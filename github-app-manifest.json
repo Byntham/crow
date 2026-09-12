@@ -1,0 +1,18 @@
+{
+  "name": "Crow",
+  "url": "https://YOUR_CROW_HOST",
+  "hook_attributes": {
+    "url": "https://YOUR_CROW_HOST/webhooks/github",
+    "active": true
+  },
+  "redirect_url": "https://YOUR_CROW_HOST/setup",
+  "public": false,
+  "default_permissions": {
+    "contents": "read",
+    "pull_requests": "write",
+    "issues": "write",
+    "metadata": "read"
+  },
+  "default_events": ["pull_request"]
+}
+

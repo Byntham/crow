@@ -1,0 +1,9 @@
+# Replace the hostname and point DNS at this server. If PORT in .env is not
+# 8787, change the upstream port below to match it.
+crow.example.com {
+	# The App homepage is the host root; send visitors to Crow's informational
+	# setup page while keeping the webhook route private to its exact path.
+	redir / /setup 302
+	@github path /webhooks/github /setup
+	reverse_proxy @github 127.0.0.1:8787
+}
