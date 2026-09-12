@@ -3,7 +3,7 @@ services:
     build:
       context: .
       args:
-        CROW_CLI_PACKAGE: ${CROW_CLI_PACKAGE:-@openai/codex}
+        CROW_CLI_PACKAGE: "${CROW_CLI_PACKAGE:-@openai/codex}"
     env_file: .env
     restart: unless-stopped
     ports:
@@ -47,9 +47,9 @@ services:
 
 secrets:
   github_private_key:
-    file: ${GITHUB_PRIVATE_KEY_PATH:-./secrets/github-app.pem}
+    file: "${GITHUB_PRIVATE_KEY_PATH:-./secrets/github-app.pem}"
   github_webhook_secret:
-    file: ${GITHUB_WEBHOOK_SECRET_PATH:-./secrets/webhook-secret}
+    file: "${GITHUB_WEBHOOK_SECRET_PATH:-./secrets/webhook-secret}"
 
 volumes:
   crow-state:

@@ -202,7 +202,10 @@ export function truncateDiff(value, maxBytes) {
 }
 
 function validJob(job) {
-  return job && Number.isSafeInteger(job.installationId) && job.installationId > 0 && validRepo(job.repo) && Number.isSafeInteger(job.number) && job.number > 0 && shaPattern.test(job.sha) && (job.baseSha === undefined || shaPattern.test(job.baseSha));
+  // RegExp#test coerces non-string values. Require actual SHA strings so a
+  // malformed webhook cannot smuggle a numeric/object value through the
+  // validation and into Git arguments or the durable queue key.
+  return job && Number.isSafeInteger(job.installationId) && job.installationId > 0 && validRepo(job.repo) && Number.isSafeInteger(job.number) && job.number > 0 && typeof job.sha === 'string' && shaPattern.test(job.sha) && (job.baseSha === undefined || (typeof job.baseSha === 'string' && shaPattern.test(job.baseSha)));
 }
 
 function markerFor(sha, baseSha) { return `<!-- crow-review:${sha}${baseSha ? `:${baseSha}` : ''} -->`; }

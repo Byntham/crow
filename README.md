@@ -46,8 +46,8 @@ that can create/install an App.
    ```
 
    For a systemd install running as `crow`, make the secret files readable by
-   that user (for example, `sudo chown crow:crow secrets/github-app.pem
-   secrets/webhook-secret` after creating the account).
+   that user (for example, `sudo chown crow:crow secrets/github-app.pem secrets/webhook-secret`
+   after creating the account).
 
    Edit `.env` and set `GITHUB_APP_ID`, `CROW_PROVIDER`, and the public-facing
    host details. The example uses the same relative paths for Docker and a
@@ -59,7 +59,9 @@ that can create/install an App.
    ```bash
    docker compose build
    # Choose one (the login is persisted in the named auth volume):
-   docker compose run --rm -it --entrypoint codex crow login
+   # Codex's device flow works when the server has no browser/localhost callback.
+   docker compose run --rm -it --entrypoint codex crow login --device-auth
+   # Claude prints a URL and accepts the returned code in this terminal.
    docker compose run --rm -it --entrypoint claude crow auth login
    ```
 
@@ -81,8 +83,14 @@ that can create/install an App.
    `/health` includes `configured: true/false`; the Compose health check only
    reports healthy once the App key and webhook secret are readable.
 
+   Codex's read-only sandbox also needs the Docker host to allow unprivileged
+   user and network namespaces. Keep that sandbox enabled; configure the host
+   kernel/security policy if `bwrap` reports a namespace error.
+
    The proxy must forward `/webhooks/github` to Crow. GitHub cannot deliver a
-   webhook to a private HTTP-only address.
+   webhook to a private HTTP-only address. For Caddy, copy
+   [`Caddyfile.example`](./Caddyfile.example), replace the hostname (and the
+   upstream port if `PORT` is customized), then reload Caddy.
 
 ## Non-Docker install
 
@@ -99,8 +107,11 @@ will run Crow:
 
 ```bash
 npm install
-sudo npm install --global @openai/codex  # or @anthropic-ai/claude-code@^2.1.259
-codex login                               # or: claude auth login
+# Install the provider you selected (choose one):
+sudo npm install --global @openai/codex
+# sudo npm install --global @anthropic-ai/claude-code@^2.1.259
+codex login --device-auth                 # use plain `codex login` with a local browser
+# For Claude instead: claude auth login
 cp .env.example .env
 npm start
 ```
@@ -115,13 +126,22 @@ sudo install -d -o crow -g crow /opt/crow/.crow-data /home/crow/.codex /home/cro
 ```
 
 Run the CLI login as `User=crow` when using systemd (for example,
-`sudo -u crow -H codex login`; for Claude use
+`sudo -u crow -H codex login --device-auth`; for Claude use
 `sudo -u crow -H env CLAUDE_CONFIG_DIR=/home/crow/.claude claude auth login`.
 The administrator's home-directory login is not shared. The example unit sets
 `CLAUDE_CONFIG_DIR` so Claude's config and subscription credentials also stay
 under `/home/crow/.claude`. If Node or the CLI was installed in a
 custom (for example, nvm) prefix, set absolute `CROW_CODEX_BIN`/
 `CROW_CLAUDE_BIN` paths and adjust `ExecStart`/`PATH` in the unit.
+
+Install and start the unit after updating its paths if needed:
+
+```bash
+sudo cp crow.service.example /etc/systemd/system/crow.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now crow
+sudo journalctl -u crow -f
+```
 
 ## Provider choice and safety
 
