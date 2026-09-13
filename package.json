@@ -1,19 +1,27 @@
 {
   "name": "crow",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Automatic GitHub pull request reviews using a local Codex or Claude CLI",
-  "engines": { "node": ">=22.12.0" },
+  "packageManager": "pnpm@12.3.4",
+  "description": "Self-hosted, subscription-authenticated GitHub PR reviews",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "bin": {
+    "crow": "dist/bin/crow.mjs"
+  },
   "scripts": {
-    "dev": "vite --host 0.0.0.0",
-    "build": "vite build",
-    "preview": "vite preview --host 0.0.0.0",
-    "start": "node --env-file-if-exists=.env server/crow.mjs",
-    "test": "node --test",
-    "check": "npm test && npm run build && node --check server/crow.mjs && node --check server/github.mjs && node --check server/job-store.mjs && node --check server/review-runner.mjs"
+    "start": "pnpm build && node dist/bin/crow.mjs run",
+    "typecheck": "tsc --noEmit",
+    "build": "pnpm typecheck && node scripts/build.mjs",
+    "test": "node scripts/check.mjs",
+    "check": "pnpm typecheck && node scripts/check.mjs",
+    "probe": "pnpm build && node dist/bin/crow.mjs doctor --runtime",
+    "test:runtime": "pnpm build && node scripts/probe-runtime.mjs && node scripts/probe-recovery.mjs"
   },
   "devDependencies": {
-    "vite": "^7.1.5"
+    "@types/node": "24.13.4",
+    "typescript": "7.0.2"
   }
 }
