@@ -1,6 +1,11 @@
 import { homedir, userInfo } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { cliPath, isBinary, version } from "./runtime.mjs";
+import {
+  binaryPath,
+  prepareBinaryUpdate,
+  checkBinaryUpdate,
+} from "./binary-install.mjs";
 import { mkdir, rm } from "node:fs/promises";
 import {
   atomic,
@@ -18,6 +23,7 @@ interface UnitOptions {
   executable?: string;
   cli?: string;
   path?: string;
+  standalone?: boolean;
 }
 interface InstallMetadata {
   installation?: string;
@@ -33,6 +39,7 @@ interface UpdateStatus {
   checkedAt: number;
   available: boolean | null;
   commits?: number;
+  version?: string;
   warning?: string;
   cached?: boolean;
 }
@@ -96,9 +103,6 @@ function statusResult(value: unknown): AdminStatus {
   });
   return { ...result, jobs, repos };
 }
-export const cliPath = fileURLToPath(
-  new URL("../bin/crow.mjs", import.meta.url),
-);
 export const unitName = (root: string) =>
   `crow-${hash(resolve(root)).slice(0, 16)}.service`;
 const quote = (value: unknown) =>
@@ -116,9 +120,13 @@ export function unitText(
     executable = process.execPath,
     cli = cliPath,
     path = process.env.PATH,
+    standalone = isBinary,
   }: UnitOptions = {},
 ) {
-  return `[Unit]\nDescription=Crow PR review service\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart=${quote(executable)} ${quote(cli)} run\nEnvironment=${quote(`CROW_HOME=${resolve(root)}`)}\nEnvironment=${quote(`PATH=${dirname(executable)}:${path || "/usr/local/bin:/usr/bin:/bin"}`)}\nRestart=on-failure\nRestartSec=5\nKillMode=mixed\nTimeoutStopSec=45\nUMask=0077\n\n[Install]\nWantedBy=default.target\n`;
+  const command = standalone
+    ? quote(executable)
+    : `${quote(executable)} ${quote(cli)}`;
+  return `[Unit]\nDescription=Crow PR review service\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart=${command} run\nEnvironment=${quote(`CROW_HOME=${resolve(root)}`)}\nEnvironment=${quote(`PATH=${dirname(executable)}:${path || "/usr/local/bin:/usr/bin:/bin"}`)}\nRestart=on-failure\nRestartSec=5\nKillMode=mixed\nTimeoutStopSec=45\nUMask=0077\n\n[Install]\nWantedBy=default.target\n`;
 }
 export async function installService(
   root: string,
@@ -131,12 +139,20 @@ export async function installService(
     throw new Error(
       "Persistent startup currently requires Linux and systemd. Use crow run in your service manager.",
     );
-  const metadata = await metadataAt(dirname(dirname(cliPath)));
+  const metadata = isBinary
+    ? null
+    : await metadataAt(dirname(dirname(cliPath)));
   const cli = metadata?.installation
     ? join(metadata.installation, "current/bin/crow.mjs")
     : cliPath;
   await mkdir(base, { recursive: true });
-  await atomic(join(base, unitName(root)), unitText(root, { cli }));
+  await atomic(
+    join(base, unitName(root)),
+    unitText(root, {
+      cli,
+      ...(isBinary ? { executable: binaryPath(root) } : {}),
+    }),
+  );
   await run("systemctl", ["--user", "daemon-reload"]);
   const { stdout } = await run("loginctl", [
     "show-user",
@@ -329,31 +345,88 @@ export async function doctor(
   });
   return { ok: checks.every((x) => x.ok), checks };
 }
+export async function waitForStartup(
+  root: string,
+  expectedVersion: string,
+  {
+    run = processRun,
+    timeoutMs = 30000,
+    intervalMs = 500,
+  }: { run?: Run; timeoutMs?: number; intervalMs?: number } = {},
+) {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    const result = await run(
+      "systemctl",
+      ["--user", "show", unitName(root), "--property=MainPID", "--value"],
+      { timeout: 5000 },
+    );
+    const pid = Number(result.stdout.trim());
+    const ready: unknown = await json(join(root, "ready.json"), null);
+    if (
+      Number.isSafeInteger(pid) &&
+      pid > 0 &&
+      isRecord(ready) &&
+      ready.pid === pid &&
+      ready.version === expectedVersion &&
+      (await processId(join(root, "runtime.lock"))) === pid
+    ) {
+      process.kill(pid, 0);
+      return;
+    }
+    if (Date.now() >= deadline) break;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  } while (Date.now() <= deadline);
+  throw new Error("Updated Crow did not finish starting");
+}
 export async function update(
   root: string,
   config: CrowConfig,
-  { run = processRun }: { run?: Run } = {},
+  {
+    run = processRun,
+    binary = isBinary,
+    prepareRelease = prepareBinaryUpdate,
+    startup = waitForStartup,
+  }: {
+    run?: Run;
+    binary?: boolean;
+    prepareRelease?: typeof prepareBinaryUpdate;
+    startup?: typeof waitForStartup;
+  } = {},
 ) {
-  const metadata = await metadataAt(dirname(dirname(cliPath)));
-  const project = sourceRoot(dirname(dirname(cliPath)), metadata);
-  const status = await run("git", ["status", "--porcelain"], { cwd: project });
-  if (status.stdout.trim())
-    throw new Error(
-      "Crow checkout has local changes. Commit or move them before crow update.",
+  const prepared = binary
+    ? await prepareRelease(root, version(), { run })
+    : null;
+  let metadata: InstallMetadata | null = null;
+  let project = "",
+    upstream = "";
+  if (binary) {
+    if (!prepared) return { updated: false, message: "Crow is current." };
+  } else {
+    metadata = await metadataAt(dirname(dirname(cliPath)));
+    project = sourceRoot(dirname(dirname(cliPath)), metadata);
+    const status = await run("git", ["status", "--porcelain"], {
+      cwd: project,
+    });
+    if (status.stdout.trim())
+      throw new Error(
+        "Crow checkout has local changes. Commit or move them before crow update.",
+      );
+    await run("git", ["fetch", "--quiet"], { cwd: project });
+    const ref = await run(
+      "git",
+      ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+      { cwd: project },
     );
-  await run("git", ["fetch", "--quiet"], { cwd: project });
-  const ref = await run(
-    "git",
-    ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
-    { cwd: project },
-  );
-  const count = await run(
-    "git",
-    ["rev-list", "--count", `HEAD..${ref.stdout.trim()}`],
-    { cwd: project },
-  );
-  if (Number(count.stdout.trim()) === 0)
-    return { updated: false, message: "Crow is current." };
+    const count = await run(
+      "git",
+      ["rev-list", "--count", `HEAD..${ref.stdout.trim()}`],
+      { cwd: project },
+    );
+    upstream = ref.stdout.trim();
+    if (Number(count.stdout.trim()) === 0)
+      return { updated: false, message: "Crow is current." };
+  }
   if (config.role !== "worker") await admin(config, "drain", {});
   else {
     const pid = await processId(join(root, "runtime.lock"));
@@ -372,6 +445,7 @@ export async function update(
       }
     }
   }
+  let rollback: (() => Promise<void>) | undefined;
   try {
     if (config.role !== "worker")
       for (;;) {
@@ -385,7 +459,15 @@ export async function update(
         await new Promise((r) => setTimeout(r, 1000));
       }
     await serviceAction(root, "stop", { run });
-    await run("git", ["merge", "--ff-only", ref.stdout.trim()], {
+    if (prepared) {
+      await rm(join(root, "ready.json"), { force: true });
+      rollback = await prepared.activate();
+      await serviceAction(root, "start", { run });
+      await startup(root, prepared.version, { run });
+      if (config.role !== "worker") await waitForService(config);
+      return { updated: true, version: prepared.version };
+    }
+    await run("git", ["merge", "--ff-only", upstream], {
       cwd: project,
     });
     await run(process.execPath, ["scripts/check.mjs", "--runtime-only"], {
@@ -406,6 +488,18 @@ export async function update(
     } else await serviceAction(root, "start", { run });
     return { updated: true };
   } catch (e) {
+    if (rollback) {
+      await serviceAction(root, "stop", { run }).catch(() => {});
+      await rollback();
+      await serviceAction(root, "start", { run });
+      throw new Error(
+        `Update failed and the previous Crow binary was restored: ${errorMessage(e)}`,
+      );
+    }
+    if (binary)
+      throw new Error(
+        `Binary update stopped: ${errorMessage(e)}. Run crow start after resolving the issue.`,
+      );
     throw new Error(
       `Update stopped: ${errorMessage(e)}. Inspect the checkout, then run crow start.`,
     );
@@ -435,6 +529,9 @@ export async function updateAvailability(
       previous = {
         checkedAt: cached.checkedAt,
         available: cached.available,
+        ...(typeof cached.version === "string"
+          ? { version: cached.version }
+          : {}),
         ...(typeof cached.commits === "number"
           ? { commits: cached.commits }
           : {}),
@@ -446,6 +543,19 @@ export async function updateAvailability(
   }
   if (previous?.checkedAt && now - previous.checkedAt < 86400000)
     return { ...previous, cached: true };
+  if (isBinary) {
+    const check = await checkBinaryUpdate(version(), { run });
+    const result = {
+      checkedAt: now,
+      available: check.warning
+        ? (previous?.available ?? null)
+        : check.available,
+      version: check.version ?? previous?.version,
+      ...(check.warning ? { warning: check.warning } : {}),
+    };
+    await atomic(cache, result).catch(() => {});
+    return { ...result, cached: !!check.warning && !!previous };
+  }
   try {
     const signal = AbortSignal.timeout(10000);
     const metadata = await metadataAt(release);

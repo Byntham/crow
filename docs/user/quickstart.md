@@ -1,15 +1,16 @@
 # Linux quickstart
 
-Crow needs an always-on Linux machine, Git, a GitHub account with admin or maintain access to the repositories you enroll, and a Codex subscription. Ubuntu with systemd is the supported guided installation path.
+Crow needs an always-on Linux machine, a GitHub account with admin or maintain access to the repositories you enroll, and a Codex subscription. Ubuntu with systemd is the supported guided installation path. Setup can install missing Git, GitHub CLI, Codex, and supported ingress tools with your confirmation.
 
-Run Crow as your normal user. Setup requests sudo for missing system packages, startup permissions, or Tailscale configuration that requires elevated permissions. The installer copies Crow into a versioned release directory and writes a CLI in `~/.local/bin`. Keep the original checkout for future updates.
+[Download and verify the Linux binary](install.md). No Node installation, package manager, or source checkout is required.
+
+Run the extracted binary as your normal user:
 
 ```sh
-bash scripts/install.sh
-~/.local/bin/crow setup
+./crow setup --role both --ingress funnel
 ```
 
-The installer uses Node.js 24 or newer if available; otherwise it downloads the official Node 24 runtime and verifies its published checksum. Add `~/.local/bin` to your `PATH` if the installer requests it. `CROW_INSTALL_DIR` and `CROW_BIN_DIR` choose alternative release and CLI directories. They do not change the state location selected by `CROW_HOME`.
+Setup copies the executable into Crow's installation, makes it available through `~/.local/bin/crow`, and requests sudo for system changes that need it. Add `~/.local/bin` to your `PATH` if requested. You can remove the downloaded archive and extracted copy after setup completes.
 
 1. Choose `both`, the default role. This runs the connection service and worker together.
 2. Sign into GitHub CLI if needed. Open its URL on your desktop and enter the device code.

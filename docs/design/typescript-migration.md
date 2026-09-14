@@ -14,7 +14,7 @@ Application modules in `lib/` and CLI entry points in `bin/` use `.mts`. TypeScr
 
 Imports retain their emitted `.mjs` paths. NodeNext resolves these to `.mts` source during type checking, and Node resolves them to JavaScript at runtime. Shared domain types live in `lib/types.mts`; modules use type-only imports where appropriate. Type definitions describe the data each operation needs without turning runtime validation into unchecked assertions.
 
-Only erasable TypeScript syntax is allowed. Node's `stripTypeScriptTypes` API removes annotations and type-only declarations without transforming application behavior. The build emits `.mjs` files with the same module layout. It does not bundle dependencies or introduce a runtime loader.
+Only erasable TypeScript syntax is allowed. For development and source installation, Node's `stripTypeScriptTypes` API removes annotations and type-only declarations without transforming application behavior. That build emits `.mjs` files with the same module layout and no runtime loader. Binary release builds separately bundle the application with esbuild and embed it in the official Node runtime.
 
 Build scripts, behavioral tests, and runtime probes remain `.mjs`. These scripts orchestrate installation and exercise public behavior. Keeping them executable with Node alone lets users run installation and update checks without pnpm or a compiler. Tests import the built application, which also checks that emitted module paths work.
 
@@ -36,6 +36,7 @@ Independent module groups can be migrated in parallel. Shared types and compilat
 pnpm install --frozen-lockfile
 pnpm typecheck
 pnpm build
+pnpm build:binary
 pnpm check
 pnpm test:runtime
 ```
@@ -46,8 +47,8 @@ Generated `dist/` output is disposable and excluded from version control. Develo
 
 ## Installation
 
-Users still run `bash scripts/install.sh` and then `crow setup`. The installer selects or installs Node 24, strips the source into a fresh release staging directory, validates generated syntax, and runs CLI help before activating the release. It uses the checkout's source rather than trusting an existing `dist/` directory.
+The recommended installation is now a prebuilt Linux binary. Users download and verify the archive, extract it, and run `./crow setup`. The executable includes the Node 24 LTS runtime. Setup installs it into Crow's managed release directory and configures the stable command and systemd service. Users do not need source files, Node, pnpm, or TypeScript. See [binary releases](binary-release.md).
 
-Installed modules live in the release's `bin/` and `lib/` directories. The stable CLI wrapper and systemd service run these ordinary JavaScript modules. Users need neither pnpm nor TypeScript, and Crow adds no runtime package dependencies. Strict type checking is a development and release check; the dependency-free installer checks the emitted program.
+Source installation remains available through `bash scripts/install.sh` followed by `crow setup`. That installer selects or installs Node 24, strips source into a fresh staging directory, validates generated syntax, and runs CLI help before activating the release. It uses the checkout's source rather than an existing `dist/` directory. Installed modules live in the release's `bin/` and `lib/` directories, and the CLI wrapper and systemd service run those ordinary JavaScript modules. This path also needs neither pnpm nor TypeScript. Strict type checking is a development and release check.
 
 See [runtime validation](runtime-validation.md) for the automated checks and the account-backed validation that remains separate from installation.

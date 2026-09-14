@@ -6,14 +6,15 @@ Each operator runs an independent installation. There is no shared Crow backend,
 
 ## Start
 
-Install Crow from this checkout. The installer uses Node.js 24 or newer if available, or installs an official Node 24 runtime in Crow's directory:
+Download and extract the binary for your Linux architecture, then run:
 
 ```sh
-bash scripts/install.sh
-~/.local/bin/crow setup
+./crow setup
 ```
 
-Setup defaults to running both the connection service and worker on this machine. It guides Tailscale Funnel, creation of your own GitHub App, repository selection, a separate Codex subscription login, and persistent systemd startup. Missing supported Linux dependencies can be installed with your confirmation. Browser steps print URLs you can open on a separate desktop. No browser is required on the host.
+Download a binary from [GitHub Releases](https://github.com/Byntham/Crow/releases). See [installation](docs/user/install.md) for release download instructions and the source installation alternative. The binary includes Node 24 LTS; users do not need Node, pnpm, or a checkout.
+
+Setup installs the executable and defaults to running both the connection service and worker on this machine. It guides Tailscale Funnel, creation of your own GitHub App, repository selection, a separate Codex subscription login, and persistent systemd startup. Missing supported Linux dependencies can be installed with your confirmation. Browser steps print URLs you can open on a separate desktop. No browser is required on the host.
 
 Setup does not run a test review. It checks connections, authentication, runtime capabilities, and startup configuration. Rerun `crow setup` to continue incomplete onboarding.
 
@@ -45,11 +46,12 @@ Use Node 24 LTS. The `packageManager` field in `package.json` pins pnpm to 12.3.
 pnpm install --frozen-lockfile
 pnpm typecheck    # Strict TypeScript checking
 pnpm build        # Check types and emit JavaScript into dist/
+pnpm build:binary # Check types and package this Linux architecture
 pnpm check        # Check types, rebuild, and run the test suite
 pnpm test:runtime # Actual installed Codex, with local synthetic responses
 ```
 
-Application source lives in `lib/*.mts` and `bin/*.mts`. TypeScript 7 checks it in strict NodeNext mode. Node emits the runnable `.mjs` modules into `dist/`; `pnpm start` builds and runs `dist/bin/crow.mjs`. Build scripts, behavioral tests, and runtime probes remain JavaScript; compile-only contract tests use TypeScript. `pnpm test` rebuilds and runs the suite without the separate type check; use `pnpm check` before submitting changes. See the [TypeScript migration design](docs/design/typescript-migration.md) for the source and installation choices.
+Application source lives in `lib/*.mts` and `bin/*.mts`. TypeScript 7 checks it in strict NodeNext mode. Node emits the runnable `.mjs` modules into `dist/`; `pnpm start` builds and runs `dist/bin/crow.mjs`. Release builds bundle the application into a Node single executable. Build scripts, behavioral tests, and runtime probes remain JavaScript; compile-only contract tests use TypeScript. `pnpm test` rebuilds and runs the suite without the separate type check; use `pnpm check` before submitting changes. See the [TypeScript migration design](docs/design/typescript-migration.md) and [binary release design](docs/design/binary-release.md).
 
 Tests use local fixtures and simulated provider/GitHub responses. They do not publish comments or run provider inference. Live subscription refresh, provider behavior across interruptions, and networking account authorization still require validation on an enrolled installation. Capability checks do not prove those live behaviors. See [runtime validation](docs/design/runtime-validation.md) for what the actual CLI probes establish.
 

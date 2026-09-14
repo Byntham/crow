@@ -1,16 +1,18 @@
 # Setup and deployment design
 
-This document describes the intended setup experience, not an installation guide for the current implementation. Each user hosts an independent Crow installation. The earlier official shared-service rollout is superseded by ADR 0007.
+This document describes setup and deployment decisions. See the [quickstart](../user/quickstart.md) for installation instructions. Each user hosts an independent Crow installation. The earlier official shared-service rollout is superseded by ADR 0007.
 
 ## One setup flow
 
-Use one installer and one `crow setup` command with three roles:
+Distribute a Linux binary with the official Node runtime embedded. The operator downloads and verifies an archive, extracts it, then runs `./crow setup`. Setup installs the executable in Crow's managed directory and creates a stable CLI command. No source checkout, Node installation, or package manager is required for this path. Source installation remains available for developers. See [binary releases](binary-release.md) for packaging and verification.
 
-| Role | Setup responsibilities |
-| --- | --- |
-| Both, default | Configure the operator's connection service, local storage, worker, public HTTPS, GitHub App onboarding, Codex authentication, and persistent startup on one machine. |
-| Connection service only | Configure public HTTPS, the operator's GitHub App, storage, and persistent startup. This host does not need Codex. |
-| Worker only | Pair with the operator's existing connection service, verify local Codex and subscription login, and configure persistent startup. This host does not need public HTTPS or the App private key. |
+Use one `crow setup` command with three roles:
+
+| Role                    | Setup responsibilities                                                                                                                                                                          |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Both, default           | Configure the operator's connection service, local storage, worker, public HTTPS, GitHub App onboarding, Codex authentication, and persistent startup on one machine.                           |
+| Connection service only | Configure public HTTPS, the operator's GitHub App, storage, and persistent startup. This host does not need Codex.                                                                              |
+| Worker only             | Pair with the operator's existing connection service, verify local Codex and subscription login, and configure persistent startup. This host does not need public HTTPS or the App private key. |
 
 Each installation registers and owns its own GitHub App. Crow guides registration through GitHub's manifest flow and captures generated credentials after browser confirmation. App installation and repository selection remain visible operator choices. No Marketplace listing or manual copying of App keys is required by this flow.
 

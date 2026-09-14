@@ -10,7 +10,7 @@ import {
 } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { inspectionInvocation } from "./runtime.mjs";
 import { atomic, json, cleanEnv, processRun } from "./util.mjs";
 import { schema, validateReport } from "./report.mjs";
 
@@ -181,9 +181,6 @@ function providerModel(value: unknown): ProviderModel | null {
   };
 }
 
-const helper = fileURLToPath(
-  new URL("../bin/inspection-mcp.mjs", import.meta.url),
-);
 const disabled = [
   "shell_tool",
   "unified_exec",
@@ -761,8 +758,14 @@ export async function prepareReview({
     "agents.default_subagent_model": model,
     "agents.default_subagent_reasoning_effort": effort,
     [`projects.${JSON.stringify(cwd)}.trust_level`]: "trusted",
-    "mcp_servers.crow_inspection.command": process.execPath,
-    "mcp_servers.crow_inspection.args": [helper, sourcePath, contextPath],
+    "mcp_servers.crow_inspection.command": inspectionInvocation(
+      sourcePath,
+      contextPath,
+    ).command,
+    "mcp_servers.crow_inspection.args": inspectionInvocation(
+      sourcePath,
+      contextPath,
+    ).args,
     "mcp_servers.crow_inspection.required": true,
     "mcp_servers.crow_inspection.default_tools_approval_mode": "approve",
     "mcp_servers.crow_inspection.enabled_tools": [

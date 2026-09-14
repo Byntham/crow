@@ -3,9 +3,12 @@ import type { CrowConfig, AppRegistration } from "./types.mjs";
 import { createServer } from "node:http";
 import { createInterface } from "node:readline/promises";
 import { mkdir, readFile, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { join, dirname } from "node:path";
+import { join } from "node:path";
 import { homedir, tmpdir, arch } from "node:os";
 import { defaults, save, validateConfig } from "./config.mjs";
+import { isBinary, version } from "./runtime.mjs";
+import { installBinary } from "./binary-install.mjs";
+import { installCodex } from "./codex-install.mjs";
 import {
   atomic,
   isRecord,
@@ -14,7 +17,6 @@ import {
   equal,
   httpsUrl,
   processRun,
-  cleanEnv,
   integer,
 } from "./util.mjs";
 import {
@@ -109,9 +111,9 @@ export async function ensureCommand(
     )) !== "yes"
   )
     throw new Error(`Install ${command}, then rerun crow setup.`);
-  if (command === "gh") {
+  if (command === "gh" || command === "git") {
     await run("sudo", ["apt-get", "update"], { inherit: true });
-    await run("sudo", ["apt-get", "install", "-y", "gh"], { inherit: true });
+    await run("sudo", ["apt-get", "install", "-y", command], { inherit: true });
     return;
   }
   const dir = await mkdtemp(join(tmpdir(), "crow-install-"));
@@ -608,6 +610,18 @@ export async function setup(
     });
   try {
     await mkdir(root, { recursive: true, mode: 0o700 });
+    if (isBinary) {
+      const executable = await installBinary(root, { version: version() });
+      log(`Installed Crow at ${executable}`);
+      if (
+        !(process.env.PATH || "")
+          .split(":")
+          .includes(join(homedir(), ".local/bin"))
+      )
+        log(
+          'Add ~/.local/bin to your PATH. For this shell, run: export PATH="$HOME/.local/bin:$PATH"',
+        );
+    }
     const stored: unknown = await json(join(root, "config.json"), null);
     const config = stored ? validateConfig(stored) : defaults(root);
     const selectedRole =
@@ -693,30 +707,19 @@ export async function setup(
       await save(config, root);
     }
     if (config.role !== "service") {
+      await ensureCommand("git", { run, ask });
       const provider = await import("./provider.mjs");
       try {
         await run(config.worker.codex, ["--version"]);
       } catch {
         if (
           (await ask(
-            "Codex is missing. Install latest official @openai/codex using npm? yes/no",
+            "Codex is missing. Install the latest official standalone Codex package? yes/no",
             "yes",
           )) !== "yes"
         )
           throw new Error("Install Codex and rerun setup.");
-        const npm = join(dirname(process.execPath), "npm");
-        const prefix = join(root, "tools");
-        await run(
-          npm,
-          ["install", "--global", "--prefix", prefix, "@openai/codex@latest"],
-          {
-            env: cleanEnv({
-              PATH: `${dirname(process.execPath)}:${process.env.PATH || "/usr/bin:/bin"}`,
-            }),
-            inherit: true,
-          },
-        );
-        config.worker.codex = join(prefix, "bin/codex");
+        config.worker.codex = await installCodex(root, { run });
         await save(config, root);
       }
       if (!(await provider.authStatus(config.worker, root)).authenticated) {

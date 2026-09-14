@@ -1,0 +1,73 @@
+name: Build binary release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.21.0
+      - name: Verify tag version
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: node --input-type=module -e 'import fs from "node:fs"; const pkg=JSON.parse(fs.readFileSync("package.json")); if (process.env.RELEASE_TAG !== `v${pkg.version}`) throw new Error("Tag must match package.json version");'
+      - name: Install pinned pnpm
+        run: npm install --global "$(node --print 'JSON.parse(require("node:fs").readFileSync("package.json")).packageManager')"
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - run: pnpm build:binary
+      - name: Test packaged executable without host Node
+        run: |
+          mkdir binary-smoke
+          tar -xzf dist-release/crow-v*-linux-${{ matrix.arch }}.tar.gz -C binary-smoke
+          CROW_TEST_BINARY="$PWD/binary-smoke/crow" node --test test/binary.test.mjs
+          (cd dist-release && sha256sum --check SHA256SUMS)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: crow-linux-${{ matrix.arch }}
+          path: dist-release/*
+          if-no-files-found: error
+          retention-days: 7
+
+  draft-release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: crow-linux-*
+          path: artifacts
+      - name: Assemble checksums and create draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          mkdir release
+          cp artifacts/crow-linux-*/*.tar.gz release/
+          cat artifacts/crow-linux-*/SHA256SUMS > release/SHA256SUMS
+          (cd release && sha256sum --check SHA256SUMS)
+          gh release create "$RELEASE_TAG" release/* --verify-tag --draft --title "Crow $RELEASE_TAG" --notes "Native Linux binaries for x64 and arm64. Extract the archive and run ./crow setup; setup installs the permanent crow command. See the repository installation documentation for checksum verification and prerequisites."

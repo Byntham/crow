@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-import { readFile, realpath } from "node:fs/promises";
+import { readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { isMain, version } from "../lib/runtime.mjs";
 import { home, load, save, settings, validateConfig } from "../lib/config.mjs";
 import {
   admin,
@@ -129,6 +129,7 @@ async function runCrow(config: CrowConfig, root: string) {
   const close = async () => {
     if (closing) return;
     closing = true;
+    await rm(join(root, "ready.json"), { force: true });
     await worker?.close();
     await service?.close();
     await release();
@@ -163,6 +164,10 @@ async function runCrow(config: CrowConfig, root: string) {
         console.error(`Drain failed: ${errorMessage(e)}`);
       }
     });
+    await atomic(join(root, "ready.json"), {
+      pid: process.pid,
+      version: version(),
+    });
     console.log(`Crow ${config.role} running.`);
     await new Promise(() => {});
   } catch (e) {
@@ -171,11 +176,22 @@ async function runCrow(config: CrowConfig, root: string) {
   }
 }
 export async function main(argv = process.argv.slice(2)) {
+  if (argv[0] === "_inspection-mcp") {
+    if (!argv[1]) throw new Error("Inspection source is required");
+    return (await import("./inspection-mcp.mjs")).inspectionMain(
+      argv[1],
+      argv[2],
+    );
+  }
   const { args, flags } = parse(argv),
     [command = "help", ...rest] = args,
     root = home();
   const print = (x: unknown) =>
     console.log(typeof x === "string" ? x : JSON.stringify(x, null, 2));
+  if (command === "version" || flags.version) {
+    print(version());
+    return;
+  }
   if (["help", "-h", "--help"].includes(command) || flags.help) {
     print(help);
     return;
@@ -394,10 +410,7 @@ export async function main(argv = process.argv.slice(2)) {
   }
   throw new Error(`Unknown command ${command}. Run crow help.`);
 }
-if (
-  process.argv[1] &&
-  import.meta.url === pathToFileURL(await realpath(process.argv[1])).href
-)
+if (isMain(import.meta.url))
   main().catch((e) => {
     console.error(`Crow: ${errorMessage(e)}`);
     process.exitCode = 1;
