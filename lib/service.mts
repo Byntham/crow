@@ -128,6 +128,21 @@ const activeStates: ReviewState[] = [
   "paused",
   "publishing",
 ];
+function ineligibleReason(
+  repo: Pick<RepositoryRecord, "policy" | "authors">,
+  pr: { state: string; draft: boolean; user: { login: string } },
+) {
+  if (pr.state !== "open") return "PR is closed";
+  if (pr.draft) return "PR is a draft";
+  if (
+    repo.policy !== "everyone" &&
+    !(repo.authors || []).some(
+      (login) => login.toLowerCase() === pr.user.login.toLowerCase(),
+    )
+  )
+    return "PR author is not authorized";
+  return "PR is not eligible";
+}
 const logins = (value: unknown): value is string[] =>
   Array.isArray(value) &&
   value.every(
@@ -268,7 +283,7 @@ export async function startService(
         ))
         store.updateJob(j.id, {
           state: "cancelled",
-          reason: "PR is closed, a draft, or its author is not authorized",
+          reason: ineligibleReason(repo, pr),
         });
       return { skipped: "PR is not eligible" };
     }
@@ -310,7 +325,7 @@ export async function startService(
           store.updateJob(job.id, {
             state: "cancelled",
             autoRecover: false,
-            reason: "PR is no longer eligible",
+            reason: ineligibleReason(repo, current!),
           });
       }
       const candidates = prs.filter(

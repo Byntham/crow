@@ -378,6 +378,7 @@ async function rpc<T>(
     );
     let sequence = 0,
       buffer = "",
+      stderr = "",
       bytes = 0,
       settled = false;
     const pending = new Map<
@@ -417,11 +418,20 @@ async function rpc<T>(
         send({ id, method, params });
       });
     child.on("error", finish);
-    child.on("close", (code) =>
-      finish(new Error(`Codex metadata connection exited (${code})`)),
-    );
+    child.on("close", (code) => {
+      const detail = stderr.trim().slice(-4000);
+      finish(
+        new Error(
+          `Codex metadata connection exited (${code})` +
+            (detail ? `\nCodex stderr:\n${detail}` : ""),
+        ),
+      );
+    });
     child.stdin.on("error", finish);
-    child.stderr.on("data", () => {});
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (data: string) => {
+      stderr = (stderr + data).slice(-4000);
+    });
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (data: string) => {
       bytes += Buffer.byteLength(data);
