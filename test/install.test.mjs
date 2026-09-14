@@ -34,8 +34,17 @@ test(
   { skip: process.platform !== "linux" },
   (t) => {
     const root = fixture(t);
+    const mocks = join(root, "mocks");
+    mkdirSync(mocks);
+    writeFileSync(
+      join(mocks, "git"),
+      '#!/bin/sh\n[ "$1" = rev-parse ] && [ "$2" = HEAD ] || exit 1\nprintf "%s\\n" "$CROW_FIXTURE_REV"\n',
+      { mode: 0o755 },
+    );
     const env = {
       ...process.env,
+      PATH: `${mocks}:${process.env.PATH}`,
+      CROW_FIXTURE_REV: "a".repeat(40),
       CROW_NODE: process.execPath,
       CROW_INSTALL_DIR: join(root, "install with spaces"),
       CROW_BIN_DIR: join(root, "bin with spaces"),
@@ -43,6 +52,13 @@ test(
     const first = install(env);
     assert.equal(first.status, 0, first.stderr || first.stdout);
     const release = readlinkSync(join(env.CROW_INSTALL_DIR, "current"));
+    const metadataFile = join(env.CROW_INSTALL_DIR, "current/install.json");
+    assert.equal(
+      JSON.parse(readFileSync(metadataFile, "utf8")).revision,
+      env.CROW_FIXTURE_REV,
+    );
+    // Simulate a new commit that changes only files excluded from the payload.
+    env.CROW_FIXTURE_REV = "b".repeat(40);
     const second = install(env);
     assert.equal(second.status, 0, second.stderr || second.stdout);
     assert.equal(readlinkSync(join(env.CROW_INSTALL_DIR, "current")), release);
@@ -70,6 +86,7 @@ test(
     const metadata = JSON.parse(
       readFileSync(join(env.CROW_INSTALL_DIR, "current/install.json"), "utf8"),
     );
+    assert.equal(metadata.revision, env.CROW_FIXTURE_REV);
     assert.equal(metadata.bin, env.CROW_BIN_DIR);
     assert.equal(metadata.installation, env.CROW_INSTALL_DIR);
     assert.equal(metadata.source, project.replace(/\/$/, ""));

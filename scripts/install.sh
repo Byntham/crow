@@ -83,7 +83,13 @@ import {spawnSync} from 'node:child_process';
 const revision=spawnSync('git',['rev-parse','HEAD'],{cwd:process.argv[3],encoding:'utf8'});
 writeFileSync(process.argv[2],JSON.stringify({source:process.argv[3],installation:process.argv[4],bin:process.argv[5],revision:revision.status===0?revision.stdout.trim():null,installedAt:new Date().toISOString()},null,2)+'\n',{mode:0o600});
 NODE
-if [[ ! -e "$crow_install/releases/$crow_release" ]]; then mv -- "$crow_tmp/release" "$crow_install/releases/$crow_release"; fi
+if [[ ! -e "$crow_install/releases/$crow_release" ]]; then
+  mv -- "$crow_tmp/release" "$crow_install/releases/$crow_release"
+else
+  # Identical runtime files may come from a newer source revision. Replace only
+  # the installation metadata atomically so later updates see that revision.
+  mv -Tf -- "$crow_tmp/release/install.json" "$crow_install/releases/$crow_release/install.json"
+fi
 ln -s -- "releases/$crow_release" "$crow_tmp/current"
 if [[ -e "$crow_install/current" && ! -L "$crow_install/current" ]]; then echo "Refusing to replace directory $crow_install/current" >&2; exit 1; fi
 mv -Tf -- "$crow_tmp/current" "$crow_install/current"
