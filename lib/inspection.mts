@@ -91,12 +91,40 @@ export async function checkout(
   ).trim();
   return { dir, head, base, target: pr.base.ref, targetSha: pr.base.sha };
 }
-export async function files(source: InspectionSource, rev = source.head) {
-  return (
-    await git(source.dir, ["ls-tree", "-r", "--name-only", "-z", revision(rev)])
-  )
-    .split("\0")
-    .filter(Boolean);
+async function gitNames(
+  source: InspectionSource,
+  args: string[],
+  visit: (path: string) => void,
+) {
+  let pending = "";
+  await git(source.dir, args, {
+    capture: false,
+    onChunk(chunk) {
+      let start = 0;
+      while (start < chunk.length) {
+        const end = chunk.indexOf("\0", start);
+        pending += chunk.slice(start, end < 0 ? chunk.length : end);
+        if (pending.length > 65536)
+          throw new Error("Repository path exceeds 64 KB");
+        if (end < 0) break;
+        if (pending) visit(pending);
+        pending = "";
+        start = end + 1;
+      }
+    },
+  });
+  if (pending) throw new Error("Incomplete Git path listing");
+}
+async function files(
+  source: InspectionSource,
+  visit: (path: string) => void,
+  rev = source.head,
+) {
+  await gitNames(
+    source,
+    ["ls-tree", "-r", "--name-only", "-z", revision(rev)],
+    visit,
+  );
 }
 export async function readBlob(
   source: InspectionSource,
@@ -215,9 +243,13 @@ export async function publicationPatch(
   }
   return parts.join("");
 }
-async function changedFiles(source: InspectionSource) {
-  return (
-    await git(source.dir, [
+async function changedFiles(
+  source: InspectionSource,
+  visit: (path: string) => void,
+) {
+  await gitNames(
+    source,
+    [
       "diff",
       "--no-ext-diff",
       "--no-textconv",
@@ -226,10 +258,9 @@ async function changedFiles(source: InspectionSource) {
       "-z",
       revision(source.base),
       revision(source.head),
-    ])
-  )
-    .split("\0")
-    .filter(Boolean);
+    ],
+    visit,
+  );
 }
 function pageBounds(args: Record<string, unknown>, maximum: number) {
   const offset = args.offset ?? 0;
@@ -255,17 +286,28 @@ function pageMetadata(total: number, offset: number, count: number) {
 type InspectionPage = ReturnType<typeof pageMetadata> &
   ({ files: string[] } | { patch: string });
 export async function guidance(source: InspectionSource): Promise<Guidance> {
-  const names = await files(source, source.targetSha),
-    wanted = names
-      .filter(
-        (x) =>
-          x === "AGENTS.md" ||
-          x.endsWith("/AGENTS.md") ||
-          x === ".crow/review.md",
-      )
-      .sort();
-  const parts = [];
+  const wanted: string[] = [];
   let size = 0;
+  await files(
+    source,
+    (path) => {
+      if (
+        path === "AGENTS.md" ||
+        path.endsWith("/AGENTS.md") ||
+        path === ".crow/review.md"
+      ) {
+        size += Buffer.byteLength(path);
+        if (size > 256000)
+          throw new Error(
+            "Repository guidance exceeds 256 KB; reduce the instruction files",
+          );
+        wanted.push(path);
+      }
+    },
+    source.targetSha,
+  );
+  wanted.sort();
+  const parts = [];
   for (const path of wanted) {
     const body = await readBlob(source, path, source.targetSha);
     size += Buffer.byteLength(body);
@@ -295,12 +337,26 @@ export async function inspectionTool(
     )
       throw new Error("changed_only must be a boolean");
     const prefix = typeof args.prefix === "string" ? args.prefix : "";
-    const names = (
-      await (args.changed_only ? changedFiles(source) : files(source))
-    ).filter((path) => path.startsWith(prefix));
+    const names: string[] = [];
+    let total = 0,
+      characters = 0,
+      filled = false;
+    const visit = (path: string) => {
+      if (!path.startsWith(prefix)) return;
+      if (total++ < offset || filled) return;
+      if (names.length >= count || characters + path.length > 200000) {
+        filled = true;
+        return;
+      }
+      characters += path.length;
+      names.push(path);
+    };
+    await (args.changed_only
+      ? changedFiles(source, visit)
+      : files(source, visit));
     return {
-      files: names.slice(offset, offset + count),
-      ...pageMetadata(names.length, offset, count),
+      files: names,
+      ...pageMetadata(total, offset, names.length),
     };
   }
   if (name === "read_file") {

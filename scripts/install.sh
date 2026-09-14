@@ -49,6 +49,20 @@ if [[ -z "$crow_node" ]] || ! "$crow_node" -e 'if(Number(process.versions.node.s
   fi
 fi
 crow_node=$("$crow_node" -p 'process.execPath')
+{
+  printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+  printf 'export PATH=%q:"$PATH"\n' "$(dirname -- "$crow_node")"
+  printf 'exec %q %q "$@"\n' "$crow_node" "$crow_install/current/bin/crow.mjs"
+} > "$crow_tmp/crow"
+chmod 755 "$crow_tmp/crow"
+# Only a wrapper generated for this exact installation may be replaced. Never
+# follow symlinks or overwrite another Crow installation sharing the bin folder.
+if [[ -e "$crow_bin/crow" || -L "$crow_bin/crow" ]]; then
+  if [[ -L "$crow_bin/crow" || ! -f "$crow_bin/crow" ]] || ! cmp -s -- "$crow_tmp/crow" "$crow_bin/crow"; then
+    echo "Refusing to replace existing executable $crow_bin/crow; move it aside or choose another CROW_BIN_DIR." >&2
+    exit 1
+  fi
+fi
 # Compile with Node's built-in TypeScript stripping. Developers verify strict types
 # before release; installing from a checkout needs neither pnpm nor TypeScript.
 "$crow_node" "$crow_source/scripts/build.mjs" --out "$crow_tmp/release"
@@ -93,13 +107,7 @@ fi
 ln -s -- "releases/$crow_release" "$crow_tmp/current"
 if [[ -e "$crow_install/current" && ! -L "$crow_install/current" ]]; then echo "Refusing to replace directory $crow_install/current" >&2; exit 1; fi
 mv -Tf -- "$crow_tmp/current" "$crow_install/current"
-{
-  printf '#!/usr/bin/env bash\nset -euo pipefail\n'
-  printf 'export PATH=%q:"$PATH"\n' "$(dirname -- "$crow_node")"
-  printf 'exec %q %q "$@"\n' "$crow_node" "$crow_install/current/bin/crow.mjs"
-} > "$crow_tmp/crow"
-chmod 755 "$crow_tmp/crow"
-mv -f -- "$crow_tmp/crow" "$crow_bin/crow"
+mv -Tf -- "$crow_tmp/crow" "$crow_bin/crow"
 echo "Installed Crow $crow_release."
 printf 'Run %q setup to configure this installation.\n' "$crow_bin/crow"
 case ":$PATH:" in *":$crow_bin:"*) ;; *) printf 'Add the CLI to PATH: export PATH=%q:"$PATH"\n' "$crow_bin" ;; esac

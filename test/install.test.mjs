@@ -8,6 +8,7 @@ import {
   mkdirSync,
   existsSync,
   readlinkSync,
+  symlinkSync,
 } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -149,5 +150,57 @@ test(
     const bad = install(env);
     assert.notEqual(bad.status, 0);
     assert.equal(existsSync(join(env.CROW_INSTALL_DIR, "current")), false);
+  },
+);
+
+test(
+  "source installation preserves unrelated commands and symlinks before activation",
+  { skip: process.platform !== "linux" },
+  (t) => {
+    const root = fixture(t);
+    const other = join(root, "other-command");
+    writeFileSync(other, "unrelated executable\n", { mode: 0o755 });
+    for (const kind of [
+      "file",
+      "symlink",
+      "broken symlink",
+      "other Crow installation",
+    ]) {
+      const bin = join(root, kind, "bin");
+      const installRoot = join(root, kind, "install");
+      mkdirSync(bin, { recursive: true });
+      const entry = join(bin, "crow");
+      const env = {
+        ...process.env,
+        CROW_NODE: process.execPath,
+        CROW_INSTALL_DIR: installRoot,
+        CROW_BIN_DIR: bin,
+      };
+      if (kind === "file")
+        writeFileSync(entry, "unrelated executable\n", { mode: 0o755 });
+      else if (kind.includes("symlink"))
+        symlinkSync(kind === "symlink" ? other : join(root, "missing"), entry);
+      else {
+        const original = install({
+          ...env,
+          CROW_INSTALL_DIR: join(root, "other-crow"),
+        });
+        assert.equal(original.status, 0, original.stderr);
+      }
+      const before = kind.includes("symlink")
+        ? readlinkSync(entry)
+        : readFileSync(entry, "utf8");
+      const result = install(env);
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /Refusing to replace existing executable/);
+      assert.equal(
+        kind.includes("symlink")
+          ? readlinkSync(entry)
+          : readFileSync(entry, "utf8"),
+        before,
+      );
+      assert.equal(existsSync(join(installRoot, "current")), false);
+      assert.equal(readFileSync(other, "utf8"), "unrelated executable\n");
+    }
   },
 );

@@ -8,7 +8,6 @@ import {
   git,
   revision,
   safePath,
-  files,
   readBlob,
   diff,
   publicationPatch,
@@ -140,7 +139,11 @@ test("literal filename and search strings never execute shell syntax", async (t)
     await readBlob(source, "$(touch SHOULD_NOT_EXIST).txt"),
     "literal-name",
   );
-  assert.ok((await files(source)).includes("$(touch SHOULD_NOT_EXIST).txt"));
+  assert.ok(
+    (await inspectionTool(source, "list_files", {})).files.includes(
+      "$(touch SHOULD_NOT_EXIST).txt",
+    ),
+  );
   assert.equal(
     await inspectionTool(source, "search", {
       text: "$(touch SHOULD_NOT_EXIST)",
@@ -305,6 +308,79 @@ test("diffs larger than 16 MiB stream pages and bounded publication anchors", as
     publicationPatch(source, findings, { signal }),
     /superseded/,
   );
+});
+
+test("tree and changed-path listings over 16 MiB stream pages and target guidance", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "crow-large-tree-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await git(dir, ["init", "--bare"]);
+  const blob = async (body) =>
+    (await git(dir, ["hash-object", "-w", "--stdin"], { input: body })).trim();
+  const tree = async (entries) =>
+    (
+      await git(dir, ["mktree", "-z"], { input: entries.join("\0") + "\0" })
+    ).trim();
+  const trusted = await blob("Trusted target guidance.");
+  const untrusted = await blob("Untrusted PR guidance.");
+  const empty = await blob("");
+  const leafNames = Array.from(
+    { length: 1000 },
+    (_, i) => `f${String(i).padStart(4, "0")}-${"x".repeat(180)}.txt`,
+  );
+  // Reuse one subtree 100 times. Git emits 100,000 paths without creating
+  // that many objects or filesystem entries in this fixture.
+  const subtree = await tree(
+    leafNames.map((name) => `100644 blob ${empty}\t${name}`),
+  );
+  const directories = Array.from(
+    { length: 100 },
+    (_, i) => `dir${String(i).padStart(3, "0")}`,
+  );
+  const roots = directories.map((name) => `040000 tree ${subtree}\t${name}`);
+  const base = await tree([
+    `100644 blob ${trusted}\tAGENTS.md`,
+    `100644 blob ${empty}\tdeleted.txt`,
+  ]);
+  const targetSha = await tree([...roots, `100644 blob ${trusted}\tAGENTS.md`]);
+  const head = await tree([
+    ...roots,
+    `100644 blob ${untrusted}\tAGENTS.md`,
+    `100644 blob ${empty}\tz-later.txt`,
+  ]);
+  const source = { dir, base, head, targetSha, target: "main" };
+  assert.ok(
+    100000 * (directories[0].length + 1 + leafNames[0].length + 1) >
+      16 * 1024 * 1024,
+  );
+  const total = 100002;
+  const first = await inspectionTool(source, "list_files", {});
+  assert.equal(first.total, total);
+  assert.equal(first.nextOffset, first.files.length);
+  assert.equal(first.truncated, true);
+  assert.ok(first.files.join("").length <= 200000);
+  const later = await inspectionTool(source, "list_files", {
+    offset: total - 2,
+  });
+  assert.deepEqual(later.files, [`dir099/${leafNames.at(-1)}`, "z-later.txt"]);
+  assert.equal(later.nextOffset, null);
+  const changed = await inspectionTool(source, "list_files", {
+    changed_only: true,
+    offset: total - 1,
+  });
+  assert.equal(changed.total, total + 1); // Includes the deleted base path.
+  assert.deepEqual(changed.files, later.files);
+  const filtered = await inspectionTool(source, "list_files", {
+    prefix: "dir099/",
+    offset: 998,
+    count: 1,
+  });
+  assert.equal(filtered.total, 1000);
+  assert.deepEqual(filtered.files, [`dir099/${leafNames[998]}`]);
+  assert.equal(filtered.nextOffset, 999);
+  const rules = await guidance(source);
+  assert.deepEqual(rules.files, [
+    { path: "AGENTS.md", body: "Trusted target guidance." },
+  ]);
 });
 
 test("MCP advertises pagination and serializes completion metadata for reviewers", async (t) => {
