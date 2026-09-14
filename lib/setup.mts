@@ -346,13 +346,9 @@ export function appManifest(config: CrowConfig, name: string) {
       pull_requests: "write",
       issues: "write",
     },
-    default_events: [
-      "pull_request",
-      "push",
-      "issue_comment",
-      "installation",
-      "installation_repositories",
-    ],
+    // GitHub sends installation and installation_repositories automatically;
+    // including them in default_events makes the manifest invalid.
+    default_events: ["pull_request", "push", "issue_comment"],
   };
 }
 export function registrationAction(

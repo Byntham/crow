@@ -103,6 +103,8 @@ test("manifest requests advisory review permissions and points to configured pub
   assert.equal(m.default_permissions.contents, "read");
   assert.equal(m.default_permissions.checks, undefined);
   assert.equal(m.redirect_url, c.publicUrl + "/setup/callback");
+  // GitHub rejects automatic installation events as explicit subscriptions.
+  assert.deepEqual(m.default_events, ["pull_request", "push", "issue_comment"]);
 });
 test("App registration rejects forged callback and stores generated credentials after valid state", async () => {
   const root = await mkdtemp(join(tmpdir(), "crow-setup-"));
