@@ -11,6 +11,49 @@ import {
   waitForStartup,
 } from "../dist/lib/operations.mjs";
 import { version } from "../dist/lib/runtime.mjs";
+import { acquireLock } from "../dist/lib/util.mjs";
+import { installDownloaded } from "../dist/lib/install-command.mjs";
+
+test("binary updates and bootstrap share an installation lock", async (t) => {
+  const { root, config } = await fixture(t);
+  const release = await acquireLock(join(root, "install.lock"));
+  try {
+    await assert.rejects(
+      update(root, config, {
+        binary: true,
+        prepareRelease: async () =>
+          assert.fail("An update cannot stage during another installation"),
+      }),
+      /lock/,
+    );
+  } finally {
+    await release();
+  }
+  let staged;
+  const started = new Promise((resolve) => {
+    staged = resolve;
+  });
+  let finish;
+  const pending = new Promise((resolve) => {
+    finish = resolve;
+  });
+  const updating = update(root, config, {
+    binary: true,
+    prepareRelease: async () => {
+      staged();
+      await pending;
+      return null;
+    },
+  });
+  await started;
+  try {
+    await assert.rejects(installDownloaded(root, { version: "0.2.0" }), /lock/);
+  } finally {
+    finish();
+    await updating;
+  }
+  await assert.rejects(access(join(root, "install.lock")), { code: "ENOENT" });
+});
 
 async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), "crow-binary-operations-"));
@@ -197,7 +240,10 @@ test("startup readiness requires the expected version and the live systemd proce
     ["different runtime process", ready, { pid: process.pid + 1 }],
   ]) {
     await t.test(name, async () => {
-      for (const [file, value] of [[readyPath, marker], [lockPath, runtime]]) {
+      for (const [file, value] of [
+        [readyPath, marker],
+        [lockPath, runtime],
+      ]) {
         if (value === null) await rm(file, { force: true });
         else await writeFile(file, JSON.stringify(value));
       }

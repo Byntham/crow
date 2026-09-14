@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { homedir, tmpdir, arch } from "node:os";
 import { defaults, save, validateConfig } from "./config.mjs";
 import { isBinary, version } from "./runtime.mjs";
-import { installBinary } from "./binary-install.mjs";
+import { installDownloaded } from "./install-command.mjs";
 import { installCodex } from "./codex-install.mjs";
 import {
   atomic,
@@ -611,7 +611,7 @@ export async function setup(
   try {
     await mkdir(root, { recursive: true, mode: 0o700 });
     if (isBinary) {
-      const executable = await installBinary(root, { version: version() });
+      const executable = await installDownloaded(root, { version: version() });
       log(`Installed Crow at ${executable}`);
       if (
         !(process.env.PATH || "")

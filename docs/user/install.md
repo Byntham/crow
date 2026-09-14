@@ -1,35 +1,49 @@
 # Install Crow on Linux
 
-Crow's recommended distribution is a Linux executable containing the Node 24 LTS runtime. Users do not need Node, pnpm, a TypeScript compiler, or the source repository.
+Crow's hosted installer downloads a native Linux executable containing Node 24 LTS. Users do not need the source repository, Node, pnpm, or a TypeScript compiler. The installer and binaries will be public even while the source repository is private.
 
-Download `v0.2.0` from [GitHub Releases](https://github.com/Byntham/Crow/releases/tag/v0.2.0), use the source installation below, or build a binary with `pnpm build:binary` in a development checkout.
+**The hosted installer is prepared locally but has not been deployed.** The commands below become available after the first approved publication. Until then, use the source installation or build a binary with `pnpm build:binary`.
 
-## Download and setup
+## Hosted installation
 
-The release archives are `crow-v0.2.0-linux-x64.tar.gz` and `crow-v0.2.0-linux-arm64.tar.gz`. Gibo uses x64. Choose arm64 for an ARM64 host. These binaries use glibc and the system C++ runtime; Alpine and other musl distributions need a different distribution and are not supported by these artifacts.
-
-While the repository is private, authenticate GitHub CLI with an account that has access, then download the selected archive and checksums:
+From an SSH terminal on the machine that will run Crow, use:
 
 ```sh
-gh auth login
-gh release download v0.2.0 --repo Byntham/Crow \
-  --pattern crow-v0.2.0-linux-x64.tar.gz --pattern SHA256SUMS \
-  --dir crow-download
-cd crow-download
-sha256sum --check --ignore-missing SHA256SUMS
-tar -xzf crow-v0.2.0-linux-x64.tar.gz
-./crow setup --role both --ingress funnel
+curl -fsSL https://birdapp.dev/install.sh | sh
 ```
 
-Stop if checksum verification fails. `--ignore-missing` allows the checksum file to list the other architecture, which you did not download. For arm64, replace both archive names with `crow-v0.2.0-linux-arm64.tar.gz`. You can also download the files through the GitHub release page on your desktop and transfer them to the host before verification.
+Run this as your normal user, without sudo. The installer detects Linux x64 or ARM64, checks prerequisites, downloads a versioned archive from `downloads.birdapp.dev`, and verifies its checksum before extraction. It then installs the binary and offers to start setup. Ubuntu with systemd is the supported guided setup platform. These binaries require glibc and the system C++ runtime; Alpine and other musl distributions are unsupported.
 
-Run setup as your normal user. It installs the binary under the directory chosen by `CROW_HOME`, with `current/crow` selecting the active release and a stable command in `~/.local/bin/crow`. The default installation and state directory is `~/.local/share/crow`. Add `~/.local/bin` to your `PATH` if requested. After setup completes, the download directory is no longer needed.
+The bootstrap needs common Linux tools including `curl`, `tar`, and `sha256sum`. It explains missing prerequisites before installation. Crow setup offers installation of missing supported dependencies such as Git, GitHub CLI, Codex, and the chosen ingress client. GitHub login happens during setup to connect your repositories, not to download Crow.
 
-Setup guides GitHub, public HTTPS, subscription authentication, and persistent systemd startup. It offers installation of missing supported dependencies, including Git, GitHub CLI, Codex, and ingress tools. On a headless machine, open the printed browser URLs on your desktop. Setup checks connections and configuration without running a PR review.
+On a headless machine, open the printed browser URLs on your desktop. The installer reads setup prompts from your terminal even when invoked through the pipe above. Without a terminal, it installs only and prints the command to start setup later. Setup checks connections and configuration without running a PR review.
 
-Crow uses your existing official Codex executable. If it is missing, setup offers to install the latest official CLI. Installing or updating Crow does not replace an existing user-managed Codex installation.
+To install without entering setup, or to select an explicit version:
 
-See the [quickstart](quickstart.md) for the setup prompts and [operations](operations.md#lifecycle-and-updates) for binary updates.
+```sh
+curl -fsSL https://birdapp.dev/install.sh | sh -s -- --no-setup
+curl -fsSL https://birdapp.dev/install.sh | sh -s -- --version X.Y.Z --no-setup
+```
+
+Replace `X.Y.Z` with a published version. The installer cannot downgrade or replace a different existing Crow executable. Use the installed `crow update` command for upgrades, or `crow setup` to continue onboarding. Repeating installation of the identical binary preserves configuration and active work.
+
+The default installation and state directory is `~/.local/share/crow`. `current/crow` selects the installed release and `~/.local/bin/crow` is the stable command. Set `CROW_HOME` for a custom state directory and use that same value for later commands. If `~/.local/bin` is missing from your current shell's PATH, the installer prints the command to add it and still launches setup using the full executable path. Add that directory to your shell startup file if it is not already configured for future sessions.
+
+If setup is interrupted, the permanent command remains installed. Continue with `crow setup`, or the exact command printed by the installer. Crow reuses your existing official Codex executable. If it is missing, setup can install the latest official standalone package without npm. Installing Crow does not replace a user-managed Codex installation.
+
+## Manual binary installation
+
+For environments where piping an installer is inconvenient, download the versioned archive and `SHA256SUMS` from the installation page, then verify and extract it:
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS
+tar -xzf crow-vX.Y.Z-linux-x64.tar.gz
+./crow install
+```
+
+Stop if checksum verification fails. Use the actual downloaded filename and substitute `arm64` when appropriate. `--ignore-missing` permits the checksum file to include the other architecture. `./crow install --no-setup` installs without starting onboarding. You can transfer these files from your desktop to the host before verification. There is no published release to download until the first approved publication.
+
+See the [quickstart](quickstart.md) for setup prompts and [operations](operations.md#lifecycle-and-updates) for updates.
 
 ## Install from source
 

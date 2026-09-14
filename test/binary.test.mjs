@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { copyFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { once } from "node:events";
@@ -17,6 +17,35 @@ const binary =
   process.env.CROW_TEST_BINARY && resolve(process.env.CROW_TEST_BINARY);
 const options = { skip: !binary, timeout: 15000 };
 test(
+  "downloaded binary installs without a terminal and preserves existing onboarding",
+  options,
+  async (t) => {
+    const { root, env } = await fixture(t);
+    const run = () =>
+      spawnSync(binary, ["install", "--no-setup"], {
+        env,
+        cwd: root,
+        encoding: "utf8",
+      });
+    const installed = run();
+    assert.equal(installed.status, 0, installed.stderr);
+    assert.match(installed.stdout, /Start or continue setup with:/);
+    const command = join(root, ".local/bin/crow");
+    const version = spawnSync(command, ["--version"], {
+      env,
+      encoding: "utf8",
+    });
+    assert.equal(version.status, 0, version.stderr);
+    await writeFile(join(root, "config.json"), "saved onboarding");
+    const repeated = run();
+    assert.equal(repeated.status, 0, repeated.stderr);
+    assert.equal(
+      await readFile(join(root, "config.json"), "utf8"),
+      "saved onboarding",
+    );
+  },
+);
+test(
   "packaged archive survives update validation and installation",
   options,
   async (t) => {
@@ -27,26 +56,18 @@ test(
     const archive = `crow-v${pkg.version}-linux-${process.arch}.tar.gz`;
     const releaseDirectory = new URL("../dist-release/", import.meta.url);
     const candidate = await prepareBinaryUpdate(root, "0.0.0", {
-      run: async (command, args, runOptions) => {
-        if (command !== "gh")
-          return processRun(command, args, { ...runOptions, env });
-        if (args[0] === "api")
-          return {
-            stdout: JSON.stringify({
-              tag_name: `v${pkg.version}`,
-              draft: false,
-              prerelease: false,
-            }),
-            stderr: "",
-          };
-        assert.equal(args[0], "release");
-        const destination = args[args.indexOf("--dir") + 1];
-        for (const name of [archive, "SHA256SUMS"])
-          await copyFile(
-            new URL(name, releaseDirectory),
-            join(destination, name),
-          );
-        return { stdout: "", stderr: "" };
+      run: (command, args, runOptions) =>
+        processRun(command, args, { ...runOptions, env }),
+      fetch: async (url) => {
+        if (url === "https://downloads.birdapp.dev/latest.txt")
+          return new Response(`${pkg.version}\n`);
+        const name = new URL(url).pathname.split("/").at(-1);
+        assert.ok([archive, "SHA256SUMS"].includes(name));
+        assert.equal(
+          url,
+          `https://downloads.birdapp.dev/releases/v${pkg.version}/${name}`,
+        );
+        return new Response(await readFile(new URL(name, releaseDirectory)));
       },
     });
     const installed = await installBinary(root, {

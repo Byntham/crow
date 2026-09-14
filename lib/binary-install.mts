@@ -18,10 +18,10 @@ import {
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { gunzipSync } from "node:zlib";
-import { errorCode, errorMessage, id, isRecord, processRun } from "./util.mjs";
+import { errorCode, errorMessage, id, processRun } from "./util.mjs";
 import type { ProcessRunner } from "./util.mjs";
 
-const repository = "Byntham/Crow";
+const downloadOrigin = "https://downloads.birdapp.dev";
 const maxArchive = 256 * 1024 * 1024;
 const maxExtracted = 512 * 1024 * 1024;
 interface ReleaseOptions {
@@ -30,13 +30,11 @@ interface ReleaseOptions {
   platform?: string;
   arch?: string;
 }
-interface Release {
-  version: string;
-  tag: string;
-  authenticated: boolean;
-}
 function versionParts(version: string) {
-  if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version))
+  if (
+    /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(version)?.[0] !==
+    version
+  )
     throw new Error(`Invalid stable Crow release version: ${version}`);
   const parts = version.split(".").map(Number);
   if (parts.some((part) => !Number.isSafeInteger(part)))
@@ -204,56 +202,29 @@ async function publicDownload(
 ) {
   const response = await (options.fetch ?? globalThis.fetch)(url, {
     signal: AbortSignal.timeout(120_000),
+    redirect: "error",
     headers: { "User-Agent": "Crow", Accept: "application/octet-stream" },
   });
   if (!response.ok || !response.body)
-    throw new Error(
-      `GitHub release download failed (${response.status}); for private releases sign in with gh auth login`,
-    );
+    throw new Error(`Crow release download failed (${response.status})`);
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of response.body) {
     size += chunk.length;
     if (size > limit) {
-      throw new Error("GitHub release exceeds its size limit");
+      throw new Error("Crow release exceeds its size limit");
     }
     chunks.push(Buffer.from(chunk));
   }
   return Buffer.concat(chunks);
 }
-async function latest(options: ReleaseOptions): Promise<Release> {
-  let value: unknown;
-  let authenticated = false;
-  try {
-    const result = await (options.run ?? processRun)(
-      "gh",
-      ["api", `repos/${repository}/releases/latest`],
-      { timeout: 30_000, limit: 2 * 1024 * 1024 },
-    );
-    value = JSON.parse(result.stdout);
-    authenticated = true;
-  } catch {
-    value = JSON.parse(
-      (
-        await publicDownload(
-          `https://api.github.com/repos/${repository}/releases/latest`,
-          options,
-          2 * 1024 * 1024,
-        )
-      ).toString("utf8"),
-    );
-  }
-  if (
-    !isRecord(value) ||
-    typeof value.tag_name !== "string" ||
-    value.draft !== false ||
-    value.prerelease !== false ||
-    !value.tag_name.startsWith("v")
-  )
-    throw new Error("GitHub returned invalid stable Crow release metadata");
-  const version = value.tag_name.slice(1);
+async function latest(options: ReleaseOptions) {
+  const metadata = (
+    await publicDownload(`${downloadOrigin}/latest.txt`, options, 128)
+  ).toString("utf8");
+  const version = metadata.endsWith("\n") ? metadata.slice(0, -1) : metadata;
   versionParts(version);
-  return { version, tag: value.tag_name, authenticated };
+  return { version, tag: `v${version}` };
 }
 export async function checkBinaryUpdate(
   currentVersion: string,
@@ -337,41 +308,16 @@ export async function prepareBinaryUpdate(
   const temporary = await mkdtemp(join(root, ".update-"));
   const archiveName = `crow-${release.tag}-linux-${arch}.tar.gz`;
   try {
-    if (release.authenticated) {
-      await (options.run ?? processRun)(
-        "gh",
-        [
-          "release",
-          "download",
-          release.tag,
-          "--repo",
-          repository,
-          "--pattern",
-          archiveName,
-          "--pattern",
-          "SHA256SUMS",
-          "--dir",
-          temporary,
-        ],
-        { timeout: 120_000, limit: 1024 * 1024 },
+    for (const name of [archiveName, "SHA256SUMS"])
+      await writeFile(
+        join(temporary, name),
+        await publicDownload(
+          `${downloadOrigin}/releases/${release.tag}/${name}`,
+          options,
+          name === "SHA256SUMS" ? 1024 * 1024 : maxArchive,
+        ),
+        { mode: 0o600 },
       );
-    } else {
-      for (const name of [archiveName, "SHA256SUMS"])
-        await writeFile(
-          join(temporary, name),
-          await publicDownload(
-            `https://github.com/${repository}/releases/download/${release.tag}/${name}`,
-            options,
-            name === "SHA256SUMS" ? 1024 * 1024 : maxArchive,
-          ),
-          { mode: 0o600 },
-        );
-    }
-    if (
-      (await stat(join(temporary, archiveName))).size > maxArchive ||
-      (await stat(join(temporary, "SHA256SUMS"))).size > 1024 * 1024
-    )
-      throw new Error("GitHub release exceeds its size limit");
     const sums = (await readFile(join(temporary, "SHA256SUMS"), "utf8"))
       .split(/\r?\n/)
       .map((line) => /^([a-fA-F0-9]{64}) [ *](\S+)$/.exec(line))

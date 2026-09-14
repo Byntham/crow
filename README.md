@@ -6,13 +6,13 @@ Each operator runs an independent installation. There is no shared Crow backend,
 
 ## Start
 
-Download and extract the binary for your Linux architecture, then run:
+The hosted installer is prepared for `birdapp.dev` but has not been deployed yet. Once published, install with:
 
 ```sh
-./crow setup
+curl -fsSL https://birdapp.dev/install.sh | sh
 ```
 
-Download a binary from [GitHub Releases](https://github.com/Byntham/Crow/releases). See [installation](docs/user/install.md) for release download instructions and the source installation alternative. The binary includes Node 24 LTS; users do not need Node, pnpm, or a checkout.
+The installer downloads and verifies the Linux binary, installs a permanent command, and offers to start setup. Downloads are public; access to Crow's private source repository is not required. Node 24 LTS is included, so users do not need Node, pnpm, or a checkout. See [installation](docs/user/install.md) for install-only mode and the source installation alternative.
 
 Setup installs the executable and defaults to running both the connection service and worker on this machine. It guides Tailscale Funnel, creation of your own GitHub App, repository selection, a separate Codex subscription login, and persistent systemd startup. Missing supported Linux dependencies can be installed with your confirmation. Browser steps print URLs you can open on a separate desktop. No browser is required on the host.
 

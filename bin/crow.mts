@@ -32,7 +32,7 @@ function errorMessage(error: unknown): string {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
-const help = `Crow: self-hosted GitHub PR reviews\n\n  crow setup [--role both|service|worker] [--ingress funnel|cloudflare|existing] [--port 8787]\n  crow run                         Run in the foreground\n  crow start | stop | service-restart\n  crow status | doctor [--runtime] | logs\n  crow login | models\n  crow enroll owner/repo [--include-backlog] [--worker ID]\n  crow policy owner/repo [--authors alice,bob | --everyone] [--requesters alice,bob]\n  crow repo-config owner/repo --json '{"model":"...","effort":"..."}'\n  crow review|pause|resume|restart owner/repo PR_NUMBER [--model ID --effort LEVEL]\n  crow catch-up [owner/repo] [--include-backlog]\n  crow release [owner/repo]          Release a held catch-up batch\n  crow pair                        Generate credentials for a separate worker\n  crow config [KEY JSON_VALUE]      View redacted config or set a setting\n  crow cleanup | update\n  crow backup FILE --passphrase-file FILE\n  crow restore FILE --passphrase-file FILE\n\nCROW_HOME chooses the installation directory. Default ~/.local/share/crow.\nBrowser URLs printed on a headless host can be opened on another desktop.\n`;
+const help = `Crow: self-hosted GitHub PR reviews\n\n  crow install [--no-setup]         Install a downloaded binary\n  crow setup [--role both|service|worker] [--ingress funnel|cloudflare|existing] [--port 8787]\n  crow run                         Run in the foreground\n  crow start | stop | service-restart\n  crow status | doctor [--runtime] | logs\n  crow login | models\n  crow enroll owner/repo [--include-backlog] [--worker ID]\n  crow policy owner/repo [--authors alice,bob | --everyone] [--requesters alice,bob]\n  crow repo-config owner/repo --json '{"model":"...","effort":"..."}'\n  crow review|pause|resume|restart owner/repo PR_NUMBER [--model ID --effort LEVEL]\n  crow catch-up [owner/repo] [--include-backlog]\n  crow release [owner/repo]          Release a held catch-up batch\n  crow pair                        Generate credentials for a separate worker\n  crow config [KEY JSON_VALUE]      View redacted config or set a setting\n  crow cleanup | update\n  crow backup FILE --passphrase-file FILE\n  crow restore FILE --passphrase-file FILE\n\nCROW_HOME chooses the installation directory. Default ~/.local/share/crow.\nBrowser URLs printed on a headless host can be opened on another desktop.\n`;
 export function parse(argv: string[]) {
   const args: string[] = [],
     flags: Flags = {};
@@ -41,7 +41,9 @@ export function parse(argv: string[]) {
     if (s.startsWith("--")) {
       const [key, inline] = s.slice(2).split(/=(.*)/s);
       if (inline !== undefined) flags[key] = inline;
-      else if (["include-backlog", "everyone", "runtime"].includes(key))
+      else if (
+        ["include-backlog", "everyone", "runtime", "no-setup"].includes(key)
+      )
         flags[key] = true;
       else if (argv[i + 1] && !argv[i + 1].startsWith("--"))
         flags[key] = argv[++i];
@@ -205,6 +207,18 @@ export async function main(argv = process.argv.slice(2)) {
       port: flags.port,
     });
     return;
+  }
+  if (command === "install") {
+    if (
+      rest.length ||
+      Object.keys(flags).some((key) => key !== "no-setup") ||
+      (flags["no-setup"] !== undefined && flags["no-setup"] !== true)
+    )
+      throw new Error("Usage: crow install [--no-setup]");
+    return (await import("../lib/install-command.mjs")).installCommand(
+      root,
+      flags["no-setup"] === true,
+    );
   }
   if (command === "restore" || command === "backup") {
     if (!rest[0] || typeof flags["passphrase-file"] !== "string")

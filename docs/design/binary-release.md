@@ -18,7 +18,7 @@ The build bundles the TypeScript entry points with esbuild, creates a Node SEA p
 
 `dist-release` receives `crow-vVERSION-linux-x64.tar.gz` or `crow-vVERSION-linux-arm64.tar.gz`, plus `SHA256SUMS`. Each archive contains `crow` and `THIRD_PARTY_NOTICES`, including the embedded Node runtime's complete license notices. Use `node scripts/build-binary.mjs --out DIRECTORY` to choose another output directory. Build each architecture separately, then combine the checksum files when assembling a release.
 
-The GitHub workflow builds and tests both architectures natively. A version tag must match `package.json`. Successful tag builds create a **draft** GitHub release for maintainer review. A manual workflow run creates downloadable build artifacts without creating a release. Adding this workflow does not itself publish Crow.
+The GitHub workflow builds and tests both architectures natively. A version tag must match `package.json`. Builds produce private workflow artifacts only. Publication uses a separate manual workflow that verifies the selected successful build, uploads immutable R2 objects, checks the public downloads, and updates `latest.txt` last. Website deployment is also manual. Neither code pushes nor version tags publish downloads. See [hosted distribution](../maintainer/hosted-distribution.md) for account setup and the publication procedure.
 
 ## Runtime safeguards and verification
 

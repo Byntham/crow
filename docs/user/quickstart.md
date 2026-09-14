@@ -2,15 +2,13 @@
 
 Crow needs an always-on Linux machine, a GitHub account with admin or maintain access to the repositories you enroll, and a Codex subscription. Ubuntu with systemd is the supported guided installation path. Setup can install missing Git, GitHub CLI, Codex, and supported ingress tools with your confirmation.
 
-[Download and verify the Linux binary](install.md). No Node installation, package manager, or source checkout is required.
-
-Run the extracted binary as your normal user:
+The [hosted installer](install.md) is prepared but not deployed yet. Once published, run it as your normal user:
 
 ```sh
-./crow setup --role both --ingress funnel
+curl -fsSL https://birdapp.dev/install.sh | sh
 ```
 
-Setup copies the executable into Crow's installation, makes it available through `~/.local/bin/crow`, and requests sudo for system changes that need it. Add `~/.local/bin` to your `PATH` if requested. You can remove the downloaded archive and extracted copy after setup completes.
+It installs Crow and offers to start setup. No Node installation, package manager, source checkout, or repository download permission is required. Missing system dependencies may need sudo during setup. If you install without setup, continue with `crow setup` or the full command printed by the installer.
 
 1. Choose `both`, the default role. This runs the connection service and worker together.
 2. Sign into GitHub CLI if needed. Open its URL on your desktop and enter the device code.

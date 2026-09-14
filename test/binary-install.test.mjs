@@ -52,15 +52,10 @@ function releaseOptions({
   checksum = true,
   version = "0.3.0",
   returnedVersion = version,
-  authenticated = true,
+  metadata = `${version}\n`,
   arch = "x64",
 } = {}) {
   const calls = [];
-  const metadata = JSON.stringify({
-    tag_name: `v${version}`,
-    draft: false,
-    prerelease: false,
-  });
   const name = `crow-v${version}-linux-${arch}.tar.gz`;
   const sums = `${checksum ? createHash("sha256").update(payload).digest("hex") : "0".repeat(64)}  ${name}\n`;
   return {
@@ -69,24 +64,18 @@ function releaseOptions({
     arch,
     run: async (command, args) => {
       calls.push([command, args]);
-      if (command === "gh" && args[0] === "api") {
-        if (!authenticated) throw new Error("gh unavailable");
-        return { stdout: metadata, stderr: "" };
-      }
-      if (command === "gh") {
-        const dir = args[args.indexOf("--dir") + 1];
-        await writeFile(join(dir, name), payload);
-        await writeFile(join(dir, "SHA256SUMS"), sums);
-        return { stdout: "", stderr: "" };
-      }
+      assert.notEqual(command, "gh");
       assert.deepEqual(args, ["--version"]);
       return { stdout: `crow ${returnedVersion}\n`, stderr: "" };
     },
     fetch: async (url, options) => {
       assert.equal(options.headers.Authorization, undefined);
-      if (url.endsWith("/latest")) return new Response(metadata);
-      if (url.endsWith("/SHA256SUMS")) return new Response(sums);
-      assert.ok(url.endsWith(`/${name}`));
+      assert.equal(options.redirect, "error");
+      if (url === "https://downloads.birdapp.dev/latest.txt")
+        return new Response(metadata);
+      const base = `https://downloads.birdapp.dev/releases/v${version}`;
+      if (url === `${base}/SHA256SUMS`) return new Response(sums);
+      assert.equal(url, `${base}/${name}`);
       return new Response(payload);
     },
   };
@@ -147,7 +136,7 @@ test("update validates before activation and can roll back without changing a cu
   const prepared = await prepareBinaryUpdate(root, "0.2.0", options);
   assert.equal(prepared.version, "0.3.0");
   assert.equal(await readlink(join(root, "current")), previous);
-  assert.equal(options.calls.filter(([command]) => command !== "gh").length, 1);
+  assert.equal(options.calls.length, 1);
   const rollback = await prepared.activate();
   assert.notEqual(await readlink(join(root, "current")), previous);
   assert.equal(await readlink(join(binDir, "crow")), binaryPath(root));
@@ -159,10 +148,9 @@ test("update validates before activation and can roll back without changing a cu
   );
 });
 
-test("public release fallback never needs GitHub credentials and supports arm64", async (t) => {
+test("public hosted releases need no GitHub credentials and support arm64", async (t) => {
   const { root } = await fixture(t);
   const options = releaseOptions({
-    authenticated: false,
     arch: "arm64",
     payload: archive([{ name: "crow", body: executable("arm64") }]),
   });
@@ -187,10 +175,7 @@ test("invalid release payloads are rejected before executable validation or acti
   ]) {
     const options = releaseOptions(input);
     await assert.rejects(prepareBinaryUpdate(root, "0.2.0", options));
-    assert.equal(
-      options.calls.every(([command]) => command === "gh"),
-      true,
-    );
+    assert.equal(options.calls.length, 0);
     assert.equal((await readdir(root)).length, 0);
   }
   await assert.rejects(
@@ -203,7 +188,7 @@ test("invalid release payloads are rejected before executable validation or acti
   );
 });
 
-test("update checks use semantic versions and return warnings for unavailable private releases", async (t) => {
+test("update checks use semantic versions and return warnings for unavailable hosted releases", async (t) => {
   const { root } = await fixture(t);
   assert.deepEqual(await checkBinaryUpdate("0.3.0", releaseOptions()), {
     available: false,
@@ -218,13 +203,10 @@ test("update checks use semantic versions and return warnings for unavailable pr
     null,
   );
   const unavailable = await checkBinaryUpdate("0.2.0", {
-    run: async () => {
-      throw Error("missing gh");
-    },
     fetch: async () => new Response("", { status: 404 }),
   });
   assert.equal(unavailable.available, false);
-  assert.match(unavailable.warning, /gh auth login/);
+  assert.match(unavailable.warning, /Crow release download failed \(404\)/);
   await assert.rejects(
     prepareBinaryUpdate(root, "0.2.0", { platform: "darwin" }),
     /Linux/,
@@ -234,6 +216,58 @@ test("update checks use semantic versions and return warnings for unavailable pr
       .warning,
     /Invalid/,
   );
+});
+
+test("latest metadata accepts only a stable version and one optional newline", async (t) => {
+  const { root } = await fixture(t);
+  for (const metadata of ["0.3.0", "0.3.0\n"])
+    assert.deepEqual(
+      await checkBinaryUpdate("0.2.0", releaseOptions({ metadata })),
+      { available: true, version: "0.3.0" },
+    );
+  for (const metadata of [
+    "",
+    "v0.3.0",
+    "0.3.0-rc.1",
+    "0.3.0+build",
+    "00.3.0",
+    " 0.3.0",
+    "0.3.0 ",
+    "0.3.0\r\n",
+    "0.3.0\n\n",
+    "0.3.0\n0.4.0",
+    "0.3.0\n/path",
+    "9007199254740992.0.0",
+    "0".repeat(129),
+  ]) {
+    const options = releaseOptions({ metadata });
+    const status = await checkBinaryUpdate("0.2.0", options);
+    assert.equal(status.available, false, JSON.stringify(metadata));
+    assert.ok(status.warning);
+    await assert.rejects(prepareBinaryUpdate(root, "0.2.0", options));
+    assert.equal(options.calls.length, 0);
+  }
+  await assert.rejects(readdir(root), { code: "ENOENT" });
+});
+
+test("download failures and oversized checksums never execute a candidate", async (t) => {
+  const { root } = await fixture(t);
+  for (const failure of ["network", "status", "size"]) {
+    const options = releaseOptions();
+    const download = options.fetch;
+    options.fetch = async (url, request) => {
+      if (!url.endsWith("/SHA256SUMS")) return download(url, request);
+      if (failure === "network") throw new Error("Connection lost");
+      if (failure === "status") return new Response("", { status: 503 });
+      return new Response("x".repeat(1024 * 1024 + 1));
+    };
+    await assert.rejects(
+      prepareBinaryUpdate(root, "0.2.0", options),
+      /Connection lost|download failed|size limit/,
+    );
+    assert.equal(options.calls.length, 0);
+    assert.deepEqual(await readdir(root), []);
+  }
 });
 
 test("source wrapper replacement requires explicit migration and recognizable Crow content", async (t) => {

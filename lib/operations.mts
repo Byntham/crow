@@ -9,6 +9,7 @@ import {
 import { mkdir, rm } from "node:fs/promises";
 import {
   atomic,
+  acquireLock,
   processRun,
   cleanEnv,
   json,
@@ -379,7 +380,28 @@ export async function waitForStartup(
   } while (Date.now() <= deadline);
   throw new Error("Updated Crow did not finish starting");
 }
+interface UpdateOptions {
+  run?: Run;
+  binary?: boolean;
+  prepareRelease?: typeof prepareBinaryUpdate;
+  startup?: typeof waitForStartup;
+}
 export async function update(
+  root: string,
+  config: CrowConfig,
+  options: UpdateOptions = {},
+) {
+  const release =
+    (options.binary ?? isBinary)
+      ? await acquireLock(join(root, "install.lock"))
+      : null;
+  try {
+    return await performUpdate(root, config, options);
+  } finally {
+    await release?.();
+  }
+}
+async function performUpdate(
   root: string,
   config: CrowConfig,
   {
@@ -387,12 +409,7 @@ export async function update(
     binary = isBinary,
     prepareRelease = prepareBinaryUpdate,
     startup = waitForStartup,
-  }: {
-    run?: Run;
-    binary?: boolean;
-    prepareRelease?: typeof prepareBinaryUpdate;
-    startup?: typeof waitForStartup;
-  } = {},
+  }: UpdateOptions,
 ) {
   const prepared = binary
     ? await prepareRelease(root, version(), { run })

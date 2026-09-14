@@ -119,19 +119,27 @@ export function cleanEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     ...extra,
   };
 }
+export function hostEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const session = Object.fromEntries(
+    ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"]
+      .filter((key) => process.env[key])
+      .map((key) => [key, process.env[key]]),
+  );
+  return { ...cleanEnv(), ...session, ...extra };
+}
 export function processRun(
   command: string,
   args: string[],
   {
     cwd,
-    env = cleanEnv(),
+    env = hostEnv(),
     input,
     signal,
     timeout = 0,
     limit = 16 * 1024 * 1024,
     onLine,
     inherit = false,
-    detached = true,
+    detached = !inherit,
     capture = true,
   }: ProcessOptions = {},
 ): Promise<ProcessResult> {

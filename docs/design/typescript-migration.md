@@ -47,7 +47,7 @@ Generated `dist/` output is disposable and excluded from version control. Develo
 
 ## Installation
 
-The recommended installation is now a prebuilt Linux binary. Users download and verify the archive, extract it, and run `./crow setup`. The executable includes the Node 24 LTS runtime. Setup installs it into Crow's managed release directory and configures the stable command and systemd service. Users do not need source files, Node, pnpm, or TypeScript. See [binary releases](binary-release.md).
+The recommended installation is now a prebuilt Linux binary. The hosted installer downloads and verifies the archive, then installs it and offers setup. Users can also extract a downloaded archive and run `./crow install`. The executable includes the Node 24 LTS runtime. Setup installs it into Crow's managed release directory and configures the stable command and systemd service. Users do not need source files, Node, pnpm, or TypeScript. See [binary releases](binary-release.md).
 
 Source installation remains available through `bash scripts/install.sh` followed by `crow setup`. That installer selects or installs Node 24, strips source into a fresh staging directory, validates generated syntax, and runs CLI help before activating the release. It uses the checkout's source rather than an existing `dist/` directory. Installed modules live in the release's `bin/` and `lib/` directories, and the CLI wrapper and systemd service run those ordinary JavaScript modules. This path also needs neither pnpm nor TypeScript. Strict type checking is a development and release check.
 

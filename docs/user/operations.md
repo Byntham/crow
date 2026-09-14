@@ -65,11 +65,11 @@ crow update
 crow cleanup
 ```
 
-`crow status` checks for updates at most once per day and reports available versions. Binary installations check published stable GitHub releases; source installations check the checkout's configured upstream. Offline update checks do not prevent status output. A private release requires an authenticated GitHub CLI account with repository access.
+`crow status` checks for updates at most once per day and reports available versions. Binary installations check the public stable version at `downloads.birdapp.dev/latest.txt`; source installations check the checkout's configured upstream. Offline update checks do not prevent status output. Download checks do not require GitHub authentication.
 
 The native user systemd service starts after reboot and continues after logout. `crow run` runs in the foreground for another service manager.
 
-For a binary installation, `crow update` downloads the published stable release for the host architecture and verifies its SHA-256 checksum and reported version before stopping the service. It drains active work, switches the installed executable, and restarts Crow. It verifies that the new process finished initialization and restores the previous executable if startup fails. There is no source checkout or local build step. Draft releases are not update candidates.
+For a binary installation, `crow update` downloads the published stable release for the host architecture from `downloads.birdapp.dev` and verifies its SHA-256 checksum and reported version before stopping the service. It drains active work, switches the installed executable, and restarts Crow. It verifies that the new process finished initialization and restores the previous executable if startup fails. There is no source checkout or local build step. Only an explicitly published stable version is an update candidate. The hosted endpoint must be deployed before this update path is available.
 
 For a source installation, `crow update` fetches the checkout's configured upstream, requires a clean tree, drains active reviews, stops Crow, applies a fast-forward update, runs checks, and starts the service. Keep the source checkout available for these updates. Neither update path replaces your Codex installation. If an update fails, inspect the reported error before running `crow start`.
 
