@@ -200,7 +200,10 @@ export async function startService(
     busy = false,
     publishing = false,
     auditing = false;
-  const scans = new Map<string, Promise<CatchUpResult>>();
+  const scans = new Map<
+    string,
+    { includeBacklog: boolean; task: Promise<CatchUpResult> }
+  >();
   if (config.role === "both")
     store.put("workers", config.worker.id, {
       ...store.get("workers", config.worker.id),
@@ -263,7 +266,12 @@ export async function startService(
     includeBacklog = false,
   ): Promise<CatchUpResult> {
     const existing = scans.get(name);
-    if (existing) return existing;
+    if (existing) {
+      if (!includeBacklog || existing.includeBacklog) return existing.task;
+      // An explicit inclusive scan must not inherit a normal scan's exclusions.
+      await existing.task.catch(() => {});
+      return catchUp(name, true);
+    }
     const task = (async () => {
       const repo = repoFor(name),
         token = await github.token(repo),
@@ -309,11 +317,11 @@ export async function startService(
       for (const pr of fresh) store.queue(repo, pr, { held });
       return { queued: held ? 0 : fresh.length, held: held ? fresh.length : 0 };
     })();
-    scans.set(name, task);
+    scans.set(name, { includeBacklog, task });
     try {
       return await task;
     } finally {
-      scans.delete(name);
+      if (scans.get(name)?.task === task) scans.delete(name);
     }
   }
   async function handleEvent(e: CrowEvent) {
@@ -391,6 +399,8 @@ export async function startService(
   async function publish(j: PublishableReviewJob) {
     const repo = repoFor(j.repo),
       { pr, token } = await refreshPr(repo, j.number);
+    // An operator may pause publication while GitHub is responding.
+    if (store.get("jobs", j.id)?.state !== "publishing") return;
     if (
       !eligible(repo, pr) ||
       pr.head.sha !== j.head ||
@@ -403,9 +413,10 @@ export async function startService(
     // Target SHA changing needs a worker comparison check before publishing. Do not label an unchecked comparison current.
     if (pr.base.sha !== j.comparison.targetSha) {
       store.updateJob(j.id, {
-        state: "paused",
+        state: "queued",
+        nextAt: 0,
         reason:
-          "Target branch changed before publication. Resume to verify the comparison.",
+          "Target branch changed; verifying the comparison before publication.",
       });
       return;
     }
@@ -991,9 +1002,24 @@ export async function startService(
       }
       if (!j.settings)
         throw new Error("Review settings are missing from the active job");
+      const kind = optionalString(a.kind) || "transient";
+      if (kind === "superseded") {
+        const repo = repoFor(j.repo),
+          { pr } = await refreshPr(repo, j.number),
+          current = store.get("jobs", j.id);
+        if (current?.state !== "reviewing" || current.lease !== lease)
+          return { cancel: true };
+        store.updateJob(j.id, { state: "superseded" }, lease);
+        if (eligible(repo, pr)) {
+          const replacement = store.queue(repo, pr);
+          // GitHub's PR snapshot may briefly lag the fetched Git reference.
+          if (pr.head.sha === j.head && pr.base.ref === j.target)
+            store.updateJob(replacement.id, { nextAt: Date.now() + 5000 });
+        }
+        return { cancel: true };
+      }
       const count = j.retries + 1,
-        retry = j.settings.retry,
-        kind = optionalString(a.kind) || "transient";
+        retry = j.settings.retry;
       let state: ReviewState = "paused",
         reason = "Review interrupted. Resume saved work or explicitly restart.",
         nextAt = 0;
@@ -1007,7 +1033,11 @@ export async function startService(
             Math.min(Number(a.retryAfter) || 0, 86400000),
           );
         reason = `Provider interrupted; retry ${count}/${retry.count} is scheduled.`;
-        store.put("state", "cooldown", nextAt);
+        store.put(
+          "state",
+          "cooldown",
+          Math.max(Number(store.get("state", "cooldown")) || 0, nextAt),
+        );
       }
       if (kind === "auth")
         reason =

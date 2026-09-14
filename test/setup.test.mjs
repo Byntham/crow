@@ -369,3 +369,110 @@ test("update checks accept release metadata without a Git revision", async () =>
     await rm(release, { recursive: true, force: true });
   }
 });
+
+for (const phase of ["drain", "poll", "stop", "install", "ready", "success"]) {
+  test(`setup restores its drain after ${phase}`, async () => {
+    const root = await mkdtemp(join(tmpdir(), "crow-setup-drain-"));
+    const { Store } = await import("../dist/lib/store.mjs");
+    const { restartSetupService } = await import("../dist/lib/setup.mjs");
+    const store = new Store(join(root, "service.sqlite"));
+    const calls = [];
+    let online = true;
+    let reads = 0;
+    const error = new Error(`${phase} failed`);
+    try {
+      const operation = restartSetupService(defaults(root), root, {
+        log: () => {},
+        administer: async (_config, action) => {
+          calls.push(action);
+          if (!online) throw new Error("service unavailable");
+          if (action === "status") {
+            if (++reads > 1 && phase === "poll") throw error;
+            return { jobs: [], draining: !!store.get("state", "drain") };
+          }
+          if (action === "drain") {
+            store.put("state", "drain", true);
+            // Model a successful mutation followed by a lost response.
+            if (phase === "drain") throw error;
+          } else if (action === "undrain") store.delete("state", "drain");
+          else throw new Error(`unexpected action ${action}`);
+          return {};
+        },
+        stop: async () => {
+          calls.push("stop");
+          if (phase === "stop") throw error;
+          online = false;
+        },
+        install: async () => {
+          calls.push("install");
+          if (phase === "install") throw error;
+          if (phase !== "ready") online = true;
+        },
+        ready: async () => {
+          calls.push("ready");
+          if (phase === "ready") throw error;
+        },
+      });
+      if (phase === "success") await operation;
+      else await assert.rejects(operation, (actual) => actual === error);
+      assert.equal(store.get("state", "drain"), null);
+      assert.equal(calls.at(-1), "undrain");
+      if (phase === "success")
+        assert.deepEqual(calls, [
+          "status",
+          "drain",
+          "status",
+          "stop",
+          "install",
+          "ready",
+          "undrain",
+        ]);
+      // A new process sees the cleanup even after readiness/install failed.
+      const reopened = new Store(join(root, "service.sqlite"));
+      try {
+        assert.equal(reopened.get("state", "drain"), null);
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      store.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const online of [true, false]) {
+  for (const fail of [true, false]) {
+    test(`setup preserves an operator drain with service online=${online}, failure=${fail}`, async () => {
+      const root = await mkdtemp(join(tmpdir(), "crow-setup-prior-drain-"));
+      const { Store } = await import("../dist/lib/store.mjs");
+      const { restartSetupService } = await import("../dist/lib/setup.mjs");
+      const store = new Store(join(root, "service.sqlite"));
+      store.put("state", "drain", true);
+      const calls = [];
+      try {
+        const operation = restartSetupService(defaults(root), root, {
+          log: () => {},
+          administer: async (_config, action) => {
+            calls.push(action);
+            assert.equal(action, "status");
+            if (!online) throw new Error("offline");
+            return { jobs: [], draining: true };
+          },
+          stop: async () => {},
+          install: async () => {
+            if (fail) throw new Error("install failed");
+          },
+          ready: async () => {},
+        });
+        if (fail) await assert.rejects(operation, /install failed/);
+        else await operation;
+        assert.equal(store.get("state", "drain"), true);
+        assert(calls.every((action) => action === "status"));
+      } finally {
+        store.close();
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  }
+}

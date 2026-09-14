@@ -955,7 +955,7 @@ export async function runReview({
     : "";
   const prompt = session
     ? `Continue the incomplete Crow review for the same comparison. If the previous final response was invalid, correct it using saved evidence. Return the complete JSON report.\n${boundary}${taskPrompt}`
-    : `${boundary}${taskPrompt}\n\nReview ${job.repo} PR #${job.number}. Head: ${source.head}; merge base: ${source.base}; target: ${source.target}. Use crow_inspection.diff to inspect the comparison, and other inspection tools for supporting context.\n${prContextText(job.prContext)}${guidanceText(guidance)}\n\nReturn only a complete report matching the supplied JSON schema.`;
+    : `${boundary}${taskPrompt}\n\nReview ${job.repo} PR #${job.number}. Head: ${source.head}; merge base: ${source.base}; target: ${source.target}. Start with crow_inspection.list_files using changed_only=true to discover the changed paths, then use crow_inspection.diff to inspect the comparison and other inspection tools for supporting context. Follow nextOffset until null for both file lists and diff pages; a truncated page does not cover the complete comparison.\n${prContextText(job.prContext)}${guidanceText(guidance)}\n\nReturn only a complete report matching the supplied JSON schema.`;
   let lastMessage: string | undefined,
     providerFailure: ProviderError | null | undefined,
     completed = false,

@@ -14,7 +14,7 @@ import {
   guidance,
   inspectionTool,
 } from "../dist/lib/inspection.mjs";
-async function fixture(t) {
+async function fixture(t, { largeDiff = false } = {}) {
   const dir = await mkdtemp(join(tmpdir(), "crow-inspection-"));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const run = (args) =>
@@ -34,6 +34,7 @@ async function fixture(t) {
   await writeFile(join(dir, "src", "AGENTS.md"), "Scoped source rules.");
   await writeFile(join(dir, "src", "api.js"), "const old = 1;\n");
   await writeFile(join(dir, "binary.dat"), Buffer.from([0, 1, 2]));
+  if (largeDiff) await writeFile(join(dir, "deleted.txt"), "removed by PR\n");
   await symlink("/etc/passwd", join(dir, "outside"));
   await run(["add", "."]);
   await run(["commit", "-m", "base"]);
@@ -46,6 +47,17 @@ async function fixture(t) {
   await writeFile(join(dir, "AGENTS.md"), "Untrusted changed rules.");
   await writeFile(join(dir, ".crow", "review.md"), "Untrusted review rules.");
   await writeFile(join(dir, "$(touch SHOULD_NOT_EXIST).txt"), "literal-name");
+  if (largeDiff) {
+    await rm(join(dir, "deleted.txt"));
+    await writeFile(
+      join(dir, "a-large.txt"),
+      "changed line with context\n".repeat(12000),
+    );
+    await writeFile(
+      join(dir, "z-later.txt"),
+      "late change must remain reachable\n",
+    );
+  }
   await run(["add", "."]);
   await run(["commit", "-m", "feature"]);
   const head = (await run(["rev-parse", "HEAD"])).stdout.trim();
@@ -155,12 +167,132 @@ test("inspection tools expose bounded line reads and reject execution tools", as
   );
   assert.deepEqual(
     await inspectionTool(source, "list_files", { prefix: "src/" }),
-    ["src/AGENTS.md", "src/api.js"],
+    {
+      files: ["src/AGENTS.md", "src/api.js"],
+      offset: 0,
+      total: 2,
+      nextOffset: null,
+      truncated: false,
+    },
   );
   await assert.rejects(
     inspectionTool(source, "shell", { command: "npm test" }),
     /Unknown inspection tool/,
   );
+});
+
+test("large PR inspection exposes every changed path and every diff page", async (t) => {
+  const { source } = await fixture(t, { largeDiff: true });
+  const full = await diff(source);
+  assert.ok(full.length > 200000);
+  const first = await inspectionTool(source, "diff", {});
+  assert.equal(first.truncated, true);
+  assert.equal(first.nextOffset, 200000);
+  assert.equal(first.total, full.length);
+  assert.doesNotMatch(first.patch, /late change must remain reachable/);
+  let assembled = first.patch;
+  let offset = first.nextOffset;
+  while (offset !== null) {
+    const page = await inspectionTool(source, "diff", { offset });
+    assert.equal(page.offset, offset);
+    assert.equal(page.truncated, page.nextOffset !== null);
+    assembled += page.patch;
+    offset = page.nextOffset;
+  }
+  assert.equal(assembled, full);
+  assert.match(assembled, /late change must remain reachable/);
+
+  const changed = [];
+  offset = 0;
+  while (offset !== null) {
+    const page = await inspectionTool(source, "list_files", {
+      changed_only: true,
+      offset,
+      count: 2,
+    });
+    changed.push(...page.files);
+    assert.equal(page.truncated, page.nextOffset !== null);
+    offset = page.nextOffset;
+  }
+  assert.ok(changed.includes("deleted.txt"));
+  assert.ok(changed.includes("z-later.txt"));
+  assert.ok(!changed.includes("binary.dat"));
+  assert.ok(!changed.includes("unrelated.txt"));
+  const later = await inspectionTool(source, "diff", { path: "z-later.txt" });
+  assert.equal(later.truncated, false);
+  assert.match(later.patch, /late change must remain reachable/);
+  const deleted = await inspectionTool(source, "diff", { path: "deleted.txt" });
+  assert.match(deleted.patch, /deleted file mode/);
+});
+
+test("inspection pagination rejects invalid bounds and reports exhausted pages", async (t) => {
+  const { source } = await fixture(t);
+  for (const name of ["list_files", "diff"]) {
+    for (const args of [
+      { offset: -1 },
+      { offset: 0.5 },
+      { offset: Infinity },
+      { offset: "0" },
+      { count: 0 },
+      { count: 200001 },
+    ]) {
+      await assert.rejects(inspectionTool(source, name, args), /offset must/);
+    }
+    const page = await inspectionTool(source, name, { offset: 1000000 });
+    assert.equal(page.nextOffset, null);
+    assert.equal(page.truncated, false);
+    assert.equal((page.files ?? page.patch).length, 0);
+  }
+});
+
+test("MCP advertises pagination and serializes completion metadata for reviewers", async (t) => {
+  const { source, dir } = await fixture(t);
+  const sourcePath = join(dir, "source.json");
+  await writeFile(sourcePath, JSON.stringify(source));
+  const response = await processRun(
+    process.execPath,
+    ["dist/bin/inspection-mcp.mjs", sourcePath],
+    {
+      input: [
+        { jsonrpc: "2.0", id: 1, method: "tools/list" },
+        {
+          jsonrpc: "2.0",
+          id: 2,
+          method: "tools/call",
+          params: {
+            name: "list_files",
+            arguments: { changed_only: true, count: 1 },
+          },
+        },
+        {
+          jsonrpc: "2.0",
+          id: 3,
+          method: "tools/call",
+          params: { name: "diff", arguments: { count: 20 } },
+        },
+      ].map((request) => JSON.stringify(request) + "\n").join(""),
+    },
+  );
+  const messages = response.stdout.trim().split("\n").map(JSON.parse);
+  const definitions = messages[0].result.tools;
+  for (const name of ["list_files", "diff"]) {
+    const definition = definitions.find((tool) => tool.name === name);
+    assert.equal(definition.inputSchema.properties.offset.minimum, 0);
+    assert.match(definition.description, /nextOffset/);
+  }
+  assert.equal(
+    definitions.find((tool) => tool.name === "list_files")
+      .inputSchema.properties.changed_only.type,
+    "boolean",
+  );
+  const filesPage = JSON.parse(messages[1].result.content[0].text);
+  assert.equal(filesPage.files.length, 1);
+  assert.equal(filesPage.nextOffset, 1);
+  assert.equal(filesPage.truncated, true);
+  const diffPage = JSON.parse(messages[2].result.content[0].text);
+  assert.equal(diffPage.patch.length, 20);
+  assert.equal(diffPage.nextOffset, 20);
+  assert.equal(diffPage.truncated, true);
 });
 
 test("diff does not invoke a configured external diff command", async (t) => {

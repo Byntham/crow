@@ -127,6 +127,45 @@ export async function diff(source: InspectionSource, path?: string) {
   if (path) args.push("--", safePath(path));
   return git(source.dir, args);
 }
+async function changedFiles(source: InspectionSource) {
+  return (
+    await git(source.dir, [
+      "diff",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--no-renames",
+      "--name-only",
+      "-z",
+      revision(source.base),
+      revision(source.head),
+    ])
+  )
+    .split("\0")
+    .filter(Boolean);
+}
+function pageBounds(args: Record<string, unknown>, maximum: number) {
+  const offset = args.offset ?? 0;
+  const count = args.count ?? maximum;
+  if (
+    typeof offset !== "number" ||
+    !Number.isSafeInteger(offset) ||
+    offset < 0 ||
+    typeof count !== "number" ||
+    !Number.isSafeInteger(count) ||
+    count < 1 ||
+    count > maximum
+  )
+    throw new Error(
+      `offset must be a nonnegative integer and count must be between 1 and ${maximum}`,
+    );
+  return { offset, count };
+}
+function pageMetadata(total: number, offset: number, count: number) {
+  const nextOffset = offset + count < total ? offset + count : null;
+  return { offset, total, nextOffset, truncated: nextOffset !== null };
+}
+type InspectionPage = ReturnType<typeof pageMetadata> &
+  ({ files: string[] } | { patch: string });
 export async function guidance(source: InspectionSource): Promise<Guidance> {
   const names = await files(source, source.targetSha),
     wanted = names
@@ -154,18 +193,28 @@ export async function inspectionTool(
   source: InspectionSource,
   name: string,
   input: unknown,
-): Promise<string | string[]> {
+): Promise<string | InspectionPage> {
   if (!isRecord(input))
     throw new Error("Inspection arguments must be an object");
   const args = input;
-  if (name === "list_files")
-    return (await files(source))
-      .filter(
-        (x) =>
-          !args.prefix ||
-          (typeof args.prefix === "string" && x.startsWith(args.prefix)),
-      )
-      .slice(0, 10000);
+  if (name === "list_files") {
+    const { offset, count } = pageBounds(args, 10000);
+    if (args.prefix !== undefined && typeof args.prefix !== "string")
+      throw new Error("prefix must be a string");
+    if (
+      args.changed_only !== undefined &&
+      typeof args.changed_only !== "boolean"
+    )
+      throw new Error("changed_only must be a boolean");
+    const prefix = typeof args.prefix === "string" ? args.prefix : "";
+    const names = (
+      await (args.changed_only ? changedFiles(source) : files(source))
+    ).filter((path) => path.startsWith(prefix));
+    return {
+      files: names.slice(offset, offset + count),
+      ...pageMetadata(names.length, offset, count),
+    };
+  }
   if (name === "read_file") {
     const text = await readBlob(
       source,
@@ -185,10 +234,17 @@ export async function inspectionTool(
       .map((s, i) => `${start + i}: ${s}`)
       .join("\n");
   }
-  if (name === "diff")
-    return (
-      await diff(source, args.path ? safePath(args.path) : undefined)
-    ).slice(0, 200000);
+  if (name === "diff") {
+    const { offset, count } = pageBounds(args, 200000);
+    const patch = await diff(
+      source,
+      args.path ? safePath(args.path) : undefined,
+    );
+    return {
+      patch: patch.slice(offset, offset + count),
+      ...pageMetadata(patch.length, offset, count),
+    };
+  }
   if (name === "search") {
     if (
       typeof args.text !== "string" ||

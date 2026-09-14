@@ -9,6 +9,7 @@ import { defaults, save, validateConfig } from "./config.mjs";
 import { isBinary, version } from "./runtime.mjs";
 import { installDownloaded } from "./install-command.mjs";
 import { installCodex } from "./codex-install.mjs";
+import { Store } from "./store.mjs";
 import {
   atomic,
   isRecord,
@@ -578,6 +579,83 @@ export function applySetupPort(config: CrowConfig, port: unknown) {
   config.port = selected;
   config.serviceUrl = `http://127.0.0.1:${selected}`;
 }
+// Restore only the drain requested by this setup run, including when the
+// service cannot restart. The scheduler reads this persistent row on each claim.
+export async function restartSetupService(
+  config: CrowConfig,
+  root: string,
+  {
+    run = processRun,
+    log = console.log,
+    administer = admin,
+    stop = serviceAction,
+    install = installService,
+    ready = waitForService,
+  }: {
+    run?: Run;
+    log?: (value: unknown) => void;
+    administer?: typeof admin;
+    stop?: typeof serviceAction;
+    install?: typeof installService;
+    ready?: typeof waitForService;
+  } = {},
+) {
+  let ownsDrain = false;
+  let failure: unknown;
+  let failed = false;
+  try {
+    const current = await administer(config, "status").catch(() => null);
+    if (current) {
+      log("Waiting for active reviews before applying setup changes.");
+      if (!current.draining) {
+        // A failed HTTP response may still have applied the request.
+        ownsDrain = true;
+        await administer(config, "drain", {});
+      }
+      for (;;) {
+        const state = await administer(config, "status");
+        if (
+          !(state.jobs || []).some((j) =>
+            ["reviewing", "publishing"].includes(j.state),
+          )
+        )
+          break;
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+      await stop(root, "stop", { run });
+    }
+    await install(root, { run });
+    await ready(config);
+  } catch (error) {
+    failed = true;
+    failure = error;
+    throw error;
+  } finally {
+    if (ownsDrain) {
+      try {
+        try {
+          await administer(config, "undrain", {});
+        } catch {
+          // Setup runs on the connection-service host. SQLite coordinates this
+          // write with a surviving service, and retains it for a later restart.
+          const store = new Store(join(root, "service.sqlite"));
+          try {
+            store.delete("state", "drain");
+          } finally {
+            store.close();
+          }
+        }
+      } catch (error) {
+        if (failed)
+          throw new AggregateError(
+            [failure, error],
+            "Setup failed and could not clear its drain. Run crow undrain after restoring the service.",
+          );
+        throw error;
+      }
+    }
+  }
+}
 export async function setup(
   root: string,
   {
@@ -765,26 +843,7 @@ export async function setup(
       await save(config, root);
     }
     if (config.role !== "worker") {
-      let running = false;
-      try {
-        await admin(config, "status");
-        running = true;
-      } catch {}
-      if (running) {
-        log("Waiting for active reviews before applying setup changes.");
-        await admin(config, "drain", {});
-        for (;;) {
-          const state = await admin(config, "status");
-          if (
-            !(state.jobs || []).some((j) =>
-              ["reviewing", "publishing"].includes(j.state),
-            )
-          )
-            break;
-          await new Promise((r) => setTimeout(r, 1000));
-        }
-        await serviceAction(root, "stop", { run });
-      }
+      await restartSetupService(config, root, { run, log });
     } else {
       const pid = await processId(join(root, "runtime.lock"));
       if (pid) {
@@ -802,11 +861,9 @@ export async function setup(
         }
         await serviceAction(root, "stop", { run });
       }
+      await installService(root, { run });
     }
-    await installService(root, { run });
     if (config.role !== "worker") {
-      await waitForService(config);
-      await admin(config, "undrain", {});
       const current = await admin(config, "status");
       if (config.role === "service")
         log(

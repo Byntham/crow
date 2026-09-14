@@ -28,8 +28,14 @@ export async function inspectionMain(sourcePath: string, contextPath?: string) {
   const definitions: ToolDefinition[] = [
     {
       name: "list_files",
-      description: "List tracked files at the reviewed PR commit.",
-      properties: { prefix: { type: "string" } },
+      description:
+        "List files with pagination metadata. Set changed_only=true to enumerate every changed path against the merge base, including deleted files; otherwise list all tracked files at the PR commit. Follow nextOffset until null before treating the list as complete.",
+      properties: {
+        prefix: { type: "string" },
+        changed_only: { type: "boolean" },
+        offset: { type: "integer", minimum: 0 },
+        count: { type: "integer", minimum: 1, maximum: 10000 },
+      },
     },
     {
       name: "read_file",
@@ -45,8 +51,13 @@ export async function inspectionMain(sourcePath: string, contextPath?: string) {
     },
     {
       name: "diff",
-      description: "Read the PR diff against its merge base.",
-      properties: { path: { type: "string" } },
+      description:
+        "Read a page of the PR diff against its merge base, optionally for one path. Returns patch plus pagination metadata. offset/count use character offsets, not lines. Follow nextOffset until null to read the complete diff; a truncated page is not the entire comparison. Use list_files with changed_only=true to discover paths independently of diff size.",
+      properties: {
+        path: { type: "string" },
+        offset: { type: "integer", minimum: 0 },
+        count: { type: "integer", minimum: 1, maximum: 200000 },
+      },
     },
     {
       name: "search",

@@ -385,6 +385,8 @@ interface UpdateOptions {
   binary?: boolean;
   prepareRelease?: typeof prepareBinaryUpdate;
   startup?: typeof waitForStartup;
+  release?: string;
+  installUnit?: typeof installService;
 }
 export async function update(
   root: string,
@@ -409,6 +411,8 @@ async function performUpdate(
     binary = isBinary,
     prepareRelease = prepareBinaryUpdate,
     startup = waitForStartup,
+    release = dirname(dirname(cliPath)),
+    installUnit = installService,
   }: UpdateOptions,
 ) {
   const prepared = binary
@@ -420,8 +424,8 @@ async function performUpdate(
   if (binary) {
     if (!prepared) return { updated: false, message: "Crow is current." };
   } else {
-    metadata = await metadataAt(dirname(dirname(cliPath)));
-    project = sourceRoot(dirname(dirname(cliPath)), metadata);
+    metadata = await metadataAt(release);
+    project = sourceRoot(release, metadata);
     const status = await run("git", ["status", "--porcelain"], {
       cwd: project,
     });
@@ -441,7 +445,17 @@ async function performUpdate(
       { cwd: project },
     );
     upstream = ref.stdout.trim();
-    if (Number(count.stdout.trim()) === 0)
+    const pending = Number(count.stdout.trim());
+    if (!Number.isSafeInteger(pending) || pending < 0)
+      throw new Error("Invalid update comparison");
+    const checkout = metadata?.installation
+      ? (
+          await run("git", ["rev-parse", "HEAD"], { cwd: project })
+        ).stdout.trim()
+      : null;
+    const needsInstall =
+      !!metadata?.installation && metadata.revision !== checkout;
+    if (pending === 0 && !needsInstall)
       return { updated: false, message: "Crow is current." };
   }
   if (config.role !== "worker") await admin(config, "drain", {});
@@ -501,7 +515,7 @@ async function performUpdate(
         }),
         inherit: true,
       });
-      await installService(root, { run });
+      await installUnit(root, { run });
     } else await serviceAction(root, "start", { run });
     return { updated: true };
   } catch (e) {

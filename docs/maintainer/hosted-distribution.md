@@ -2,10 +2,10 @@
 
 These files prepare public installation of Crow while the source repository stays private. Nothing in a pull request deploys the site or publishes binaries. R2 has been enabled in the operator's Cloudflare account; the bucket, Pages project, domains, credentials, and first publication still need setup.
 
-| Resource | Name | Public address |
-| --- | --- | --- |
-| Cloudflare Pages direct-upload project | `crow-site` | `https://birdapp.dev` |
-| R2 bucket | `crow-releases` | `https://downloads.birdapp.dev` |
+| Resource                               | Name            | Public address                  |
+| -------------------------------------- | --------------- | ------------------------------- |
+| Cloudflare Pages direct-upload project | `crow-site`     | `https://birdapp.dev`           |
+| R2 bucket                              | `crow-releases` | `https://downloads.birdapp.dev` |
 
 Pages serves `website/`, including `install.sh`. R2 serves archives larger than Pages' 25 MiB file limit. Neither resource runs Crow or handles review traffic. Gibo is not part of the download service.
 
@@ -31,12 +31,12 @@ The workflows identify `public-release` and `public-website` environments. If su
 
 Required secrets:
 
-| Used by | Repository secret | Value and permissions |
-| --- | --- | --- |
-| Both | `CLOUDFLARE_ACCOUNT_ID` | The 32-character account ID shown in Cloudflare. This is an identifier, not a credential. |
-| `public-release` | `CROW_R2_ACCESS_KEY_ID` | Access Key ID from a dedicated R2 API token. |
-| `public-release` | `CROW_R2_SECRET_ACCESS_KEY` | Secret Access Key from that same R2 token. |
-| `public-website` | `CROW_PAGES_API_TOKEN` | Cloudflare API token with **Account → Cloudflare Pages → Edit**, restricted to this Cloudflare account. |
+| Used by          | Repository secret           | Value and permissions                                                                                   |
+| ---------------- | --------------------------- | ------------------------------------------------------------------------------------------------------- |
+| Both             | `CLOUDFLARE_ACCOUNT_ID`     | The 32-character account ID shown in Cloudflare. This is an identifier, not a credential.               |
+| `public-release` | `CROW_R2_ACCESS_KEY_ID`     | Access Key ID from a dedicated R2 API token.                                                            |
+| `public-release` | `CROW_R2_SECRET_ACCESS_KEY` | Secret Access Key from that same R2 token.                                                              |
+| `public-website` | `CROW_PAGES_API_TOKEN`      | Cloudflare API token with **Account → Cloudflare Pages → Edit**, restricted to this Cloudflare account. |
 
 Create an account-owned R2 token from **R2 → Manage R2 API tokens** with **Object Read & Write** and **Apply to specific buckets only → crow-releases**. The publisher reads existing objects to refuse changed replacements, and writes release objects. It does not need bucket administration, DNS permissions, or access to other buckets. R2's preset may also permit deletion; the publisher never deletes an object.
 
@@ -44,7 +44,7 @@ The Pages token needs no zone or DNS edit permissions. Cloudflare's Pages permis
 
 ## Build without publishing
 
-`.github/workflows/release.yml` builds and tests Linux x64 and ARM64 on native Ubuntu runners. It runs on a matching version tag or manual dispatch and uploads private GitHub Actions artifacts. It never creates a GitHub release or uploads to Cloudflare.
+`.github/workflows/release.yml` builds and tests Linux x64 and ARM64 on native Ubuntu runners. It runs for pull requests, matching version tags, and manual dispatch, and uploads private GitHub Actions artifacts. PR builds validate the proposed merge; publication requires a separate tag or manual build of the reviewed source commit. It never creates a GitHub release or uploads to Cloudflare.
 
 The build artifacts are `crow-linux-x64` and `crow-linux-arm64`. Each contains its archive, `SHA256SUMS`, and `build-metadata.json` recording the source commit, archive hash, version, architecture, and the packaged executable's actual `--version` output. Artifacts expire after seven days. Publish within that window or build a new version. Rebuilding an existing version can change its archive bytes and must not overwrite an already published version.
 

@@ -32,7 +32,7 @@ function errorMessage(error: unknown): string {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
-const help = `Crow: self-hosted GitHub PR reviews\n\n  crow install [--no-setup]         Install a downloaded binary\n  crow setup [--role both|service|worker] [--ingress funnel|cloudflare|existing] [--port 8787]\n  crow run                         Run in the foreground\n  crow start | stop | service-restart\n  crow status | doctor [--runtime] | logs\n  crow login | models\n  crow enroll owner/repo [--include-backlog] [--worker ID]\n  crow policy owner/repo [--authors alice,bob | --everyone] [--requesters alice,bob]\n  crow repo-config owner/repo --json '{"model":"...","effort":"..."}'\n  crow review|pause|resume|restart owner/repo PR_NUMBER [--model ID --effort LEVEL]\n  crow catch-up [owner/repo] [--include-backlog]\n  crow release [owner/repo]          Release a held catch-up batch\n  crow pair                        Generate credentials for a separate worker\n  crow config [KEY JSON_VALUE]      View redacted config or set a setting\n  crow cleanup | update\n  crow backup FILE --passphrase-file FILE\n  crow restore FILE --passphrase-file FILE\n\nCROW_HOME chooses the installation directory. Default ~/.local/share/crow.\nBrowser URLs printed on a headless host can be opened on another desktop.\n`;
+const help = `Crow: self-hosted GitHub PR reviews\n\n  crow install [--no-setup]         Install a downloaded binary\n  crow setup [--role both|service|worker] [--ingress funnel|cloudflare|existing] [--port 8787]\n  crow run                         Run in the foreground\n  crow start | stop | service-restart\n  crow status | doctor [--runtime] | logs\n  crow login | models\n  crow enroll owner/repo [--include-backlog] [--worker ID]\n  crow policy owner/repo [--authors alice,bob | --everyone] [--requesters alice,bob]\n  crow repo-config owner/repo --json '{"model":"...","effort":"..."}'\n  crow review|pause|resume|restart owner/repo PR_NUMBER [--model ID --effort LEVEL]\n  crow catch-up [owner/repo] [--include-backlog]\n  crow release [owner/repo]          Release a held catch-up batch\n  crow pair                        Generate credentials for a separate worker\n  crow config [KEY JSON_VALUE]      View redacted config or set a setting\n  crow cleanup | update\n  crow drain | undrain             Hold or resume new review claims\n  crow backup FILE --passphrase-file FILE\n  crow restore FILE --passphrase-file FILE\n\nCROW_HOME chooses the installation directory. Default ~/.local/share/crow.\nBrowser URLs printed on a headless host can be opened on another desktop.\n`;
 export function parse(argv: string[]) {
   const args: string[] = [],
     flags: Flags = {};
@@ -312,6 +312,12 @@ export async function main(argv = process.argv.slice(2)) {
   }
   if (command === "update") {
     print(await update(root, config));
+    return;
+  }
+  if (["drain", "undrain"].includes(command)) {
+    if (rest.length || Object.keys(flags).length)
+      throw new Error(`Usage: crow ${command}`);
+    print(await admin(config, command, {}));
     return;
   }
   if (command === "status") {

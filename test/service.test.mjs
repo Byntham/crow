@@ -600,7 +600,7 @@ test("resuming with a changed merge base supersedes saved analysis and coalesces
     1,
   );
 });
-test("saved report resumes through worker comparison verification after an unrelated target advance", async (t) => {
+test("saved report automatically verifies its comparison after an unrelated target advance", async (t) => {
   const f = await fixture(t);
   const job = await claim(f),
     identity = { id: job.id, lease: job.lease };
@@ -610,9 +610,8 @@ test("saved report resumes through worker comparison verification after an unrel
     ...identity,
     report: { summary: "Saved complete report.", findings: [] },
   });
-  await until(() => f.store.get("jobs", job.id).state === "paused");
+  await until(() => f.store.get("jobs", job.id).state === "queued");
   assert.equal(f.published.length, 0);
-  await f.call("/admin/resume", { repo: "owner/project", number: 1 });
   const resumed = (await f.worker("next")).data.job;
   assert.equal(resumed.id, job.id);
   assert.equal(resumed.report.summary, "Saved complete report.");
@@ -822,4 +821,165 @@ test("redelivered events from before enrollment do not import excluded initial b
   await f.webhook("pull_request", payload, "older-than-enrollment");
   await until(() => f.store.events().length === 0);
   assert.equal(f.store.all("jobs").length, 0);
+});
+
+test("concurrent provider failures cannot shorten the shared cooldown", async (t) => {
+  const f = await fixture(t);
+  const first = await claim(f);
+  f.prs.set(2, pr(2));
+  await f.call("/admin/review", { repo: "owner/project", number: 2 });
+  const second = (await f.worker("next")).data.job;
+  const session = "12345678-1234-1234-1234-123456789abc";
+  await f.worker("failed", {
+    id: first.id, lease: first.lease, session, kind: "transient", retryAfter: 60000,
+  });
+  const cooldown = f.store.get("state", "cooldown");
+  assert.ok(cooldown >= Date.now() + 59000);
+  await f.worker("failed", {
+    id: second.id, lease: second.lease, session, kind: "transient",
+  });
+  assert.equal(f.store.get("state", "cooldown"), cooldown);
+  assert.equal((await f.worker("next")).data, null);
+});
+
+test("target pushes revalidate saved work automatically and replace changed comparisons", async (t) => {
+  const f = await fixture(t);
+  const job = await claim(f), identity = { id: job.id, lease: job.lease };
+  await f.worker("comparison", { ...identity, comparison });
+  await f.worker("session", {
+    ...identity, session: "12345678-1234-1234-1234-123456789abc",
+  });
+  f.prs.set(1, pr(1, { base: { ref: "main", sha: "d".repeat(40) } }));
+  await f.webhook("push", {
+    repository: { full_name: "owner/project" }, ref: "refs/heads/main",
+  });
+  await until(() => f.store.events().length === 0);
+  assert.equal(f.store.get("jobs", job.id).state, "reviewing");
+  await f.worker("report", {
+    ...identity, report: { summary: "Report for the old comparison.", findings: [] },
+  });
+  await until(() => f.store.get("jobs", job.id).state === "queued");
+  const resumed = (await f.worker("next")).data.job;
+  assert.equal(resumed.session, "12345678-1234-1234-1234-123456789abc");
+  assert.ok(resumed.report);
+  const result = await f.worker("comparison", {
+    id: resumed.id, lease: resumed.lease,
+    comparison: { ...comparison, base: "e".repeat(40), targetSha: "d".repeat(40) },
+  });
+  assert.deepEqual(result.data, { cancel: true });
+  assert.equal(f.store.get("jobs", job.id).state, "superseded");
+  const replacement = f.store.all("jobs").find((j) => j.state === "queued");
+  assert.ok(replacement);
+  assert.equal(replacement.session, null);
+  assert.equal(replacement.report, null);
+  assert.equal(f.published.length, 0);
+});
+
+test("target pushes and catch-up preserve an explicitly paused review", async (t) => {
+  const f = await fixture(t);
+  const job = await claim(f);
+  await f.worker("comparison", { id: job.id, lease: job.lease, comparison });
+  await f.call("/admin/pause", { repo: "owner/project", number: 1 });
+  f.prs.set(1, pr(1, { base: { ref: "main", sha: "d".repeat(40) } }));
+  await f.webhook("push", {
+    repository: { full_name: "owner/project" }, ref: "refs/heads/main",
+  });
+  await until(() => f.store.events().length === 0);
+  await f.call("/admin/catch-up", { repo: "owner/project" });
+  assert.equal(f.store.get("jobs", job.id).state, "paused");
+  assert.equal((await f.worker("next")).data, null);
+});
+
+test("target revalidation does not undo a pause during publication refresh", async (t) => {
+  const f = await fixture(t);
+  const job = await claim(f), identity = { id: job.id, lease: job.lease };
+  await f.worker("comparison", { ...identity, comparison });
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  let refreshing = false;
+  f.github.pr = async () => {
+    refreshing = true;
+    await gate;
+    return pr(1, { base: { ref: "main", sha: "d".repeat(40) } });
+  };
+  t.after(() => release());
+  await f.worker("report", {
+    ...identity, report: { summary: "Saved report.", findings: [] },
+  });
+  await until(() => refreshing);
+  await f.call("/admin/pause", { repo: "owner/project", number: 1 });
+  release();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(f.store.get("jobs", job.id).state, "paused");
+  assert.equal(f.published.length, 0);
+});
+
+for (const eligible of [true, false]) {
+  test(`checkout head races refresh the PR and ${eligible ? "queue its current head" : "respect author authorization"}`, async (t) => {
+    const f = await fixture(t);
+    const job = await claim(f);
+    f.prs.set(1, pr(1, {
+      head: { sha: "d".repeat(40) }, user: { login: eligible ? "alice" : "mallory" },
+    }));
+    const result = await f.worker("failed", {
+      id: job.id, lease: job.lease, kind: "superseded",
+    });
+    assert.deepEqual(result.data, { cancel: true });
+    assert.equal(f.store.get("jobs", job.id).state, "superseded");
+    const replacement = f.store.all("jobs").find((j) => j.state === "queued");
+    assert.equal(!!replacement, eligible);
+    if (eligible) assert.equal(replacement.head, "d".repeat(40));
+  });
+}
+
+test("checkout recovery cannot undo an operator pause during GitHub refresh", async (t) => {
+  const f = await fixture(t);
+  const job = await claim(f);
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  let refreshing = false;
+  f.github.pr = async () => {
+    refreshing = true;
+    await gate;
+    return pr(1, { head: { sha: "d".repeat(40) } });
+  };
+  t.after(() => release());
+  const failure = f.worker("failed", {
+    id: job.id, lease: job.lease, kind: "superseded",
+  });
+  await until(() => refreshing);
+  await f.call("/admin/pause", { repo: "owner/project", number: 1 });
+  release();
+  assert.deepEqual((await failure).data, { cancel: true });
+  assert.equal(f.store.get("jobs", job.id).state, "paused");
+  assert.equal(f.store.all("jobs").length, 1);
+});
+
+test("inclusive catch-up waits for a normal scan and includes the excluded backlog", async (t) => {
+  const f = await fixture(t);
+  const repo = f.store.get("repos", "owner/project");
+  f.store.enroll({ ...repo, excluded: [1] });
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  let scans = 0, active = 0, maximum = 0;
+  f.github.prs = async () => {
+    scans++;
+    maximum = Math.max(maximum, ++active);
+    if (scans === 1) await gate;
+    active--;
+    return [pr()];
+  };
+  t.after(() => release());
+  const normal = f.svc.admin("catch-up", { repo: repo.name });
+  await until(() => scans === 1);
+  const inclusive = f.svc.admin("catch-up", { repo: repo.name, includeBacklog: true });
+  const duplicate = f.svc.admin("catch-up", { repo: repo.name, includeBacklog: true });
+  release();
+  assert.equal((await normal)[repo.name].queued, 0);
+  assert.equal((await inclusive)[repo.name].queued, 1);
+  assert.equal((await duplicate)[repo.name].queued, 1);
+  assert.equal(scans, 2);
+  assert.equal(maximum, 1);
+  assert.deepEqual(f.store.get("repos", repo.name).excluded, []);
+  assert.equal(f.store.all("jobs").length, 1);
 });
