@@ -31,7 +31,7 @@ async function fixture(t, options = {}) {
  readline.createInterface({input:process.stdin}).on('line',line=>{const r=JSON.parse(line);if(r.id===undefined)return;
  if(r.method==='initialize')send({id:r.id,result:{userAgent:'test'}});
  else if(r.method==='config/read'){const config={};for(let i=0;i<args.length;i++){if(args[i]!=='-c')continue;const argument=args[++i],split=argument.indexOf('='),key=argument.slice(0,split);let value;try{value=JSON.parse(argument.slice(split+1));}catch{continue;}const parts=key.split('.');let target=config;for(const p of parts.slice(0,-1))target=target[p]??={};target[parts.at(-1)]=value;}if(behavior.unsafe)config.mcp_servers.unexpected={command:'bad'};send({id:r.id,result:{config}});}
- else if(r.method==='account/read'&&behavior.accountOffline)send({id:r.id,error:{message:'temporary metadata connection failure'}});
+ else if(r.method==='account/read'&&behavior.accountOffline){process.stderr.write('metadata backend unavailable\\n');process.exit(1);}
  else if(r.method==='account/read')send({id:r.id,result:{account:behavior.unauth?null:{type:behavior.api?'apiKey':'chatgpt',planType:'pro'}}});
  else if(r.method==='model/list'){
  if(behavior.offline)send({id:r.id,error:{message:'temporary service outage'}});
@@ -289,6 +289,7 @@ test("metadata failure keeps transient classification instead of demanding login
   const status = await authStatus(f.worker, f.root);
   assert.equal(status.errorKind, "transient");
   await assert.rejects(runReview(f), (e) => e.kind === "transient");
+  assert.match(status.warning, /metadata backend unavailable/);
   await assert.rejects(
     readFile(join(f.root, "invocation.json")),
     (e) => e.code === "ENOENT",
