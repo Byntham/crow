@@ -236,9 +236,23 @@ export async function startService(
   async function enqueue(
     repo: RepositoryRecord,
     n: number,
-    { manual = false, restart = false, held = false, event = false } = {},
+    {
+      manual = false,
+      restart = false,
+      held = false,
+      event = false,
+      requester = "",
+    } = {},
   ) {
     const { pr } = await refreshPr(repo, n);
+    repo = repoFor(repo.name);
+    if (
+      requester &&
+      !(repo.requesters || repo.authors).some(
+        (login) => login.toLowerCase() === requester.toLowerCase(),
+      )
+    )
+      return { skipped: "Requester is no longer authorized" };
     if (!eligible(repo, pr)) {
       for (const j of store
         .all("jobs")
@@ -273,9 +287,10 @@ export async function startService(
       return catchUp(name, true);
     }
     const task = (async () => {
-      const repo = repoFor(name),
-        token = await github.token(repo),
-        prs = await github.prs(repo, token);
+      const initial = repoFor(name),
+        token = await github.token(initial),
+        prs = await github.prs(initial, token),
+        repo = repoFor(name);
       if (includeBacklog) {
         repo.excluded = [];
         store.enroll(repo);
@@ -351,17 +366,19 @@ export async function startService(
         (x) => x.toLowerCase() === e.actor?.toLowerCase(),
       )
     )
-      await enqueue(repo, e.number, { manual: true });
+      await enqueue(repo, e.number, { manual: true, requester: e.actor });
     if (e.type === "push" && e.ref?.startsWith("refs/heads/")) {
       // Event-driven target changes: inspect comparisons again without importing excluded backlog.
       const token = await github.token(repo);
-      for (const pr of await github.prs(repo, token))
+      const prs = await github.prs(repo, token);
+      const currentRepo = repoFor(repo.name);
+      for (const pr of prs)
         if (
           pr.base.ref === e.ref.slice(11) &&
-          eligible(repo, pr) &&
-          !repo.excluded?.includes(pr.number)
+          eligible(currentRepo, pr) &&
+          !currentRepo.excluded?.includes(pr.number)
         )
-          store.queue(repo, pr);
+          store.queue(currentRepo, pr);
     }
   }
   async function status(j: ReviewJob) {
@@ -397,8 +414,8 @@ export async function startService(
     });
   }
   async function publish(j: PublishableReviewJob) {
-    const repo = repoFor(j.repo),
-      { pr, token } = await refreshPr(repo, j.number);
+    const { pr, token } = await refreshPr(repoFor(j.repo), j.number);
+    const repo = repoFor(j.repo);
     // An operator may pause publication while GitHub is responding.
     if (store.get("jobs", j.id)?.state !== "publishing") return;
     if (
@@ -847,14 +864,18 @@ export async function startService(
       });
       if (!job) return null;
       try {
-        const repo = repoFor(job.repo),
-          { pr, token } = await refreshPr(repo, job.number);
+        const { pr, token } = await refreshPr(repoFor(job.repo), job.number),
+          current = store.get("jobs", job.id);
+        if (current?.state !== "reviewing" || current.lease !== job.lease)
+          return null;
+        const repo = repoFor(job.repo);
         if (
           !eligible(repo, pr) ||
           pr.head.sha !== job.head ||
-          pr.base.ref !== job.target
+          pr.base.ref !== job.target ||
+          repo.worker !== job.worker
         ) {
-          store.updateJob(job.id, { state: "superseded" });
+          store.updateJob(job.id, { state: "superseded" }, job.lease);
           if (eligible(repo, pr)) store.queue(repo, pr);
           return null;
         }
@@ -1016,8 +1037,8 @@ export async function startService(
         throw new Error("Review settings are missing from the active job");
       const kind = optionalString(a.kind) || "transient";
       if (kind === "superseded") {
+        const { pr } = await refreshPr(repoFor(j.repo), j.number);
         const repo = repoFor(j.repo),
-          { pr } = await refreshPr(repo, j.number),
           current = store.get("jobs", j.id);
         if (current?.state !== "reviewing" || current.lease !== lease)
           return { cancel: true };

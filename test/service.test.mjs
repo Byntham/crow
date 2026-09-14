@@ -1102,3 +1102,217 @@ test("admin status omits stored patches while preserving job progress", async (t
   assert.ok(JSON.stringify(status.data).length < 10000);
   assert.equal(f.store.get("jobs", job.id).patch.length, 1000000);
 });
+
+for (const authorAllowed of [true, false]) {
+  test(`enqueue preserves concurrent repository configuration and ${authorAllowed ? "uses the new worker" : "enforces the new author policy"}`, async (t) => {
+    const f = await fixture(t);
+    const repo = f.store.get("repos", "owner/project");
+    f.store.enroll({ ...repo, excluded: [1] });
+    await f.call("/admin/pair", {
+      id: "replacement-worker",
+      token: "x".repeat(40),
+    });
+    let release,
+      entered = false;
+    f.github.pr = async () => {
+      entered = true;
+      return new Promise((resolve) => {
+        release = () => resolve(pr());
+      });
+    };
+    const request = f.call("/admin/review", { repo: repo.name, number: 1 });
+    await until(() => entered);
+    const configured = await f.call("/admin/config-repo", {
+      repo: repo.name,
+      policy: "selected",
+      authors: authorAllowed ? ["alice", "bob"] : ["bob"],
+      requesters: ["bob"],
+      worker: "replacement-worker",
+      settings: { model: "replacement-model", effort: "medium" },
+    });
+    release();
+    assert.equal(configured.status, 200);
+    assert.equal((await request).status, 200);
+    const stored = f.store.get("repos", repo.name);
+    assert.deepEqual(
+      { ...stored, excluded: configured.data.excluded },
+      configured.data,
+    );
+    const jobs = f.store.all("jobs");
+    assert.equal(jobs.length, authorAllowed ? 1 : 0);
+    if (authorAllowed) {
+      assert.equal(jobs[0].worker, "replacement-worker");
+      assert.deepEqual(stored.excluded, []);
+    } else assert.deepEqual(stored.excluded, [1]);
+  });
+}
+
+test("an issue-comment requester revoked during PR refresh cannot remove backlog exclusions", async (t) => {
+  const f = await fixture(t);
+  const repo = f.store.get("repos", "owner/project");
+  f.store.enroll({ ...repo, excluded: [1] });
+  let release,
+    entered = false;
+  f.github.pr = async () => {
+    entered = true;
+    return new Promise((resolve) => {
+      release = () => resolve(pr());
+    });
+  };
+  await f.webhook("issue_comment", {
+    action: "created",
+    repository: { full_name: repo.name },
+    issue: { number: 1, pull_request: {} },
+    comment: { body: "@crow review", user: { login: "alice" } },
+  });
+  await until(() => entered);
+  const configured = await f.call("/admin/config-repo", {
+    repo: repo.name,
+    requesters: ["bob"],
+  });
+  release();
+  assert.equal(configured.status, 200);
+  await until(() => f.store.events().length === 0);
+  assert.equal(f.store.all("jobs").length, 0);
+  assert.deepEqual(f.store.get("repos", repo.name).excluded, [1]);
+  assert.deepEqual(f.store.get("repos", repo.name).requesters, ["bob"]);
+});
+
+test("inclusive catch-up preserves author policy changed during its GitHub scan", async (t) => {
+  const f = await fixture(t);
+  const repo = f.store.get("repos", "owner/project");
+  f.store.enroll({ ...repo, excluded: [1] });
+  let release,
+    entered = false;
+  f.github.prs = async () => {
+    entered = true;
+    return new Promise((resolve) => {
+      release = () => resolve([pr()]);
+    });
+  };
+  const scan = f.call("/admin/catch-up", {
+    repo: repo.name,
+    includeBacklog: true,
+  });
+  await until(() => entered);
+  const configured = await f.call("/admin/config-repo", {
+    repo: repo.name,
+    authors: ["bob"],
+    requesters: ["bob"],
+    settings: { model: "new-model", effort: "medium" },
+  });
+  release();
+  assert.equal(configured.status, 200);
+  assert.equal((await scan).data[repo.name].queued, 0);
+  assert.deepEqual(f.store.get("repos", repo.name), {
+    ...configured.data,
+    excluded: [],
+  });
+  assert.equal(f.store.all("jobs").length, 0);
+});
+
+for (const changedHead of [true, false]) {
+  test(`a claim refreshed after an operator pause cannot ${changedHead ? "queue a replacement" : "dispatch the paused job"}`, async (t) => {
+    const f = await fixture(t);
+    await f.call("/admin/review", { repo: "owner/project", number: 1 });
+    const job = f.store.all("jobs")[0];
+    let release,
+      entered = false;
+    f.github.pr = async () => {
+      entered = true;
+      return new Promise((resolve) => {
+        release = () =>
+          resolve(pr(1, changedHead ? { head: { sha: "d".repeat(40) } } : {}));
+      });
+    };
+    const claim = f.worker("next");
+    await until(() => entered);
+    await f.call("/admin/pause", { repo: "owner/project", number: 1 });
+    release();
+    const result = await claim;
+    assert.equal(result.status, 200);
+    assert.equal(result.data, null);
+    assert.equal(f.store.get("jobs", job.id).state, "paused");
+    assert.equal(f.store.all("jobs").length, 1);
+  });
+}
+
+test("a claim uses author authorization updated while GitHub responds", async (t) => {
+  const f = await fixture(t);
+  await f.call("/admin/review", { repo: "owner/project", number: 1 });
+  let release,
+    entered = false;
+  f.github.pr = async () => {
+    entered = true;
+    return new Promise((resolve) => {
+      release = () => resolve(pr());
+    });
+  };
+  const claim = f.worker("next");
+  await until(() => entered);
+  const configured = await f.call("/admin/config-repo", {
+    repo: "owner/project",
+    authors: ["bob"],
+  });
+  release();
+  assert.equal(configured.status, 200);
+  assert.equal((await claim).data, null);
+  assert.ok(f.store.all("jobs").every((job) => job.state === "superseded"));
+});
+
+test("target push uses author policy saved while GitHub lists PRs", async (t) => {
+  const f = await fixture(t);
+  let release;
+  f.github.prs = async () =>
+    new Promise((resolve) => {
+      release = resolve;
+    });
+  await f.webhook("push", {
+    repository: { full_name: "owner/project" },
+    ref: "refs/heads/main",
+  });
+  await until(() => release);
+  try {
+    const result = await f.call("/admin/config-repo", {
+      repo: "owner/project",
+      authors: ["bob"],
+    });
+    assert.equal(result.status, 200);
+  } finally {
+    release([pr()]);
+  }
+  await until(() => f.store.events().length === 0);
+  assert.equal(f.store.all("jobs").length, 0);
+  assert.deepEqual(f.store.get("repos", "owner/project").authors, ["bob"]);
+});
+
+test("checkout supersession uses worker assignment saved during GitHub refresh", async (t) => {
+  const f = await fixture(t);
+  const job = await claim(f);
+  await f.call("/admin/pair", { id: "replacement-worker" });
+  let release;
+  f.github.pr = async () =>
+    new Promise((resolve) => {
+      release = resolve;
+    });
+  const failed = f.worker("failed", {
+    id: job.id,
+    lease: job.lease,
+    kind: "superseded",
+  });
+  await until(() => release);
+  try {
+    const result = await f.call("/admin/config-repo", {
+      repo: "owner/project",
+      worker: "replacement-worker",
+    });
+    assert.equal(result.status, 200);
+  } finally {
+    release(pr(1, { head: { sha: "d".repeat(40) } }));
+  }
+  assert.equal((await failed).status, 200);
+  assert.equal(f.store.get("jobs", job.id).state, "superseded");
+  const replacement = f.store.all("jobs").find((item) => item.id !== job.id);
+  assert.equal(replacement.worker, "replacement-worker");
+  assert.equal(replacement.head, "d".repeat(40));
+});
