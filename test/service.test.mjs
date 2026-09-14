@@ -209,6 +209,7 @@ test("webhooks cancel newly drafted PRs and reject unauthorized authors", async 
   f.prs.set(1, pr(1, { draft: true }));
   await f.webhook("pull_request", event(1, "converted_to_draft"));
   await until(() => f.store.get("jobs", job.id).state === "cancelled");
+  assert.equal(f.store.get("jobs", job.id).reason, "PR is a draft");
   f.prs.set(2, pr(2, { user: { login: "mallory" } }));
   await f.webhook("pull_request", event(2), "delivery-2");
   await until(() => f.store.events().length === 0);
@@ -216,6 +217,15 @@ test("webhooks cancel newly drafted PRs and reject unauthorized authors", async 
     f.store.all("jobs").some((j) => j.number === 2),
     false,
   );
+});
+
+test("closed pull requests record the lifecycle cause when cancelling active work", async (t) => {
+  const f = await fixture(t);
+  const job = await claim(f);
+  f.prs.set(1, pr(1, { state: "closed" }));
+  await f.webhook("pull_request", event(1, "closed"));
+  await until(() => f.store.get("jobs", job.id).state === "cancelled");
+  assert.equal(f.store.get("jobs", job.id).reason, "PR is closed");
 });
 test("synchronizing a PR supersedes existing lease and schedules latest revision", async (t) => {
   const f = await fixture(t);
