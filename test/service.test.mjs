@@ -1359,3 +1359,18 @@ test("webhooks reject unenrolled or mismatched GitHub App installations before p
     true,
   );
 });
+
+test("reenroll refreshes only the GitHub App installation while preserving repository policy", async (t) => {
+  const f = await fixture(t);
+  const repo = f.store.get("repos", "owner/project");
+  repo.installation = 7; repo.excluded = [9]; repo.requesters = ["bob"]; f.store.enroll(repo);
+  f.github.installation = async () => ({ id: 22 });
+  const denied = await f.call("/admin/enroll", { repo: repo.name, githubToken: "token" });
+  assert.equal(denied.status, 400);
+  const result = await f.call("/admin/enroll", { repo: repo.name, githubToken: "token", reenroll: true });
+  assert.equal(result.status, 200);
+  assert.equal(result.data.installation, 22);
+  assert.equal(result.data.worker, repo.worker);
+  assert.deepEqual(result.data.excluded, [9]);
+  assert.deepEqual(result.data.requesters, ["bob"]);
+});

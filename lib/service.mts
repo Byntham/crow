@@ -74,6 +74,7 @@ interface AdminArguments {
   requesters?: string[];
   settings?: RepositorySettings;
   includeBacklog?: boolean;
+  reenroll?: boolean;
   number?: number;
   model?: string;
   effort?: string;
@@ -92,6 +93,8 @@ function adminArguments(value: unknown): AdminArguments {
     throw new Error("Invalid requesters");
   if (a.includeBacklog !== undefined && typeof a.includeBacklog !== "boolean")
     throw new Error("Invalid backlog option");
+  if (a.reenroll !== undefined && typeof a.reenroll !== "boolean")
+    throw new Error("Invalid reenroll option");
   return {
     id: optionalString(a.id),
     token: optionalString(a.token),
@@ -106,6 +109,7 @@ function adminArguments(value: unknown): AdminArguments {
         ? undefined
         : parseRepositorySettings(a.settings),
     includeBacklog: a.includeBacklog,
+    reenroll: a.reenroll,
     number:
       a.number === undefined ? undefined : optionalNumber(Number(a.number)),
     model: optionalString(a.model),
@@ -595,9 +599,10 @@ export async function startService(
     }
     if (action === "enroll") {
       const name = repoName(string(a.repo, "repository"));
-      if (store.get("repos", name))
+      const existing = store.get("repos", name);
+      if (existing && !a.reenroll)
         throw new Error(
-          "Repository is already enrolled. Use crow config-repo to change it.",
+          "Repository is already enrolled. Use crow config-repo to change it, or --reenroll after changing the GitHub App installation.",
         );
       if (!config.operator) throw new Error("Complete operator setup first");
       const user = object(
@@ -615,18 +620,23 @@ export async function startService(
         throw new Error(
           "Repository enrollment requires admin or maintain authority",
         );
-      const installation = await github.installation(name),
-        repo: RepositoryRecord = {
-          name,
-          installation: installation.id,
-          worker: a.worker || config.worker.id,
-          policy: a.policy || "selected",
-          authors: a.authors || [config.operator],
-          requesters: [config.operator],
-          settings: a.settings || {},
-          enrolledAt: Date.now(),
-          excluded: [],
-        };
+      const installation = await github.installation(name);
+      if (existing) {
+        const updated = { ...existing, installation: installation.id };
+        store.enroll(updated);
+        return updated;
+      }
+      const repo: RepositoryRecord = {
+        name,
+        installation: installation.id,
+        worker: a.worker || config.worker.id,
+        policy: a.policy || "selected",
+        authors: a.authors || [config.operator],
+        requesters: [config.operator],
+        settings: a.settings || {},
+        enrolledAt: Date.now(),
+        excluded: [],
+      };
       if (!store.get("workers", repo.worker))
         throw new Error("Pair the worker before enrolling repositories");
       if (
