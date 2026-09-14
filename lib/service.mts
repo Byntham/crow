@@ -130,8 +130,9 @@ const activeStates: ReviewState[] = [
 ];
 function ineligibleReason(
   repo: Pick<RepositoryRecord, "policy" | "authors">,
-  pr: { state: string; draft: boolean; user: { login: string } },
+  pr: { state: string; draft: boolean; user: { login: string } } | undefined,
 ) {
+  if (!pr) return "PR is no longer open";
   if (pr.state !== "open") return "PR is closed";
   if (pr.draft) return "PR is a draft";
   if (
