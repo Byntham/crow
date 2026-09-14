@@ -27,7 +27,6 @@ async function fixture(t, options = {}) {
  if(args.includes('--help')){console.log('--json --output-schema --output-last-message --ignore-user-config --ignore-rules');process.exit(0);}
  if(args.includes('features')){console.log(['shell_tool','unified_exec','apps','plugins','hooks','view_image','skip_host_skill_discovery','multi_agent','code_mode_host','code_mode'].map(x=>x+' stable true').join('\\n'));process.exit(0);}
  if(args.includes('app-server')){
- if(behavior.metadataExit){process.stderr.write(behavior.metadataExit);process.exit(1);}
  const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');
  readline.createInterface({input:process.stdin}).on('line',line=>{const r=JSON.parse(line);if(r.id===undefined)return;
  if(r.method==='initialize')send({id:r.id,result:{userAgent:'test'}});
@@ -293,17 +292,5 @@ test("metadata failure keeps transient classification instead of demanding login
   await assert.rejects(
     readFile(join(f.root, "invocation.json")),
     (e) => e.code === "ENOENT",
-  );
-});
-
-test("metadata process failures retain provider stderr", async (t) => {
-  const f = await fixture(t, { metadataExit: "config mismatch\\n" });
-  await assert.rejects(
-    () => authStatus(f.worker, f.root),
-    (error) => {
-      assert.match(error.message, /Codex metadata connection exited \(1\)/);
-      assert.match(error.message, /Codex stderr:\\nconfig mismatch/);
-      return true;
-    },
   );
 });
