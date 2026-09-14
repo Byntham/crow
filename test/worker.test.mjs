@@ -16,7 +16,8 @@ import { startWorker, workerRequest } from "../dist/lib/worker.mjs";
 import { startService } from "../dist/lib/service.mjs";
 import { defaults } from "../dist/lib/config.mjs";
 import { processRun, sleep, atomic, json, hash } from "../dist/lib/util.mjs";
-import { metadata } from "../dist/lib/report.mjs";
+import { metadata, inlineComments } from "../dist/lib/report.mjs";
+import { publicationPatch } from "../dist/lib/inspection.mjs";
 
 const session = "12345678-1234-1234-1234-123456789abc";
 const report = {
@@ -128,6 +129,79 @@ test("worker retransmits a saved report after transport failure without repeatin
   assert.equal(advertised.model, "reported-model");
   for (const key of ["token", "codex", "codexHome", "id"])
     assert.equal(key in advertised, false);
+});
+
+test("worker publishes completed findings from a PR larger than 16 MiB without retrying inference", async (t) => {
+  const f = await local(t);
+  const git = (args) =>
+    processRun("git", [
+      "-C",
+      f.root,
+      "-c",
+      "user.name=Fixture",
+      "-c",
+      "user.email=fixture@example.test",
+      ...args,
+    ]);
+  await git(["init", "-b", "main"]);
+  await git(["commit", "--allow-empty", "-m", "base"]);
+  f.source.base = (await git(["rev-parse", "HEAD"])).stdout.trim();
+  f.source.targetSha = f.source.base;
+  await writeFile(
+    join(f.root, "a-large.txt"),
+    "x".repeat(17 * 1024 * 1024) + "\n",
+  );
+  await writeFile(join(f.root, "z-later.txt"), "late change\n");
+  await git(["add", "a-large.txt", "z-later.txt"]);
+  await git(["commit", "-m", "large PR"]);
+  f.source.head = (await git(["rev-parse", "HEAD"])).stdout.trim();
+  f.job.head = f.source.head;
+  const reviewed = {
+    summary: "Reviewed the complete comparison.",
+    findings: ["a-large.txt", "z-later.txt"].map((path) => ({
+      path,
+      line: 1,
+      severity: "high",
+      title: "Actionable issue",
+      body: "Fix this issue.",
+    })),
+  };
+  let next = { job: f.job },
+    published,
+    reviews = 0,
+    failures = 0;
+  f.worker = await startWorker(
+    f.config,
+    f.root,
+    workerOptions(f, {
+      readDiff: publicationPatch,
+      request: async (_, action, body) => {
+        if (action === "next") {
+          const value = next;
+          next = null;
+          return value;
+        }
+        if (action === "report") published = body;
+        if (action === "failed") failures++;
+        return { ok: true };
+      },
+      review: async () => {
+        reviews++;
+        return reviewed;
+      },
+    }),
+  );
+  await until(() => published, "large PR publication");
+  await f.worker.drain();
+  assert.equal(reviews, 1);
+  assert.equal(failures, 0);
+  assert.ok(published.patch.length < 1000);
+  assert.deepEqual(
+    inlineComments(published.report, published.patch).map(
+      (comment) => comment.path,
+    ),
+    ["a-large.txt", "z-later.txt"],
+  );
 });
 
 test("worker uses the service-saved completed report if its local report is absent", async (t) => {

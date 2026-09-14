@@ -476,3 +476,20 @@ for (const online of [true, false]) {
     });
   }
 }
+
+test("service-hosting setup restores the local URL without an explicit port", () => {
+  for (const role of ["both", "service", "worker"]) {
+    const config = {
+      ...defaults("/tmp/crow"),
+      role,
+      port: 9887,
+      serviceUrl: "https://remote.example",
+    };
+    applySetupPort(config, undefined);
+    assert.equal(config.port, 9887);
+    assert.equal(
+      config.serviceUrl,
+      role === "worker" ? "https://remote.example" : "http://127.0.0.1:9887",
+    );
+  }
+});

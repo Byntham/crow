@@ -7,6 +7,7 @@ import type {
   ReviewJob,
   GitHubPullRequest,
   Guidance,
+  Finding,
 } from "./types.mjs";
 const sha = /^[0-9a-f]{40,64}$/;
 export function revision(value: unknown): string {
@@ -114,7 +115,7 @@ export async function readBlob(
     throw new Error("Binary file cannot be read as text");
   return text;
 }
-export async function diff(source: InspectionSource, path?: string) {
+function diffArgs(source: InspectionSource, path?: string) {
   const args = [
     "diff",
     "--no-ext-diff",
@@ -124,8 +125,95 @@ export async function diff(source: InspectionSource, path?: string) {
     revision(source.base),
     revision(source.head),
   ];
-  if (path) args.push("--", safePath(path));
-  return git(source.dir, args);
+  if (path) args.push("--", `:(literal)${safePath(path)}`);
+  return args;
+}
+export async function diff(
+  source: InspectionSource,
+  path?: string,
+  {
+    offset = 0,
+    count = 200000,
+    signal,
+  }: {
+    offset?: number;
+    count?: number;
+    signal?: AbortSignal;
+  } = {},
+) {
+  pageBounds({ offset, count }, 200000);
+  let total = 0,
+    patch = "";
+  await git(source.dir, diffArgs(source, path), {
+    signal,
+    capture: false,
+    onChunk(chunk) {
+      const start = Math.max(0, offset - total);
+      const end = Math.min(chunk.length, offset + count - total);
+      if (end > start) patch += chunk.slice(start, end);
+      total += chunk.length;
+    },
+  });
+  return { patch, ...pageMetadata(total, offset, count) };
+}
+// Publication needs only the added-line anchors for findings, never the full diff.
+// Keep bounded line prefixes so even a single huge source line cannot fill memory.
+export async function publicationPatch(
+  source: InspectionSource,
+  findings: Pick<Finding, "path" | "line">[],
+  { signal }: Pick<ProcessOptions, "signal"> = {},
+) {
+  const wanted = new Map<string, Set<number>>();
+  for (const finding of findings) {
+    const path = safePath(finding.path);
+    if (!wanted.has(path)) wanted.set(path, new Set());
+    wanted.get(path)!.add(finding.line);
+  }
+  const parts: string[] = [];
+  for (const [path, lines] of wanted) {
+    const added = new Set<number>();
+    let prefix = "",
+      line = 0,
+      inHunk = false;
+    const consume = () => {
+      const hunk = prefix.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+      if (hunk) {
+        line = Number(hunk[1]);
+        inHunk = true;
+      } else if (inHunk) {
+        if (prefix.startsWith("+")) {
+          if (lines.has(line)) added.add(line);
+          line++;
+        } else if (prefix.startsWith(" ")) line++;
+        else if (!prefix.startsWith("-") && !prefix.startsWith("\\"))
+          inHunk = false;
+      }
+      prefix = "";
+    };
+    await git(source.dir, diffArgs(source, path), {
+      signal,
+      capture: false,
+      onChunk(chunk) {
+        let start = 0;
+        while (start < chunk.length) {
+          const end = chunk.indexOf("\n", start);
+          prefix += chunk.slice(
+            start,
+            Math.min(end < 0 ? chunk.length : end, start + 256 - prefix.length),
+          );
+          if (end < 0) break;
+          consume();
+          start = end + 1;
+        }
+      },
+    });
+    if (prefix) consume();
+    if (added.size)
+      parts.push(
+        `+++ b/${path}\n${[...added].map((number) => `@@ -0,0 +${number},1 @@\n+\n`).join("")}`,
+      );
+  }
+  return parts.join("");
 }
 async function changedFiles(source: InspectionSource) {
   return (
@@ -236,14 +324,10 @@ export async function inspectionTool(
   }
   if (name === "diff") {
     const { offset, count } = pageBounds(args, 200000);
-    const patch = await diff(
-      source,
-      args.path ? safePath(args.path) : undefined,
-    );
-    return {
-      patch: patch.slice(offset, offset + count),
-      ...pageMetadata(patch.length, offset, count),
-    };
+    return diff(source, args.path ? safePath(args.path) : undefined, {
+      offset,
+      count,
+    });
   }
   if (name === "search") {
     if (

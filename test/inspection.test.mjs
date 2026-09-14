@@ -11,9 +11,11 @@ import {
   files,
   readBlob,
   diff,
+  publicationPatch,
   guidance,
   inspectionTool,
 } from "../dist/lib/inspection.mjs";
+import { inlineComments } from "../dist/lib/report.mjs";
 async function fixture(t, { largeDiff = false } = {}) {
   const dir = await mkdtemp(join(tmpdir(), "crow-inspection-"));
   t.after(() => rm(dir, { recursive: true, force: true }));
@@ -51,7 +53,9 @@ async function fixture(t, { largeDiff = false } = {}) {
     await rm(join(dir, "deleted.txt"));
     await writeFile(
       join(dir, "a-large.txt"),
-      "changed line with context\n".repeat(12000),
+      typeof largeDiff === "number"
+        ? "x".repeat(largeDiff) + "\n"
+        : "changed line with context\n".repeat(12000),
     );
     await writeFile(
       join(dir, "z-later.txt"),
@@ -115,7 +119,7 @@ test("comparison uses merge base and excludes unrelated target commits", async (
     ).trim(),
     source.base,
   );
-  const patch = await diff(source);
+  const { patch } = await diff(source);
   assert.match(patch, /const changed = 2/);
   assert.doesNotMatch(patch, /unrelated base advancement/);
 });
@@ -183,7 +187,15 @@ test("inspection tools expose bounded line reads and reject execution tools", as
 
 test("large PR inspection exposes every changed path and every diff page", async (t) => {
   const { source } = await fixture(t, { largeDiff: true });
-  const full = await diff(source);
+  const full = await git(source.dir, [
+    "diff",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-renames",
+    "--unified=5",
+    source.base,
+    source.head,
+  ]);
   assert.ok(full.length > 200000);
   const first = await inspectionTool(source, "diff", {});
   assert.equal(first.truncated, true);
@@ -245,6 +257,56 @@ test("inspection pagination rejects invalid bounds and reports exhausted pages",
   }
 });
 
+test("diffs larger than 16 MiB stream pages and bounded publication anchors", async (t) => {
+  // A single enormous added line must not defeat either the aggregate-output
+  // bound or a line-oriented reader. The later file must remain reachable.
+  const { source } = await fixture(t, { largeDiff: 17 * 1024 * 1024 });
+  const first = await inspectionTool(source, "diff", {});
+  assert.equal(first.patch.length, 200000);
+  assert.ok(first.total > 16 * 1024 * 1024);
+  const last = await inspectionTool(source, "diff", {
+    offset: first.total - 2000,
+  });
+  assert.equal(last.truncated, false);
+  assert.match(last.patch, /late change must remain reachable/);
+  const middle = await inspectionTool(source, "diff", {
+    offset: 16 * 1024 * 1024,
+    count: 100,
+  });
+  assert.equal(middle.patch, "x".repeat(100));
+  const findings = [
+    { path: "a-large.txt", line: 1 },
+    { path: "z-later.txt", line: 1 },
+    { path: "src/api.js", line: 1 }, // Context is not an added-line anchor.
+    { path: "src/api.js", line: 2 },
+    { path: "deleted.txt", line: 1 },
+  ].map((finding, i) => ({
+    ...finding,
+    id: String(i),
+    severity: "high",
+    title: "Finding",
+    body: "Details",
+  }));
+  const patch = await publicationPatch(source, findings);
+  assert.ok(patch.length < 1000);
+  assert.deepEqual(
+    inlineComments({ summary: "Reviewed", findings }, patch).map(
+      ({ path, line }) => ({ path, line }),
+    ),
+    [
+      { path: "a-large.txt", line: 1 },
+      { path: "z-later.txt", line: 1 },
+      { path: "src/api.js", line: 2 },
+    ],
+  );
+  const signal = AbortSignal.abort(new Error("Review superseded"));
+  await assert.rejects(diff(source, undefined, { signal }), /superseded/);
+  await assert.rejects(
+    publicationPatch(source, findings, { signal }),
+    /superseded/,
+  );
+});
+
 test("MCP advertises pagination and serializes completion metadata for reviewers", async (t) => {
   const { source, dir } = await fixture(t);
   const sourcePath = join(dir, "source.json");
@@ -270,7 +332,9 @@ test("MCP advertises pagination and serializes completion metadata for reviewers
           method: "tools/call",
           params: { name: "diff", arguments: { count: 20 } },
         },
-      ].map((request) => JSON.stringify(request) + "\n").join(""),
+      ]
+        .map((request) => JSON.stringify(request) + "\n")
+        .join(""),
     },
   );
   const messages = response.stdout.trim().split("\n").map(JSON.parse);
@@ -281,8 +345,8 @@ test("MCP advertises pagination and serializes completion metadata for reviewers
     assert.match(definition.description, /nextOffset/);
   }
   assert.equal(
-    definitions.find((tool) => tool.name === "list_files")
-      .inputSchema.properties.changed_only.type,
+    definitions.find((tool) => tool.name === "list_files").inputSchema
+      .properties.changed_only.type,
     "boolean",
   );
   const filesPage = JSON.parse(messages[1].result.content[0].text);
@@ -301,7 +365,7 @@ test("diff does not invoke a configured external diff command", async (t) => {
   const command = join(dir, "external-diff.sh");
   await writeFile(command, `#!/bin/sh\ntouch '${canary}'\n`, { mode: 0o700 });
   await git(source.dir, ["config", "diff.external", command]);
-  assert.match(await diff(source), /const changed/);
+  assert.match((await diff(source)).patch, /const changed/);
   const { access } = await import("node:fs/promises");
   await assert.rejects(access(canary), (e) => e.code === "ENOENT");
 });

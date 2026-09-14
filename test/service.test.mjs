@@ -1083,3 +1083,22 @@ test("a failed repository backs off without blocking other repositories or reord
   ]);
   assert.equal(f.store.all("jobs").length, 3);
 });
+
+test("admin status omits stored patches while preserving job progress", async (t) => {
+  const f = await fixture(t);
+  const job = f.store.queue(f.store.get("repos", "owner/project"), pr());
+  f.store.updateJob(job.id, {
+    state: "paused",
+    patch: "x".repeat(1000000),
+    lease: "private-lease",
+  });
+  const status = await f.call("/admin/status");
+  assert.equal(status.status, 200);
+  const view = status.data.jobs.find((item) => item.id === job.id);
+  assert.equal(view.state, "paused");
+  assert.equal(view.repo, "owner/project");
+  assert.equal(Object.hasOwn(view, "patch"), false);
+  assert.equal(Object.hasOwn(view, "lease"), false);
+  assert.ok(JSON.stringify(status.data).length < 10000);
+  assert.equal(f.store.get("jobs", job.id).patch.length, 1000000);
+});

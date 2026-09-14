@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { mkdir, appendFile, opendir, lstat } from "node:fs/promises";
-import { checkout, guidance, diff } from "./inspection.mjs";
+import { checkout, guidance, publicationPatch } from "./inspection.mjs";
 import { atomic, json, sleep, hash, isRecord } from "./util.mjs";
 import { validateConfig } from "./config.mjs";
 import { runReview } from "./provider.mjs";
@@ -53,7 +53,7 @@ interface WorkerOptions {
   review?: typeof runReview;
   prepare?: typeof checkout;
   readGuidance?: typeof guidance;
-  readDiff?: typeof diff;
+  readDiff?: typeof publicationPatch;
   logger?: Pick<Console, "error">;
   heartbeatMs?: number;
   pollMs?: number;
@@ -98,9 +98,9 @@ export async function workerRequest<A extends WorkerAction>(
   if (!response.ok)
     throw new Error(
       result &&
-      typeof result === "object" &&
-      "error" in result &&
-      typeof result.error === "string"
+        typeof result === "object" &&
+        "error" in result &&
+        typeof result.error === "string"
         ? result.error
         : `Crow service returned ${response.status}`,
     );
@@ -330,7 +330,7 @@ export async function startWorker(
     review = runReview,
     prepare = checkout,
     readGuidance = guidance,
-    readDiff = diff,
+    readDiff = publicationPatch,
     logger = console,
     heartbeatMs = 10000,
     pollMs = 1000,
@@ -574,7 +574,9 @@ export async function startWorker(
         report,
       });
       abort.signal.throwIfAborted();
-      const patch = await readDiff(source);
+      const patch = await readDiff(source, report.findings, {
+        signal: abort.signal,
+      });
       abort.signal.throwIfAborted();
       await send("report", { report, patch });
     } catch (error) {

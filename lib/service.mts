@@ -132,7 +132,7 @@ const logins = (value: unknown): value is string[] =>
       /^[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?$/.test(name),
   );
 function publicJob(j: ReviewJob) {
-  const { report, lease, ...view } = j;
+  const { report, lease, patch, ...view } = j;
   return view;
 }
 function extractEvent(type: unknown, payload: unknown): CrowEvent {

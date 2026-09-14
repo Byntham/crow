@@ -566,7 +566,11 @@ export async function githubIdentity({
   return { login: text(user.login, "GitHub login"), token };
 }
 export function applySetupPort(config: CrowConfig, port: unknown) {
-  if (port === undefined) return;
+  if (port === undefined) {
+    if (config.role !== "worker")
+      config.serviceUrl = `http://127.0.0.1:${config.port}`;
+    return;
+  }
   if (!["string", "number"].includes(typeof port))
     throw new Error("Provide a numeric setup port");
   const selected = integer(Number(port), 1, 65535, "setup port");

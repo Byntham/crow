@@ -10,6 +10,7 @@ export interface ProcessOptions {
   timeout?: number;
   limit?: number;
   onLine?: (line: string) => void;
+  onChunk?: (chunk: string) => void;
   inherit?: boolean;
   detached?: boolean;
   capture?: boolean;
@@ -138,6 +139,7 @@ export function processRun(
     timeout = 0,
     limit = 16 * 1024 * 1024,
     onLine,
+    onChunk,
     inherit = false,
     detached = !inherit,
     capture = true,
@@ -185,6 +187,14 @@ export function processRun(
       child.stderr!.setEncoding("utf8");
       child.stdout!.on("data", (data: string) => {
         if (failure) return;
+        if (onChunk) {
+          try {
+            onChunk(data);
+          } catch (e) {
+            stop(e);
+            return;
+          }
+        }
         if (capture) {
           bytes += Buffer.byteLength(data);
           out += data;
