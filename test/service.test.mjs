@@ -1316,3 +1316,46 @@ test("checkout supersession uses worker assignment saved during GitHub refresh",
   assert.equal(replacement.worker, "replacement-worker");
   assert.equal(replacement.head, "d".repeat(40));
 });
+
+test("resume rejects a fresh or unsaved review instead of creating new work", async (t) => {
+  const f = await fixture(t);
+  const fresh = await f.call("/admin/resume", {
+    repo: "owner/project",
+    number: 1,
+  });
+  assert.equal(fresh.status, 400);
+  assert.equal(f.store.all("jobs").length, 0);
+  const job = await claim(f);
+  await f.call("/admin/pause", { repo: "owner/project", number: 1 });
+  const unsaved = await f.call("/admin/resume", {
+    repo: "owner/project",
+    number: 1,
+  });
+  assert.equal(unsaved.status, 400);
+  assert.equal(f.store.get("jobs", job.id).state, "paused");
+});
+
+test("webhooks reject unenrolled or mismatched GitHub App installations before persistence", async (t) => {
+  const f = await fixture(t);
+  const payload = { ...event(), installation: { id: 999 } };
+  assert.equal(
+    (await f.webhook("pull_request", payload, "wrong-install")).data.accepted,
+    false,
+  );
+  assert.deepEqual(f.store.events(), []);
+  const unknown = {
+    ...event(),
+    repository: { full_name: "other/repo" },
+    installation: { id: 11 },
+  };
+  assert.equal(
+    (await f.webhook("pull_request", unknown, "unknown-repo")).data.accepted,
+    false,
+  );
+  assert.deepEqual(f.store.events(), []);
+  const valid = { ...event(), installation: { id: 11 } };
+  assert.equal(
+    (await f.webhook("pull_request", valid, "valid-install")).data.accepted,
+    true,
+  );
+});

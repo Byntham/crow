@@ -677,6 +677,22 @@ export async function startService(
       return repo;
     }
     if (["review", "resume", "restart"].includes(action)) {
+      if (action === "resume") {
+        const current = store
+          .all("jobs")
+          .filter(
+            (j) =>
+              j.repo === repoName(string(a.repo, "repository")) &&
+              j.number === Number(a.number),
+          )
+          .at(-1);
+        if (
+          !current ||
+          !["paused", "held"].includes(current.state) ||
+          (current.state === "paused" && !current.session && !current.report)
+        )
+          throw new Error("No paused review with saved work to resume");
+      }
       if (action === "resume" && (a.model || a.effort)) {
         const current = store
           .all("jobs")
@@ -1125,13 +1141,23 @@ export async function startService(
         const delivery = req.headers["x-github-delivery"];
         if (typeof delivery !== "string" || delivery.length > 200)
           return reply(400, { error: "Missing delivery ID" });
-        const accepted = store.acceptEvent(
-          delivery,
-          extractEvent(
-            req.headers["x-github-event"],
-            JSON.parse(raw.toString("utf8")),
-          ),
-        );
+        const payload = JSON.parse(raw.toString("utf8"));
+        const extracted = extractEvent(req.headers["x-github-event"], payload);
+        if (extracted.repo) {
+          const enrolled = store.get("repos", repoName(extracted.repo));
+          const installation = optionalObject(payload).installation;
+          const installationId =
+            installation && typeof installation === "object"
+              ? optionalNumber(optionalObject(installation).id)
+              : undefined;
+          if (
+            !enrolled ||
+            (installationId !== undefined &&
+              installationId !== enrolled.installation)
+          )
+            return reply(202, { accepted: false });
+        }
+        const accepted = store.acceptEvent(delivery, extracted);
         return reply(202, { accepted });
       }
       const bearer = String(req.headers.authorization || "").replace(
