@@ -476,13 +476,25 @@ export async function startService(
     if (busy || closed) return;
     busy = true;
     try {
+      const deferredRepos = new Set<string>();
       for (const e of store.events()) {
+        const repository = e.repo?.toLowerCase() || e.id;
+        if (deferredRepos.has(repository)) continue;
+        if ((e.nextAt || 0) > Date.now()) {
+          deferredRepos.add(repository);
+          continue;
+        }
         try {
           await handleEvent(e);
           store.eventDone(e.id);
         } catch (err) {
+          const delay = Math.max(
+            Math.min(5000 * 2 ** Math.min(e.retries || 0, 6), 300000),
+            Math.min(errorNumber(err, "retryAfter"), 86400000),
+          );
+          store.deferEvent(e, Date.now() + delay);
+          deferredRepos.add(repository);
           logger.error("Event deferred:", errorMessage(err));
-          break;
         }
       }
       for (const j of store.all("jobs")) {

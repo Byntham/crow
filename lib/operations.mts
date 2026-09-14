@@ -7,6 +7,7 @@ import {
   checkBinaryUpdate,
 } from "./binary-install.mjs";
 import { mkdir, rm } from "node:fs/promises";
+import { Store } from "./store.mjs";
 import {
   atomic,
   acquireLock,
@@ -380,6 +381,24 @@ export async function waitForStartup(
   } while (Date.now() <= deadline);
   throw new Error("Updated Crow did not finish starting");
 }
+// Lifecycle commands run on the connection-service host. Preserve cleanup even
+// when the listener is unavailable after a failed stop, install, or restart.
+export async function clearServiceDrain(
+  root: string,
+  config: CrowConfig,
+  administer = admin,
+) {
+  try {
+    await administer(config, "undrain", {});
+  } catch {
+    const store = new Store(join(root, "service.sqlite"));
+    try {
+      store.delete("state", "drain");
+    } finally {
+      store.close();
+    }
+  }
+}
 interface UpdateOptions {
   run?: Run;
   binary?: boolean;
@@ -387,6 +406,8 @@ interface UpdateOptions {
   startup?: typeof waitForStartup;
   release?: string;
   installUnit?: typeof installService;
+  administer?: typeof admin;
+  ready?: typeof waitForService;
 }
 export async function update(
   root: string,
@@ -413,6 +434,8 @@ async function performUpdate(
     startup = waitForStartup,
     release = dirname(dirname(cliPath)),
     installUnit = installService,
+    administer = admin,
+    ready = waitForService,
   }: UpdateOptions,
 ) {
   const prepared = binary
@@ -458,29 +481,37 @@ async function performUpdate(
     if (pending === 0 && !needsInstall)
       return { updated: false, message: "Crow is current." };
   }
-  if (config.role !== "worker") await admin(config, "drain", {});
-  else {
-    const pid = await processId(join(root, "runtime.lock"));
-    if (pid) {
-      await rm(join(root, "drained.json"), { force: true });
-      process.kill(pid, "SIGUSR1");
-      for (;;) {
-        const drained = await processId(join(root, "drained.json"));
-        if (drained === pid) break;
-        try {
-          process.kill(pid, 0);
-        } catch {
-          throw new Error("Worker exited while draining");
-        }
-        await new Promise((r) => setTimeout(r, 1000));
-      }
-    }
-  }
+  let ownsDrain = false;
+  let failure: unknown;
   let rollback: (() => Promise<void>) | undefined;
   try {
+    if (config.role !== "worker") {
+      const current = await administer(config, "status");
+      if (!current.draining) {
+        // A lost response may follow a successfully applied drain.
+        ownsDrain = true;
+        await administer(config, "drain", {});
+      }
+    } else {
+      const pid = await processId(join(root, "runtime.lock"));
+      if (pid) {
+        await rm(join(root, "drained.json"), { force: true });
+        process.kill(pid, "SIGUSR1");
+        for (;;) {
+          const drained = await processId(join(root, "drained.json"));
+          if (drained === pid) break;
+          try {
+            process.kill(pid, 0);
+          } catch {
+            throw new Error("Worker exited while draining");
+          }
+          await new Promise((r) => setTimeout(r, 1000));
+        }
+      }
+    }
     if (config.role !== "worker")
       for (;;) {
-        const s = await admin(config, "status");
+        const s = await administer(config, "status");
         if (
           !(s.jobs || []).some((j) =>
             ["reviewing", "publishing"].includes(j.state),
@@ -495,7 +526,7 @@ async function performUpdate(
       rollback = await prepared.activate();
       await serviceAction(root, "start", { run });
       await startup(root, prepared.version, { run });
-      if (config.role !== "worker") await waitForService(config);
+      if (config.role !== "worker") await ready(config);
       return { updated: true, version: prepared.version };
     }
     await run("git", ["merge", "--ff-only", upstream], {
@@ -517,8 +548,10 @@ async function performUpdate(
       });
       await installUnit(root, { run });
     } else await serviceAction(root, "start", { run });
+    if (config.role !== "worker") await ready(config);
     return { updated: true };
   } catch (e) {
+    failure = e;
     if (rollback) {
       await serviceAction(root, "stop", { run }).catch(() => {});
       await rollback();
@@ -535,8 +568,16 @@ async function performUpdate(
       `Update stopped: ${errorMessage(e)}. Inspect the checkout, then run crow start.`,
     );
   } finally {
-    if (config.role !== "worker")
-      await admin(config, "undrain", {}).catch(() => {});
+    if (ownsDrain) {
+      try {
+        await clearServiceDrain(root, config, administer);
+      } catch (error) {
+        throw new AggregateError(
+          failure === undefined ? [error] : [failure, error],
+          "Update could not clear its drain. Run crow undrain after restoring the service.",
+        );
+      }
+    }
   }
 }
 

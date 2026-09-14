@@ -758,3 +758,35 @@ test("retention compacts terminal reports without deleting pending receipts or p
   assert.equal(s.get("jobs", "paused").report.summary, "saved");
   assert.equal(s.acceptEvent("pending", { type: "ping" }), false);
 });
+
+test("event retry deadlines and arrival order survive a store restart", async (t) => {
+  const { s, file } = await database(t);
+  s.acceptEvent("z-first", {
+    type: "pull_request",
+    repo: "owner/project",
+    number: 1,
+  });
+  s.acceptEvent("a-second", {
+    type: "pull_request",
+    repo: "owner/project",
+    number: 2,
+  });
+  const deadline = Date.now() + 60000;
+  s.deferEvent(s.events()[0], deadline);
+  s.close();
+  const restored = new Store(file);
+  try {
+    const [first, second] = restored.events();
+    assert.equal(first.id, "z-first");
+    assert.equal(first.retries, 1);
+    assert.equal(first.nextAt, deadline);
+    assert.equal(second.id, "a-second");
+    assert.equal(second.retries, undefined);
+    restored.deferEvent(first, deadline + 60000);
+    assert.equal(restored.events()[0].retries, 2);
+    restored.eventDone(first.id);
+    assert.deepEqual(restored.events(), [second]);
+  } finally {
+    restored.close();
+  }
+});

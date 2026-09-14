@@ -831,12 +831,19 @@ test("concurrent provider failures cannot shorten the shared cooldown", async (t
   const second = (await f.worker("next")).data.job;
   const session = "12345678-1234-1234-1234-123456789abc";
   await f.worker("failed", {
-    id: first.id, lease: first.lease, session, kind: "transient", retryAfter: 60000,
+    id: first.id,
+    lease: first.lease,
+    session,
+    kind: "transient",
+    retryAfter: 60000,
   });
   const cooldown = f.store.get("state", "cooldown");
   assert.ok(cooldown >= Date.now() + 59000);
   await f.worker("failed", {
-    id: second.id, lease: second.lease, session, kind: "transient",
+    id: second.id,
+    lease: second.lease,
+    session,
+    kind: "transient",
   });
   assert.equal(f.store.get("state", "cooldown"), cooldown);
   assert.equal((await f.worker("next")).data, null);
@@ -844,27 +851,36 @@ test("concurrent provider failures cannot shorten the shared cooldown", async (t
 
 test("target pushes revalidate saved work automatically and replace changed comparisons", async (t) => {
   const f = await fixture(t);
-  const job = await claim(f), identity = { id: job.id, lease: job.lease };
+  const job = await claim(f),
+    identity = { id: job.id, lease: job.lease };
   await f.worker("comparison", { ...identity, comparison });
   await f.worker("session", {
-    ...identity, session: "12345678-1234-1234-1234-123456789abc",
+    ...identity,
+    session: "12345678-1234-1234-1234-123456789abc",
   });
   f.prs.set(1, pr(1, { base: { ref: "main", sha: "d".repeat(40) } }));
   await f.webhook("push", {
-    repository: { full_name: "owner/project" }, ref: "refs/heads/main",
+    repository: { full_name: "owner/project" },
+    ref: "refs/heads/main",
   });
   await until(() => f.store.events().length === 0);
   assert.equal(f.store.get("jobs", job.id).state, "reviewing");
   await f.worker("report", {
-    ...identity, report: { summary: "Report for the old comparison.", findings: [] },
+    ...identity,
+    report: { summary: "Report for the old comparison.", findings: [] },
   });
   await until(() => f.store.get("jobs", job.id).state === "queued");
   const resumed = (await f.worker("next")).data.job;
   assert.equal(resumed.session, "12345678-1234-1234-1234-123456789abc");
   assert.ok(resumed.report);
   const result = await f.worker("comparison", {
-    id: resumed.id, lease: resumed.lease,
-    comparison: { ...comparison, base: "e".repeat(40), targetSha: "d".repeat(40) },
+    id: resumed.id,
+    lease: resumed.lease,
+    comparison: {
+      ...comparison,
+      base: "e".repeat(40),
+      targetSha: "d".repeat(40),
+    },
   });
   assert.deepEqual(result.data, { cancel: true });
   assert.equal(f.store.get("jobs", job.id).state, "superseded");
@@ -882,7 +898,8 @@ test("target pushes and catch-up preserve an explicitly paused review", async (t
   await f.call("/admin/pause", { repo: "owner/project", number: 1 });
   f.prs.set(1, pr(1, { base: { ref: "main", sha: "d".repeat(40) } }));
   await f.webhook("push", {
-    repository: { full_name: "owner/project" }, ref: "refs/heads/main",
+    repository: { full_name: "owner/project" },
+    ref: "refs/heads/main",
   });
   await until(() => f.store.events().length === 0);
   await f.call("/admin/catch-up", { repo: "owner/project" });
@@ -892,10 +909,13 @@ test("target pushes and catch-up preserve an explicitly paused review", async (t
 
 test("target revalidation does not undo a pause during publication refresh", async (t) => {
   const f = await fixture(t);
-  const job = await claim(f), identity = { id: job.id, lease: job.lease };
+  const job = await claim(f),
+    identity = { id: job.id, lease: job.lease };
   await f.worker("comparison", { ...identity, comparison });
   let release;
-  const gate = new Promise((resolve) => { release = resolve; });
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
   let refreshing = false;
   f.github.pr = async () => {
     refreshing = true;
@@ -904,7 +924,8 @@ test("target revalidation does not undo a pause during publication refresh", asy
   };
   t.after(() => release());
   await f.worker("report", {
-    ...identity, report: { summary: "Saved report.", findings: [] },
+    ...identity,
+    report: { summary: "Saved report.", findings: [] },
   });
   await until(() => refreshing);
   await f.call("/admin/pause", { repo: "owner/project", number: 1 });
@@ -918,11 +939,17 @@ for (const eligible of [true, false]) {
   test(`checkout head races refresh the PR and ${eligible ? "queue its current head" : "respect author authorization"}`, async (t) => {
     const f = await fixture(t);
     const job = await claim(f);
-    f.prs.set(1, pr(1, {
-      head: { sha: "d".repeat(40) }, user: { login: eligible ? "alice" : "mallory" },
-    }));
+    f.prs.set(
+      1,
+      pr(1, {
+        head: { sha: "d".repeat(40) },
+        user: { login: eligible ? "alice" : "mallory" },
+      }),
+    );
     const result = await f.worker("failed", {
-      id: job.id, lease: job.lease, kind: "superseded",
+      id: job.id,
+      lease: job.lease,
+      kind: "superseded",
     });
     assert.deepEqual(result.data, { cancel: true });
     assert.equal(f.store.get("jobs", job.id).state, "superseded");
@@ -936,7 +963,9 @@ test("checkout recovery cannot undo an operator pause during GitHub refresh", as
   const f = await fixture(t);
   const job = await claim(f);
   let release;
-  const gate = new Promise((resolve) => { release = resolve; });
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
   let refreshing = false;
   f.github.pr = async () => {
     refreshing = true;
@@ -945,7 +974,9 @@ test("checkout recovery cannot undo an operator pause during GitHub refresh", as
   };
   t.after(() => release());
   const failure = f.worker("failed", {
-    id: job.id, lease: job.lease, kind: "superseded",
+    id: job.id,
+    lease: job.lease,
+    kind: "superseded",
   });
   await until(() => refreshing);
   await f.call("/admin/pause", { repo: "owner/project", number: 1 });
@@ -960,8 +991,12 @@ test("inclusive catch-up waits for a normal scan and includes the excluded backl
   const repo = f.store.get("repos", "owner/project");
   f.store.enroll({ ...repo, excluded: [1] });
   let release;
-  const gate = new Promise((resolve) => { release = resolve; });
-  let scans = 0, active = 0, maximum = 0;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  let scans = 0,
+    active = 0,
+    maximum = 0;
   f.github.prs = async () => {
     scans++;
     maximum = Math.max(maximum, ++active);
@@ -972,8 +1007,14 @@ test("inclusive catch-up waits for a normal scan and includes the excluded backl
   t.after(() => release());
   const normal = f.svc.admin("catch-up", { repo: repo.name });
   await until(() => scans === 1);
-  const inclusive = f.svc.admin("catch-up", { repo: repo.name, includeBacklog: true });
-  const duplicate = f.svc.admin("catch-up", { repo: repo.name, includeBacklog: true });
+  const inclusive = f.svc.admin("catch-up", {
+    repo: repo.name,
+    includeBacklog: true,
+  });
+  const duplicate = f.svc.admin("catch-up", {
+    repo: repo.name,
+    includeBacklog: true,
+  });
   release();
   assert.equal((await normal)[repo.name].queued, 0);
   assert.equal((await inclusive)[repo.name].queued, 1);
@@ -982,4 +1023,63 @@ test("inclusive catch-up waits for a normal scan and includes the excluded backl
   assert.equal(maximum, 1);
   assert.deepEqual(f.store.get("repos", repo.name).excluded, []);
   assert.equal(f.store.all("jobs").length, 1);
+});
+
+test("a failed repository backs off without blocking other repositories or reordering its events", async (t) => {
+  const f = await fixture(t);
+  const repo = f.store.get("repos", "owner/project");
+  f.store.enroll({ ...repo, name: "owner/healthy" });
+  let broken = true;
+  const attempts = [];
+  f.github.token = async (repository) => {
+    attempts.push(repository.name);
+    if (broken && repository.name === repo.name)
+      throw Object.assign(new Error("Installation suspended"), {
+        status: 403,
+        retryAfter: 60000,
+      });
+    return "private-installation-token";
+  };
+  const processed = [];
+  f.github.pr = async (repository, number) => {
+    processed.push(`${repository.name}#${number}`);
+    return pr(number);
+  };
+  const enqueue = (id, repository, number) =>
+    f.store.acceptEvent(id, {
+      type: "pull_request",
+      repo: repository,
+      number,
+      action: "opened",
+    });
+  enqueue("broken-first", repo.name, 1);
+  enqueue("broken-second", repo.name, 2);
+  enqueue("healthy-third", "owner/healthy", 1);
+  await until(() => f.store.all("jobs").length === 1);
+  assert.equal(f.store.all("jobs")[0].repo, "owner/healthy");
+  const pending = f.store.events();
+  assert.deepEqual(
+    pending.map((e) => e.id),
+    ["broken-first", "broken-second"],
+  );
+  assert.equal(pending[0].retries, 1);
+  assert.ok(pending[0].nextAt >= Date.now() + 58000);
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  assert.equal(attempts.filter((name) => name === repo.name).length, 1);
+  assert.equal(f.store.events()[0].retries, 1);
+  assert.deepEqual(processed, ["owner/healthy#1"]);
+  broken = false;
+  // Make the persisted deadline due without making this regression wait a minute.
+  f.store.db
+    .prepare(
+      "UPDATE events SET value=json_set(value, '$.nextAt', 0) WHERE id=?",
+    )
+    .run("broken-first");
+  await until(() => f.store.events().length === 0);
+  assert.deepEqual(processed, [
+    "owner/healthy#1",
+    "owner/project#1",
+    "owner/project#2",
+  ]);
+  assert.equal(f.store.all("jobs").length, 3);
 });

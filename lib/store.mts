@@ -12,6 +12,11 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { id, repoName } from "./util.mjs";
 const terminal = new Set(["completed", "superseded", "cancelled"]);
+interface PendingEvent extends CrowEvent {
+  id: string;
+  retries?: number;
+  nextAt?: number;
+}
 export class Store {
   db: DatabaseSync;
   constructor(file: string) {
@@ -83,14 +88,25 @@ export class Store {
       return true;
     });
   }
-  events(): (CrowEvent & { id: string })[] {
+  events(): PendingEvent[] {
     return this.db
-      .prepare("SELECT id,value FROM events WHERE state='pending'")
+      .prepare(
+        "SELECT id,value FROM events WHERE state='pending' ORDER BY rowid",
+      )
       .all()
       .map((x) => ({
         id: String(x.id),
-        ...(JSON.parse(String(x.value)) as CrowEvent),
+        ...(JSON.parse(String(x.value)) as Omit<PendingEvent, "id">),
       }));
+  }
+  deferEvent(event: PendingEvent, nextAt: number) {
+    const { id: key, ...value } = event;
+    this.db
+      .prepare("UPDATE events SET value=? WHERE id=?")
+      .run(
+        JSON.stringify({ ...value, retries: (event.retries || 0) + 1, nextAt }),
+        key,
+      );
   }
   eventDone(key: string) {
     this.db.prepare("DELETE FROM events WHERE id=?").run(key);

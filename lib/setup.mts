@@ -9,7 +9,7 @@ import { defaults, save, validateConfig } from "./config.mjs";
 import { isBinary, version } from "./runtime.mjs";
 import { installDownloaded } from "./install-command.mjs";
 import { installCodex } from "./codex-install.mjs";
-import { Store } from "./store.mjs";
+import { clearServiceDrain } from "./operations.mjs";
 import {
   atomic,
   isRecord,
@@ -633,18 +633,7 @@ export async function restartSetupService(
   } finally {
     if (ownsDrain) {
       try {
-        try {
-          await administer(config, "undrain", {});
-        } catch {
-          // Setup runs on the connection-service host. SQLite coordinates this
-          // write with a surviving service, and retains it for a later restart.
-          const store = new Store(join(root, "service.sqlite"));
-          try {
-            store.delete("state", "drain");
-          } finally {
-            store.close();
-          }
-        }
+        await clearServiceDrain(root, config, administer);
       } catch (error) {
         if (failed)
           throw new AggregateError(

@@ -54,7 +54,7 @@ GitHub gets concise reviewing, retrying, paused, and completed status. Detailed 
 
 ## Lifecycle and updates
 
-`crow drain` holds new review claims while active reviews finish. `crow undrain` restores claims. Run these commands on the connection-service host. Setup restores the drain it requested even if restarting fails, and preserves an existing operator drain. If both restart and drain cleanup fail, restore service access and run `crow undrain`.
+`crow drain` holds new review claims while active reviews finish. `crow undrain` restores claims. Run these commands on the connection-service host. Setup and updates restore the drain they requested even if restarting fails, and preserve an existing operator drain. If both restart and drain cleanup fail, restore service access and run `crow undrain`.
 
 ```sh
 crow status
