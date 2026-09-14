@@ -1,0 +1,74 @@
+name: Publish hosted Crow binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: Successful Build Crow binaries run ID
+        type: string
+        required: true
+      build_commit:
+        description: Exact full 40-character source commit SHA from that run
+        type: string
+        required: true
+      version:
+        description: Stable version from package.json, without v
+        type: string
+        required: true
+      confirmation:
+        description: Type publish VERSION to make these binaries public
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+# Never cancel an upload midway through changing the latest version.
+concurrency:
+  group: crow-public-release
+  cancel-in-progress: false
+
+env:
+  BUILD_RUN_ID: ${{ inputs.build_run_id }}
+  BUILD_COMMIT: ${{ inputs.build_commit }}
+  RELEASE_VERSION: ${{ inputs.version }}
+  PUBLICATION_CONFIRMATION: ${{ inputs.confirmation }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    environment: public-release
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Run publication code from the manually selected workflow revision,
+          # never from an arbitrary downloaded artifact or build branch.
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.21.0
+      - name: Verify selected build provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/publish-hosted.mjs verify-run
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: crow-linux-*
+          path: artifacts
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+      - name: Validate, publish and verify public downloads
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.CROW_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CROW_R2_SECRET_ACCESS_KEY }}
+          CROW_R2_BUCKET: crow-releases
+        run: node scripts/publish-hosted.mjs publish artifacts
+      - name: Record publication
+        run: |
+          node --input-type=module <<'JS'
+          import { appendFileSync } from "node:fs";
+          appendFileSync(process.env.GITHUB_STEP_SUMMARY, `Published Crow ${process.env.RELEASE_VERSION}\n\nSource commit: ${process.env.BUILD_COMMIT}\n\nBuild run: ${process.env.BUILD_RUN_ID}\n\nhttps://downloads.birdapp.dev/latest.txt\n`);
+          JS

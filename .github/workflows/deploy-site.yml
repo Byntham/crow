@@ -1,0 +1,59 @@
+name: Deploy Crow installation website
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type deploy birdapp.dev to publish the selected workflow revision
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crow-installation-website
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    environment: public-website
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.21.0
+      - name: Check confirmation and existing public release
+        env:
+          DEPLOY_CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          node --input-type=module <<'JS'
+          import { access, readFile, writeFile } from "node:fs/promises";
+          if (process.env.DEPLOY_CONFIRMATION !== "deploy birdapp.dev") throw new Error("Explicit site deployment confirmation is required");
+          await access("website/install.sh");
+          const response = await fetch("https://downloads.birdapp.dev/latest.txt", { redirect: "error", signal: AbortSignal.timeout(30000) });
+          if (!response.ok) throw new Error("Publish and verify the first binary release before deploying the installation page");
+          const latest = await response.text();
+          if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)\n$/.test(latest)) throw new Error("Public latest.txt is malformed");
+          for (const arch of ["x64", "arm64"]) {
+            const version = latest.trim();
+            const url = `https://downloads.birdapp.dev/releases/v${version}/crow-v${version}-linux-${arch}.tar.gz`;
+            const archive = await fetch(url, { method: "HEAD", redirect: "error", signal: AbortSignal.timeout(30000) });
+            if (!archive.ok) throw new Error(`Public ${arch} binary is unavailable`);
+          }
+          const checksum = await fetch(`https://downloads.birdapp.dev/releases/v${latest.trim()}/SHA256SUMS`, { method: "HEAD", redirect: "error", signal: AbortSignal.timeout(30000) });
+          if (!checksum.ok) throw new Error("Public release checksum file is unavailable");
+          const html = await readFile("website/index.html", "utf8");
+          if (!html.includes("__CROW_VERSION__")) throw new Error("Installation page is missing its version placeholder");
+          await writeFile("website/index.html", html.replaceAll("__CROW_VERSION__", latest.trim()));
+          JS
+      - name: Deploy selected source to Cloudflare Pages
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CROW_PAGES_API_TOKEN }}
+          DEPLOY_COMMIT: ${{ github.workflow_sha }}
+        run: npx --yes wrangler@4.72.0 pages deploy website --project-name crow-site --branch main --commit-hash "$DEPLOY_COMMIT"

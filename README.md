@@ -1,189 +1,58 @@
 # Crow
 
-Crow is a self-hosted GitHub pull-request reviewer. After a one-time setup, a
-PR opened or updated on GitHub automatically triggers a review. Crow checks out
-the commit, runs your authenticated Codex CLI or Claude Code CLI, and posts a
-summary plus inline findings back to the PR. There is nothing to run for each
-PR.
+Crow reviews GitHub pull requests on your own Linux machine, using your Codex subscription. It responds on GitHub with advisory inline findings and a summary intended for coding agents.
 
-## How it works
+Each operator runs an independent installation. There is no shared Crow backend, required Docker installation, Marketplace listing, or separately billed API-key fallback.
 
-GitHub sends Crow `pull_request` webhooks for `opened`, `reopened`, and
-`synchronize`. Crow verifies the signature, queues the event durably, reviews
-one PR at a time in an isolated temporary checkout, and posts a GitHub review.
-Only findings on added lines become inline comments; the rest stay in the
-summary. A commit marker makes retries and restarts idempotent.
+## Start
 
-## One-time setup (Docker)
+The hosted installer is prepared for `birdapp.dev` but has not been deployed yet. Once published, install with:
 
-You need a server with Docker, a public HTTPS hostname, and a GitHub account
-that can create/install an App.
-
-1. Create a private GitHub App (GitHub **Settings → Developer settings → GitHub
-   Apps → New GitHub App**).
-
-   - Homepage URL: `https://YOUR_CROW_HOST`
-   - Webhook URL: `https://YOUR_CROW_HOST/webhooks/github`
-   - Choose a long random webhook secret and keep it private.
-   - Repository permissions: **Contents: Read**, **Pull requests: Read and
-     write**, **Issues: Read and write**, and **Metadata: Read**.
-   - Subscribe to the **Pull request** event, create the App, install it on the
-     repositories Crow should watch, and download the App's private key. Note
-     the App ID.
-
-   [github-app-manifest.json](./github-app-manifest.json) lists the same fields
-   as a reference. It is not an upload endpoint; the GitHub form is the setup
-   flow.
-
-2. Put the key and webhook secret on the server (never commit them):
-
-   ```bash
-   mkdir -p secrets
-   cp downloaded-app-key.pem secrets/github-app.pem
-   printf '%s' 'the-webhook-secret-you-chose' > secrets/webhook-secret
-   chmod 600 secrets/github-app.pem secrets/webhook-secret
-   cp .env.example .env
-   ```
-
-   For a systemd install running as `crow`, make the secret files readable by
-   that user (for example, `sudo chown crow:crow secrets/github-app.pem secrets/webhook-secret`
-   after creating the account).
-
-   Edit `.env` and set `GITHUB_APP_ID`, `CROW_PROVIDER`, and the public-facing
-   host details. The example uses the same relative paths for Docker and a
-   normal install.
-
-3. Build Crow, then sign in to the selected CLI. Compose keeps the login in a
-   named volume, so do this once as the container's `node` user:
-
-   ```bash
-   docker compose build
-   # Choose one (the login is persisted in the named auth volume):
-   # Codex's device flow works when the server has no browser/localhost callback.
-   docker compose run --rm -it --entrypoint codex crow login --device-auth
-   # Claude prints a URL and accepts the returned code in this terminal.
-   docker compose run --rm -it --entrypoint claude crow auth login
-   ```
-
-   The image installs `@openai/codex` by default. For Claude, set
-   `CROW_PROVIDER=claude` and
-   `CROW_CLI_PACKAGE=@anthropic-ai/claude-code@^2.1.259` in `.env` before
-   `docker compose build`. Compose sets `CLAUDE_CONFIG_DIR` so Claude's
-   config and subscription credentials are kept in the mounted auth volume.
-
-4. Start Crow and put an HTTPS reverse proxy (Caddy, nginx, or equivalent) in
-   front of its local port:
-
-   ```bash
-   docker compose up -d
-   curl http://127.0.0.1:8787/health  # replace 8787 if PORT is customized
-   docker compose logs -f crow
-   ```
-
-   `/health` includes `configured: true/false`; the Compose health check only
-   reports healthy once the App key and webhook secret are readable.
-
-   Codex's read-only sandbox also needs the Docker host to allow unprivileged
-   user and network namespaces. Keep that sandbox enabled; configure the host
-   kernel/security policy if `bwrap` reports a namespace error.
-
-   The proxy must forward `/webhooks/github` to Crow. GitHub cannot deliver a
-   webhook to a private HTTP-only address. For Caddy, copy
-   [`Caddyfile.example`](./Caddyfile.example), replace the hostname (and the
-   upstream port if `PORT` is customized), then reload Caddy.
-
-## Non-Docker install
-
-Use Node `22.12` or newer. On Linux, install `bubblewrap` first so Codex's
-read-only sandbox can start (`sudo apt install bubblewrap` on Debian/Ubuntu).
-The host must also allow unprivileged user namespaces (or the equivalent
-bubblewrap configuration); keep the sandbox enabled rather than bypassing it.
-Use a recent Codex CLI that supports `codex exec --output-schema` (check with
-`codex exec --help`).
-Install the chosen CLI and authenticate it as the same OS user that will run
-Crow (a dedicated `crow` user is recommended). If the system Node prefix is
-root-owned, install the CLI with `sudo`, then run the login as the account that
-will run Crow:
-
-```bash
-npm install
-# Install the provider you selected (choose one):
-sudo npm install --global @openai/codex
-# sudo npm install --global @anthropic-ai/claude-code@^2.1.259
-codex login --device-auth                 # use plain `codex login` with a local browser
-# For Claude instead: claude auth login
-cp .env.example .env
-npm start
+```sh
+curl -fsSL https://birdapp.dev/install.sh | sh
 ```
 
-Set the file paths in `.env` to readable local files. For a systemd service,
-see [crow.service.example](./crow.service.example). Create the service user's
-writable directories before starting it, for example:
+The installer downloads and verifies the Linux binary, installs a permanent command, and offers to start setup. Downloads are public; access to Crow's private source repository is not required. Node 24 LTS is included, so users do not need Node, pnpm, or a checkout. See [installation](docs/user/install.md) for install-only mode and the source installation alternative.
 
-```bash
-sudo useradd --system --create-home --shell /usr/sbin/nologin crow
-sudo install -d -o crow -g crow /opt/crow/.crow-data /home/crow/.codex /home/crow/.claude
+Setup installs the executable and defaults to running both the connection service and worker on this machine. It guides Tailscale Funnel, creation of your own GitHub App, repository selection, a separate Codex subscription login, and persistent systemd startup. Missing supported Linux dependencies can be installed with your confirmation. Browser steps print URLs you can open on a separate desktop. No browser is required on the host.
+
+Setup does not run a test review. It checks connections, authentication, runtime capabilities, and startup configuration. Rerun `crow setup` to continue incomplete onboarding.
+
+```sh
+crow status
+crow doctor --runtime
+crow logs
 ```
 
-Run the CLI login as `User=crow` when using systemd (for example,
-`sudo -u crow -H codex login --device-auth`; for Claude use
-`sudo -u crow -H env CLAUDE_CONFIG_DIR=/home/crow/.claude claude auth login`.
-The administrator's home-directory login is not shared. The example unit sets
-`CLAUDE_CONFIG_DIR` so Claude's config and subscription credentials also stay
-under `/home/crow/.claude`. If Node or the CLI was installed in a
-custom (for example, nvm) prefix, set absolute `CROW_CODEX_BIN`/
-`CROW_CLAUDE_BIN` paths and adjust `ExecStart`/`PATH` in the unit.
+See the [Linux quickstart](docs/user/quickstart.md), [HTTPS choices](docs/user/networking.md), [separate-machine setup](docs/user/split-machines.md), and [configuration and operations](docs/user/operations.md).
 
-Install and start the unit after updating its paths if needed:
+## Review behavior
 
-```bash
-sudo cp crow.service.example /etc/systemd/system/crow.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now crow
-sudo journalctl -u crow -f
+- New PR events trigger work. Crow does not poll GitHub for PRs on a schedule.
+- Repository policies initially allow only your PRs. You can add authors or allow everyone. Authorized fork PRs targeting an enrolled repository are included.
+- Drafts and the initial open backlog are skipped. Startup/recovery catch-up repairs missed work, with large batches held for release.
+- Each worker allows three simultaneous reviews. Each review can use up to eight subagents. Both limits are configurable.
+- Reviews inspect files and diffs through dedicated read-only tools. They cannot run repository tests, scripts, or dependency installation.
+- Findings are advisory. Crow does not approve, request changes, or block merging.
+- Retries resume saved work where possible. The default is ten retries separated by at least five seconds. Reports publish only after completion and validation.
+
+Optional review instructions belong in `.crow/review.md`. Crow also reads applicable `AGENTS.md` files from the pinned target branch. These instructions cannot alter author authorization or permit execution of repository code.
+
+## Development
+
+Use Node 24 LTS. The `packageManager` field in `package.json` pins pnpm to 12.3.4. See the [pnpm installation guide](https://pnpm.io/installation) if pnpm is missing. pnpm manages the development workflow; Crow runs on Node. End users do not need pnpm.
+
+```sh
+pnpm install --frozen-lockfile
+pnpm typecheck    # Strict TypeScript checking
+pnpm build        # Check types and emit JavaScript into dist/
+pnpm build:binary # Check types and package this Linux architecture
+pnpm check        # Check types, rebuild, and run the test suite
+pnpm test:runtime # Actual installed Codex, with local synthetic responses
 ```
 
-## Provider choice and safety
+Application source lives in `lib/*.mts` and `bin/*.mts`. TypeScript 7 checks it in strict NodeNext mode. Node emits the runnable `.mjs` modules into `dist/`; `pnpm start` builds and runs `dist/bin/crow.mjs`. Release builds bundle the application into a Node single executable. Build scripts, behavioral tests, and runtime probes remain JavaScript; compile-only contract tests use TypeScript. `pnpm test` rebuilds and runs the suite without the separate type check; use `pnpm check` before submitting changes. See the [TypeScript migration design](docs/design/typescript-migration.md) and [binary release design](docs/design/binary-release.md).
 
-Set `CROW_PROVIDER=codex` or `CROW_PROVIDER=claude`. Crow uses the CLI's local
-subscription login; it does not call a separate Crow model API. Codex runs with
-an ephemeral read-only sandbox and ignores user/project instruction files.
-Claude Code 2.1.259 or newer runs in safe/restricted `dontAsk` mode with only the
-`Read` tool, no MCP configuration, and no session persistence. The checkout is
-temporary, GitHub credentials are removed before the model starts, and
-provider output is size-limited and redacted for known API keys. The CLI still
-needs to read its own login files, so run Crow in a dedicated user/container
-with no unrelated credentials in its home directory. The documented setup uses
-the mounted login files; headless token/proxy environment variables are not
-forwarded unless you add that integration deliberately.
+Tests use local fixtures and simulated provider/GitHub responses. They do not publish comments or run provider inference. Live subscription refresh, provider behavior across interruptions, and networking account authorization still require validation on an enrolled installation. Capability checks do not prove those live behaviors. See [runtime validation](docs/design/runtime-validation.md) for what the actual CLI probes establish.
 
-## Configuration
-
-| Variable | Purpose |
-| --- | --- |
-| `CROW_PROVIDER` | `codex` or `claude` |
-| `CROW_CLI_PACKAGE` | CLI package installed during the Docker build |
-| `CROW_FORWARD_API_KEYS` | Set `1` only to pass API-key env vars to the CLI (default `0`; subscription logins do not need this) |
-| `CROW_CODEX_BIN` / `CROW_CLAUDE_BIN` | Optional absolute CLI binary path |
-| `CLAUDE_CONFIG_DIR` | Optional Claude config/auth directory; Compose points this at its persistent auth volume |
-| `GITHUB_APP_ID` | GitHub App ID |
-| `GITHUB_PRIVATE_KEY_FILE` | PEM file path (Compose overrides this to its secret mount) |
-| `GITHUB_WEBHOOK_SECRET_FILE` | Webhook secret file path (Compose overrides this to its secret mount) |
-| `GITHUB_PRIVATE_KEY_PATH` / `GITHUB_WEBHOOK_SECRET_PATH` | Host-side source paths for Compose secrets |
-| `GITHUB_API_URL` / `GITHUB_HOST` | Optional GitHub Enterprise API URL (`.../api/v3`) and hostname |
-| `CROW_BOT_LOGIN` | Optional exact GitHub App bot login used when checking existing review markers |
-| `CROW_STATE_FILE` | Durable queue/history file (default `./.crow-data/state.json`) |
-| `CROW_MAX_QUEUE` | Maximum active queued reviews (default `100`) |
-| `CROW_MAX_WEBHOOK_BYTES` | Maximum webhook body size (default `2097152`) |
-| `CROW_MAX_DIFF_BYTES` | Diff context cap (default `4194304`) |
-| `CROW_REVIEW_TIMEOUT_MS` | Per-review CLI timeout (default `180000`) |
-| `CROW_MAX_PROVIDER_OUTPUT_BYTES` | CLI output cap (default `8388608`) |
-| `PORT` | Local HTTP port (default `8787`) |
-| `CROW_BIND_HOST` | Listener address (default `127.0.0.1`; use `0.0.0.0` only with deliberate network controls) |
-
-## Optional status page
-
-The Vite page in this repository is a read-only visual status mock. It is not
-needed for automatic reviews and is not served by the webhook worker. Run
-`npm run dev` locally or host `npm run build`'s `dist/` separately if you want
-to inspect it; GitHub remains the source of truth for review comments.
+The accepted product behavior and implementation sequence are in [the design documents](docs/design/implementation-plan.md).

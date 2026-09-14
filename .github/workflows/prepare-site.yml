@@ -1,0 +1,57 @@
+name: Prepare Crow Pages project
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type create crow-site to prepare the empty Pages project
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crow-installation-website
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    environment: public-website
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.21.0
+      - name: Create or verify the empty direct-upload project
+        env:
+          PREPARE_CONFIRMATION: ${{ inputs.confirmation }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CROW_PAGES_API_TOKEN }}
+        run: |
+          node --input-type=module <<'JS'
+          import { appendFileSync } from "node:fs";
+          if (process.env.PREPARE_CONFIRMATION !== "create crow-site") throw new Error("Explicit project creation confirmation is required");
+          const account = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          if (!/^[a-f0-9]{32}$/.test(account || "") || !token) throw new Error("Cloudflare account ID or Pages token is missing or invalid");
+          const base = `https://api.cloudflare.com/client/v4/accounts/${account}/pages/projects`;
+          const request = (url, options = {}) => fetch(url, {
+            ...options,
+            headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+            redirect: "error",
+            signal: AbortSignal.timeout(30000),
+          });
+          let response = await request(`${base}/crow-site`);
+          if (response.status === 404) {
+            response = await request(base, { method: "POST", body: JSON.stringify({ name: "crow-site", production_branch: "main" }) });
+          }
+          if (!response.ok) throw new Error(`Cloudflare Pages request failed with HTTP ${response.status}; check the account ID and Pages Edit permission`);
+          const body = await response.json();
+          const project = body.result;
+          if (!body.success || project?.name !== "crow-site" || project.production_branch !== "main" || project.source) {
+            throw new Error("Expected crow-site with production branch main and no Git integration; inspect the existing project before continuing");
+          }
+          appendFileSync(process.env.GITHUB_STEP_SUMMARY,
+            "The crow-site Pages project is ready. No site files were uploaded.\n\nNext, open crow-site in Cloudflare, choose Custom domains, and add birdapp.dev.\n");
+          JS

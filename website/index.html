@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Install Crow, a self-hosted GitHub pull request reviewer that uses your Codex subscription.">
+    <title>Install Crow</title>
+    <style>
+      :root { color-scheme: light dark; font-family: system-ui, sans-serif; line-height: 1.6; }
+      body { max-width: 48rem; margin: 4rem auto; padding: 0 1.25rem; }
+      h1 { line-height: 1.2; }
+      pre { overflow-x: auto; padding: 1rem; border: 1px solid #8886; border-radius: .4rem; }
+      code { font-size: .95em; }
+      a { color: light-dark(#0759aa, #8bc4ff); }
+      footer { margin-top: 3rem; font-size: .9rem; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Install Crow</h1>
+      <p>Crow reviews GitHub pull requests on a machine you control, using your Codex subscription. It runs in the background and leaves its reviews on GitHub.</p>
+      <p>On an Ubuntu or compatible Linux machine with x64 or ARM64 architecture, run:</p>
+      <pre><code>curl -fsSL https://birdapp.dev/install.sh | sh</code></pre>
+      <p>The installer downloads the native executable, verifies its checksum, and offers to start guided setup. Node, pnpm, and Docker are not required. Setup may offer to install Git, Codex, and a tunnel client when they are missing.</p>
+      <p>Keep this terminal open for setup. On a headless machine, open the printed authentication links in a browser on your desktop.</p>
+      <p>You can <a href="/install.sh">read the installer</a> before running it. To install now and configure Crow later:</p>
+      <pre><code>curl -fsSL https://birdapp.dev/install.sh | sh -s -- --no-setup
+crow setup</code></pre>
+      <p>Once configured, use <code>crow status</code> to check the service and <code>crow update</code> to install a newer release.</p>
+      <h2>Manual download</h2>
+      <p>Version __CROW_VERSION__ is also available as a <a href="https://downloads.birdapp.dev/releases/v__CROW_VERSION__/crow-v__CROW_VERSION__-linux-x64.tar.gz">Linux x64 archive</a> or <a href="https://downloads.birdapp.dev/releases/v__CROW_VERSION__/crow-v__CROW_VERSION__-linux-arm64.tar.gz">Linux ARM64 archive</a>, with a <a href="https://downloads.birdapp.dev/releases/v__CROW_VERSION__/SHA256SUMS">checksum file</a>. Check <a href="https://downloads.birdapp.dev/latest.txt">the latest version</a> for releases published since this page was deployed.</p>
+      <p>Download the archive for your machine and the checksum file into the same directory. Verify the checksum before extracting and running <code>./crow setup</code>:</p>
+      <pre><code>sha256sum --check --ignore-missing SHA256SUMS</code></pre>
+      <p>Stop if verification fails. Setup installs the permanent <code>crow</code> command.</p>
+      <p>Each installation runs independently. This website serves downloads; it does not receive your repositories, Codex credentials, or review traffic.</p>
+    </main>
+    <footer>
+      <p>Linux with glibc is required. Alpine Linux, macOS, and Windows binaries are not currently provided. Crow is under active development.</p>
+    </footer>
+  </body>
+</html>

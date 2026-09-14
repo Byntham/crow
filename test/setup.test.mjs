@@ -1,0 +1,646 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  chooseFunnelPort,
+  configureFunnel,
+  appManifest,
+  registerApp,
+  registrationAction,
+  applySetupPort,
+} from "../dist/lib/setup.mjs";
+import { defaults } from "../dist/lib/config.mjs";
+import {
+  unitText,
+  admin,
+  updateAvailability,
+} from "../dist/lib/operations.mjs";
+import { parse, redact, policyChanges } from "../dist/bin/crow.mjs";
+
+test("Funnel uses a free port and only reuses the exact Crow route", () => {
+  const status = {
+    TCP: { 443: { HTTPS: true }, 8443: { HTTPS: true } },
+    Web: {
+      "host:443": { Handlers: { "/": { Proxy: "http://localhost:3773" } } },
+      "host:8443": { Handlers: { "/": { Proxy: "http://127.0.0.1:8787" } } },
+    },
+  };
+  assert.equal(chooseFunnelPort(status), 10000);
+  assert.equal(chooseFunnelPort(status, 8443, "http://127.0.0.1:8787"), 8443);
+  status.Web["host:8443"].Handlers["/private"] = {
+    Proxy: "http://localhost:1234",
+  };
+  assert.equal(chooseFunnelPort(status, 8443, "http://127.0.0.1:8787"), 10000);
+  status.TCP[10000] = { HTTPS: true };
+  assert.throws(() => chooseFunnelPort(status), /in use/);
+});
+test("Funnel setup preserves existing Serve routes and uses background persistence", async () => {
+  const calls = [],
+    c = defaults("/tmp/crow");
+  const run = async (command, args) => {
+    calls.push([command, args]);
+    if (args[0] === "status")
+      return {
+        stdout: JSON.stringify({
+          BackendState: "Running",
+          Self: { DNSName: "crow.example.ts.net." },
+        }),
+      };
+    if (args[0] === "serve")
+      return {
+        stdout: JSON.stringify({ TCP: { 443: { HTTPS: true } }, Web: {} }),
+      };
+    return { stdout: "" };
+  };
+  await configureFunnel(c, { run });
+  assert.equal(c.publicUrl, "https://crow.example.ts.net:8443");
+  assert.deepEqual(calls.at(-1), [
+    "tailscale",
+    ["funnel", "--bg", "--https=8443", "http://127.0.0.1:8787"],
+  ]);
+  assert(!calls.flat(2).includes("reset"));
+});
+test("systemd unit quotes paths, persists across logout, and kills child processes", () => {
+  const text = unitText("/tmp/crow home%", {
+    executable: "/node space",
+    cli: "/app/bin/crow.mjs",
+    path: "/usr/bin",
+  });
+  assert.match(text, /ExecStart="\/node space"/);
+  assert.match(text, /CROW_HOME=\/tmp\/crow home%%/);
+  assert.match(text, /KillMode=mixed/);
+  assert.match(text, /UMask=0077/);
+});
+test("CLI preserves JSON and redacts credentials", () => {
+  assert.deepEqual(
+    parse(["repo-config", "a/b", "--json", '{"model":"m"}']).flags,
+    { json: '{"model":"m"}' },
+  );
+  const c = defaults("/tmp");
+  c.app = { pem: "secret", webhookSecret: "secret", id: 1 };
+  const text = JSON.stringify(redact(c));
+  assert(!text.includes(c.worker.token));
+  assert(!text.includes("secret"));
+});
+test("worker-only CLI cannot use connection-service administration", async () => {
+  await assert.rejects(
+    admin({ ...defaults("/tmp"), role: "worker" }, "status", undefined, {
+      fetcher: () => {
+        throw new Error("must not call");
+      },
+    }),
+    /connection-service host/,
+  );
+});
+test("manifest requests advisory review permissions and points to configured public callback", () => {
+  const c = defaults("/tmp");
+  c.publicUrl = "https://crow.example:8443";
+  const m = appManifest(c, "Crow");
+  assert.equal(m.public, true);
+  assert.equal(m.default_permissions.contents, "read");
+  assert.equal(m.default_permissions.checks, undefined);
+  assert.equal(m.redirect_url, c.publicUrl + "/setup/callback");
+});
+test("App registration rejects forged callback and stores generated credentials after valid state", async () => {
+  const root = await mkdtemp(join(tmpdir(), "crow-setup-"));
+  const c = defaults(root);
+  c.publicUrl = "https://example.com";
+  c.port = 0;
+  c.operator = "alice";
+  // Obtain a free concrete port. Registration binds locally, the fixture uses the same route a proxy forwards.
+  const { createServer } = await import("node:net");
+  const probe = createServer();
+  await new Promise((r) => probe.listen(0, "127.0.0.1", r));
+  c.port = probe.address().port;
+  await new Promise((r) => probe.close(r));
+  let url;
+  const announced = new Promise((resolve) => (url = resolve));
+  let exchanges = 0;
+  const registration = registerApp(c, root, {
+    ask: async (label, fallback) =>
+      label === "GitHub App name" ? "<Crow>" : fallback,
+    timeoutMs: 5000,
+    log: (line) => {
+      if (line.startsWith("Open this URL")) url(line.split(" ").at(-1));
+    },
+    fetcher: async () => {
+      exchanges++;
+      return {
+        ok: true,
+        json: async () => ({
+          id: 42,
+          pem: "key",
+          webhook_secret: "secret",
+          slug: "crow-test",
+        }),
+      };
+    },
+  });
+  try {
+    const announcedUrl = new URL(await announced),
+      base = `http://127.0.0.1:${c.port}`;
+    assert.equal(
+      (await fetch(`${base}/setup/callback?state=bad&code=bad`)).status,
+      400,
+    );
+    assert.equal(exchanges, 0);
+    const form = await (await fetch(base + announcedUrl.pathname)).text();
+    const state = form.match(/apps\/new\?state=([a-f0-9]+)/)[1];
+    assert(form.includes("&lt;Crow&gt;"));
+    const response = await fetch(
+      `${base}/setup/callback?state=${state}&code=valid`,
+    );
+    assert.equal(response.status, 200);
+    await registration;
+    const saved = JSON.parse(await readFile(join(root, "config.json"), "utf8"));
+    assert.equal(saved.app.id, 42);
+    assert.equal(saved.app.pem, "key");
+    assert.equal(exchanges, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("organization App registration URL is fixed to GitHub and rejects injected path/markup", () => {
+  const state = "a".repeat(64);
+  assert.equal(
+    registrationAction(
+      { ownerType: "organization", organization: "my-team" },
+      state,
+    ),
+    `https://github.com/organizations/my-team/settings/apps/new?state=${state}`,
+  );
+  for (const organization of [
+    "../settings",
+    "x/../../evil",
+    'x\" onclick=\"evil',
+    "https://evil.test",
+    "-bad",
+  ])
+    assert.throws(
+      () =>
+        registrationAction({ ownerType: "organization", organization }, state),
+      /Invalid/,
+    );
+  assert.throws(
+    () => registrationAction({ ownerType: "other" }, state),
+    /Invalid/,
+  );
+  const c = defaults("/tmp");
+  c.publicUrl = "https://crow.example";
+  c.appRegistration = { visibility: "private" };
+  assert.equal(appManifest(c, "Crow").public, false);
+});
+
+test("Funnel persists its plan before mutation and resumes the same binding after interruption", async () => {
+  const config = defaults("/tmp/crow");
+  let saved,
+    fail = true;
+  const status = { TCP: { 443: { HTTPS: true } }, Web: {} };
+  const ports = [];
+  const run = async (command, args) => {
+    if (args[0] === "status")
+      return {
+        stdout: JSON.stringify({
+          BackendState: "Running",
+          Self: { DNSName: "crow.example.ts.net." },
+        }),
+      };
+    if (args[0] === "serve") return { stdout: JSON.stringify(status) };
+    assert.equal(saved.ingress.pending, true);
+    assert.equal(saved.publicUrl, "https://crow.example.ts.net:8443");
+    ports.push(args[2]);
+    status.TCP[8443] = { HTTPS: true };
+    status.Web["crow.example.ts.net:8443"] = {
+      Handlers: { "/": { Proxy: "http://127.0.0.1:8787" } },
+    };
+    if (fail) throw new Error("Interrupted after binding");
+    return { stdout: "" };
+  };
+  const persistPlan = (value) => {
+    saved = structuredClone(value);
+  };
+  await assert.rejects(
+    configureFunnel(config, { run, persistPlan }),
+    /Interrupted/,
+  );
+  assert.equal(saved.ingress.pending, true);
+  fail = false;
+  await configureFunnel(saved, { run, persistPlan });
+  assert.deepEqual(ports, ["--https=8443", "--https=8443"]);
+  assert.equal(saved.ingress.pending, undefined);
+});
+
+test("setup port is configurable before onboarding and refuses accidental route migrations", () => {
+  const config = defaults("/tmp/crow");
+  applySetupPort(config, "9887");
+  assert.equal(config.port, 9887);
+  assert.equal(config.serviceUrl, "http://127.0.0.1:9887");
+  config.publicUrl = "https://crow.example";
+  assert.throws(() => applySetupPort(config, 9888), /migration/);
+  assert.throws(() => applySetupPort(config, true), /setup port/);
+  assert.throws(() => applySetupPort(config, "garbage"), /setup port/);
+});
+
+test("requester policy changes leave PR author policy untouched", () => {
+  assert.deepEqual(policyChanges({ requesters: "Alice,bob" }), {
+    requesters: ["alice", "bob"],
+  });
+  assert.deepEqual(policyChanges({ everyone: true }), { policy: "everyone" });
+  assert.deepEqual(policyChanges({ authors: "alice", requesters: "bob" }), {
+    policy: "selected",
+    authors: ["alice"],
+    requesters: ["bob"],
+  });
+  assert.throws(
+    () => policyChanges({ authors: "alice,", everyone: true }),
+    /Choose/,
+  );
+  for (const requesters of [true, "", "../alice", "alice,,bob", "-alice"])
+    assert.throws(() => policyChanges({ requesters }), /GitHub/);
+});
+
+test("status update check caches daily without merging and tolerates network failure", async () => {
+  const root = await mkdtemp(join(tmpdir(), "crow-updates-"));
+  const calls = [];
+  const run = async (command, args, options) => {
+    calls.push({ command, args, options });
+    if (args[0] === "fetch") return { stdout: "" };
+    if (args[0] === "rev-parse") return { stdout: "origin/main\n" };
+    if (args[0] === "rev-list") return { stdout: "2\n" };
+    throw new Error("Unexpected git mutation");
+  };
+  try {
+    assert.equal(
+      (await updateAvailability(root, { run, now: 100000 })).available,
+      true,
+    );
+    assert.equal(calls[0].options.timeout, 10000);
+    assert.equal(
+      calls[0].options.cwd,
+      fileURLToPath(new URL("..", import.meta.url)).replace(/\/$/, ""),
+    );
+    assert.equal(calls.length, 3);
+    assert.equal(
+      (await updateAvailability(root, { run, now: 100001 })).cached,
+      true,
+    );
+    assert.equal(calls.length, 3);
+    const failed = await updateAvailability(root, {
+      run: async () => {
+        throw new Error("offline");
+      },
+      now: 100000 + 86400001,
+    });
+    assert.equal(failed.available, true);
+    assert.match(failed.warning, /offline/);
+    assert.equal(
+      (await updateAvailability(root, { run, now: 100000 + 86400002 })).cached,
+      true,
+    );
+    assert.equal(calls.length, 3);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Funnel can guide a privileged retry without changing other bindings", async () => {
+  const c = defaults("/tmp/crow"),
+    calls = [];
+  const run = async (command, args) => {
+    calls.push([command, args]);
+    if (args[0] === "status")
+      return {
+        stdout: JSON.stringify({
+          BackendState: "Running",
+          Self: { DNSName: "host.ts.net" },
+        }),
+      };
+    if (args[0] === "serve")
+      return {
+        stdout: JSON.stringify({ TCP: { 443: { HTTPS: true } }, Web: {} }),
+      };
+    if (command === "tailscale" && args[0] === "funnel")
+      throw new Error("Access denied");
+    return { stdout: "" };
+  };
+  await configureFunnel(c, { run, ask: async () => "yes" });
+  assert.deepEqual(calls.at(-1), [
+    "sudo",
+    ["tailscale", "funnel", "--bg", "--https=8443", "http://127.0.0.1:8787"],
+  ]);
+  assert.equal(c.ingress.pending, undefined);
+});
+
+test("update checks accept release metadata without a Git revision", async () => {
+  const release = await mkdtemp(join(tmpdir(), "crow-release-"));
+  const calls = [];
+  const source = join(release, "source");
+  const run = async (command, args, options) => {
+    calls.push({ command, args, options });
+    if (args[0] === "fetch") return { stdout: "" };
+    if (args[0] === "rev-parse") return { stdout: "origin/main\n" };
+    if (args[0] === "rev-list") return { stdout: "0\n" };
+    throw new Error("Unexpected command");
+  };
+  try {
+    await writeFile(
+      join(release, "install.json"),
+      JSON.stringify({ source, revision: null }),
+    );
+    const result = await updateAvailability(join(release, "state"), {
+      release,
+      run,
+      now: 100000,
+    });
+    assert.equal(result.available, false);
+    assert.equal(result.warning, undefined);
+    assert.equal(calls.length, 3);
+    assert(calls.every(({ options }) => options.cwd === source));
+    assert.deepEqual(calls[2].args, [
+      "rev-list",
+      "--count",
+      "HEAD..origin/main",
+    ]);
+  } finally {
+    await rm(release, { recursive: true, force: true });
+  }
+});
+
+for (const phase of ["drain", "poll", "stop", "install", "ready", "success"]) {
+  test(`setup restores its drain after ${phase}`, async () => {
+    const root = await mkdtemp(join(tmpdir(), "crow-setup-drain-"));
+    const { Store } = await import("../dist/lib/store.mjs");
+    const { restartSetupService } = await import("../dist/lib/setup.mjs");
+    const store = new Store(join(root, "service.sqlite"));
+    const calls = [];
+    let online = true;
+    let reads = 0;
+    const error = new Error(`${phase} failed`);
+    try {
+      const operation = restartSetupService(defaults(root), root, {
+        log: () => {},
+        administer: async (_config, action) => {
+          calls.push(action);
+          if (!online) throw new Error("service unavailable");
+          if (action === "status") {
+            if (++reads > 1 && phase === "poll") throw error;
+            return { jobs: [], draining: !!store.get("state", "drain") };
+          }
+          if (action === "drain") {
+            store.put("state", "drain", true);
+            // Model a successful mutation followed by a lost response.
+            if (phase === "drain") throw error;
+          } else if (action === "undrain") store.delete("state", "drain");
+          else throw new Error(`unexpected action ${action}`);
+          return {};
+        },
+        stop: async () => {
+          calls.push("stop");
+          if (phase === "stop") throw error;
+          online = false;
+        },
+        install: async () => {
+          calls.push("install");
+          if (phase === "install") throw error;
+          if (phase !== "ready") online = true;
+        },
+        ready: async () => {
+          calls.push("ready");
+          if (phase === "ready") throw error;
+        },
+      });
+      if (phase === "success") await operation;
+      else await assert.rejects(operation, (actual) => actual === error);
+      assert.equal(store.get("state", "drain"), null);
+      assert.equal(calls.at(-1), "undrain");
+      if (phase === "success")
+        assert.deepEqual(calls, [
+          "status",
+          "drain",
+          "status",
+          "stop",
+          "install",
+          "ready",
+          "undrain",
+        ]);
+      // A new process sees the cleanup even after readiness/install failed.
+      const reopened = new Store(join(root, "service.sqlite"));
+      try {
+        assert.equal(reopened.get("state", "drain"), null);
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      store.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const online of [true, false]) {
+  for (const fail of [true, false]) {
+    test(`setup preserves an operator drain with service online=${online}, failure=${fail}`, async () => {
+      const root = await mkdtemp(join(tmpdir(), "crow-setup-prior-drain-"));
+      const { Store } = await import("../dist/lib/store.mjs");
+      const { restartSetupService } = await import("../dist/lib/setup.mjs");
+      const store = new Store(join(root, "service.sqlite"));
+      store.put("state", "drain", true);
+      const calls = [];
+      try {
+        const operation = restartSetupService(defaults(root), root, {
+          log: () => {},
+          administer: async (_config, action) => {
+            calls.push(action);
+            assert.equal(action, "status");
+            if (!online) throw new Error("offline");
+            return { jobs: [], draining: true };
+          },
+          stop: async () => {},
+          install: async () => {
+            if (fail) throw new Error("install failed");
+          },
+          ready: async () => {},
+        });
+        if (fail) await assert.rejects(operation, /install failed/);
+        else await operation;
+        assert.equal(store.get("state", "drain"), true);
+        assert(calls.every((action) => action === "status"));
+      } finally {
+        store.close();
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  }
+}
+
+test("service-hosting setup restores the local URL without an explicit port", () => {
+  for (const role of ["both", "service", "worker"]) {
+    const config = {
+      ...defaults("/tmp/crow"),
+      role,
+      port: 9887,
+      serviceUrl: "https://remote.example",
+    };
+    applySetupPort(config, undefined);
+    assert.equal(config.port, 9887);
+    assert.equal(
+      config.serviceUrl,
+      role === "worker" ? "https://remote.example" : "http://127.0.0.1:9887",
+    );
+  }
+});
+
+for (const state of [
+  "repository only",
+  "queued",
+  "held",
+  "reviewing",
+  "retrying",
+  "paused",
+  "publishing",
+]) {
+  test(`setup refuses removing the local worker with ${state} assignments before saving or running commands`, async () => {
+    const root = await mkdtemp(join(tmpdir(), "crow-setup-role-"));
+    const { Store } = await import("../dist/lib/store.mjs");
+    const { setup } = await import("../dist/lib/setup.mjs");
+    const { save } = await import("../dist/lib/config.mjs");
+    const config = defaults(root);
+    const store = new Store(join(root, "service.sqlite"));
+    try {
+      if (state === "repository only")
+        store.put("repos", "owner/repo", {
+          name: "owner/repo",
+          worker: config.worker.id,
+        });
+      else
+        // An unfinished job must block the transition even without a repo row.
+        store.put("jobs", "job", {
+          id: "job",
+          worker: config.worker.id,
+          state,
+          session: "local-session",
+        });
+      await save(config, root);
+      const before = await readFile(join(root, "config.json"), "utf8");
+      await assert.rejects(
+        setup(root, {
+          role: "service",
+          run: async () => {
+            assert.fail("must not run commands");
+          },
+          ask: async () => {
+            assert.fail("must not begin onboarding");
+          },
+          log: () => {},
+        }),
+        /Cannot switch to service-only.*Keep role both/,
+      );
+      assert.equal(await readFile(join(root, "config.json"), "utf8"), before);
+      assert.equal(config.role, "both");
+    } finally {
+      store.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+}
+
+test("setup allows fresh split deployment and role changes without local assignments", async () => {
+  const root = await mkdtemp(join(tmpdir(), "crow-setup-role-empty-"));
+  const { Store } = await import("../dist/lib/store.mjs");
+  const { validateSetupRole } = await import("../dist/lib/setup.mjs");
+  const config = defaults(root);
+  try {
+    await validateSetupRole(config, "service", root);
+    const store = new Store(join(root, "service.sqlite"));
+    try {
+      store.put("repos", "owner/repo", { worker: "remote-worker" });
+      store.put("jobs", "remote-paused", {
+        worker: "remote-worker",
+        state: "paused",
+      });
+      for (const state of ["completed", "superseded", "cancelled"])
+        store.put("jobs", state, { worker: config.worker.id, state });
+      await validateSetupRole(config, "service", root);
+      store.put("repos", "local", { worker: config.worker.id });
+      // Rerunning combined setup remains supported for an active installation.
+      await validateSetupRole(config, "both", root);
+      config.role = "service";
+      await validateSetupRole(config, "service", root);
+    } finally {
+      store.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("setup restart does not wait for durable publication retries", async () => {
+  const { restartSetupService } = await import("../dist/lib/setup.mjs");
+  const calls = [];
+  await restartSetupService(defaults("/unused"), "/unused", {
+    log: () => {},
+    administer: async (_config, action) => {
+      calls.push(action);
+      if (action === "status") {
+        assert(calls.filter((call) => call === "status").length <= 2);
+        return { draining: false, jobs: [{ state: "publishing" }] };
+      }
+      return {};
+    },
+    stop: async () => {
+      calls.push("stop");
+    },
+    install: async () => {
+      calls.push("install");
+    },
+    ready: async () => {
+      calls.push("ready");
+    },
+  });
+  assert.deepEqual(calls, [
+    "status", "drain", "status", "stop", "install", "ready", "undrain",
+  ]);
+});
+
+for (const role of ["both", "service"]) {
+  for (const kind of ["repos", "jobs"]) {
+    test(`setup preserves the connection service when changing ${role} to worker with ${kind}`, async () => {
+      const root = await mkdtemp(join(tmpdir(), "crow-setup-keep-service-"));
+      const { Store } = await import("../dist/lib/store.mjs");
+      const { setup, validateSetupRole } = await import("../dist/lib/setup.mjs");
+      const { save } = await import("../dist/lib/config.mjs");
+      const config = defaults(root);
+      config.role = role;
+      const store = new Store(join(root, "service.sqlite"));
+      try {
+        // Removing a connection service strands remote workers' work too.
+        store.put(kind, "record", { worker: "remote-worker", state: "paused" });
+        await save(config, root);
+        const before = await readFile(join(root, "config.json"), "utf8");
+        await assert.rejects(
+          setup(root, {
+            role: "worker",
+            run: async () => {
+              assert.fail("must not run commands");
+            },
+            ask: async () => {
+              assert.fail("must not begin pairing");
+            },
+            log: () => {},
+          }),
+          /Cannot switch to worker-only.*connection service/,
+        );
+        assert.equal(await readFile(join(root, "config.json"), "utf8"), before);
+        store.delete(kind, "record");
+        await validateSetupRole(config, "worker", root);
+      } finally {
+        store.close();
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  }
+}
