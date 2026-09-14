@@ -767,7 +767,6 @@ export async function prepareReview({
     "agents.max_concurrent_threads_per_session": Math.max(1, sub.max),
     "agents.default_subagent_model": model,
     "agents.default_subagent_reasoning_effort": effort,
-    [`projects.${JSON.stringify(cwd)}.trust_level`]: "trusted",
     "mcp_servers.crow_inspection.command": inspectionInvocation(
       sourcePath,
       contextPath,
