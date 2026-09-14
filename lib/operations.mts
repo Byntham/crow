@@ -512,12 +512,9 @@ async function performUpdate(
     if (config.role !== "worker")
       for (;;) {
         const s = await administer(config, "status");
-        if (
-          !(s.jobs || []).some((j) =>
-            ["reviewing", "publishing"].includes(j.state),
-          )
-        )
-          break;
+        // Completed reports are durable. A GitHub outage must not block an
+        // update; publication resumes after the service restarts.
+        if (!(s.jobs || []).some((j) => j.state === "reviewing")) break;
         await new Promise((r) => setTimeout(r, 1000));
       }
     await serviceAction(root, "stop", { run });

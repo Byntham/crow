@@ -2,6 +2,8 @@
 
 The default combined installation is simpler. Separate roles are useful when the public connection service belongs on one host and Codex should run on another. Both hosts still belong to the same Crow operator.
 
+These instructions apply to a new installation. An existing combined installation cannot switch to `service` while any repository or unfinished review is assigned to its local worker. Setup refuses the change before saving the new role, so the existing worker keeps running. `crow pair` creates another worker; it does not move existing repositories or saved sessions. Keep the existing installation in `both` mode until an explicit migration feature is available. You can pair remote workers with a combined installation and assign newly enrolled repositories to them. A service-hosting installation also cannot switch to `worker` while it holds repositories or unfinished reviews, because that would remove their connection service. Create the worker installation on the other machine instead.
+
 On the connection-service host:
 
 ```sh

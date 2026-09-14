@@ -11,6 +11,7 @@ for (const binary of [false, true]) {
   for (const scenario of [
     "success",
     "operator drain",
+    "pending publication",
     "lost drain response",
     "status failure",
     "stop failure",
@@ -53,10 +54,15 @@ for (const binary of [false, true]) {
             if (!online) throw new Error("Listener unavailable");
             if (action === "status") {
               statusCalls++;
+              if (scenario === "pending publication" && statusCalls > 2)
+                assert.fail("Durable publication must not block updates");
               if (statusCalls > 1 && scenario === "status failure")
                 throw new Error(scenario);
               return {
-                jobs: [],
+                jobs:
+                  scenario === "pending publication"
+                    ? [{ state: "publishing" }]
+                    : [],
                 repos: [],
                 draining: !!store.get("state", "drain"),
               };
@@ -88,7 +94,11 @@ for (const binary of [false, true]) {
           },
         },
       );
-      if (scenario === "success" || operatorDrain) {
+      if (
+        scenario === "success" ||
+        scenario === "pending publication" ||
+        operatorDrain
+      ) {
         assert.equal((await updating).updated, true);
         assert.equal(readinessCalls, 1);
       } else await assert.rejects(updating, new RegExp(scenario));

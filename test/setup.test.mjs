@@ -493,3 +493,154 @@ test("service-hosting setup restores the local URL without an explicit port", ()
     );
   }
 });
+
+for (const state of [
+  "repository only",
+  "queued",
+  "held",
+  "reviewing",
+  "retrying",
+  "paused",
+  "publishing",
+]) {
+  test(`setup refuses removing the local worker with ${state} assignments before saving or running commands`, async () => {
+    const root = await mkdtemp(join(tmpdir(), "crow-setup-role-"));
+    const { Store } = await import("../dist/lib/store.mjs");
+    const { setup } = await import("../dist/lib/setup.mjs");
+    const { save } = await import("../dist/lib/config.mjs");
+    const config = defaults(root);
+    const store = new Store(join(root, "service.sqlite"));
+    try {
+      if (state === "repository only")
+        store.put("repos", "owner/repo", {
+          name: "owner/repo",
+          worker: config.worker.id,
+        });
+      else
+        // An unfinished job must block the transition even without a repo row.
+        store.put("jobs", "job", {
+          id: "job",
+          worker: config.worker.id,
+          state,
+          session: "local-session",
+        });
+      await save(config, root);
+      const before = await readFile(join(root, "config.json"), "utf8");
+      await assert.rejects(
+        setup(root, {
+          role: "service",
+          run: async () => {
+            assert.fail("must not run commands");
+          },
+          ask: async () => {
+            assert.fail("must not begin onboarding");
+          },
+          log: () => {},
+        }),
+        /Cannot switch to service-only.*Keep role both/,
+      );
+      assert.equal(await readFile(join(root, "config.json"), "utf8"), before);
+      assert.equal(config.role, "both");
+    } finally {
+      store.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+}
+
+test("setup allows fresh split deployment and role changes without local assignments", async () => {
+  const root = await mkdtemp(join(tmpdir(), "crow-setup-role-empty-"));
+  const { Store } = await import("../dist/lib/store.mjs");
+  const { validateSetupRole } = await import("../dist/lib/setup.mjs");
+  const config = defaults(root);
+  try {
+    await validateSetupRole(config, "service", root);
+    const store = new Store(join(root, "service.sqlite"));
+    try {
+      store.put("repos", "owner/repo", { worker: "remote-worker" });
+      store.put("jobs", "remote-paused", {
+        worker: "remote-worker",
+        state: "paused",
+      });
+      for (const state of ["completed", "superseded", "cancelled"])
+        store.put("jobs", state, { worker: config.worker.id, state });
+      await validateSetupRole(config, "service", root);
+      store.put("repos", "local", { worker: config.worker.id });
+      // Rerunning combined setup remains supported for an active installation.
+      await validateSetupRole(config, "both", root);
+      config.role = "service";
+      await validateSetupRole(config, "service", root);
+    } finally {
+      store.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("setup restart does not wait for durable publication retries", async () => {
+  const { restartSetupService } = await import("../dist/lib/setup.mjs");
+  const calls = [];
+  await restartSetupService(defaults("/unused"), "/unused", {
+    log: () => {},
+    administer: async (_config, action) => {
+      calls.push(action);
+      if (action === "status") {
+        assert(calls.filter((call) => call === "status").length <= 2);
+        return { draining: false, jobs: [{ state: "publishing" }] };
+      }
+      return {};
+    },
+    stop: async () => {
+      calls.push("stop");
+    },
+    install: async () => {
+      calls.push("install");
+    },
+    ready: async () => {
+      calls.push("ready");
+    },
+  });
+  assert.deepEqual(calls, [
+    "status", "drain", "status", "stop", "install", "ready", "undrain",
+  ]);
+});
+
+for (const role of ["both", "service"]) {
+  for (const kind of ["repos", "jobs"]) {
+    test(`setup preserves the connection service when changing ${role} to worker with ${kind}`, async () => {
+      const root = await mkdtemp(join(tmpdir(), "crow-setup-keep-service-"));
+      const { Store } = await import("../dist/lib/store.mjs");
+      const { setup, validateSetupRole } = await import("../dist/lib/setup.mjs");
+      const { save } = await import("../dist/lib/config.mjs");
+      const config = defaults(root);
+      config.role = role;
+      const store = new Store(join(root, "service.sqlite"));
+      try {
+        // Removing a connection service strands remote workers' work too.
+        store.put(kind, "record", { worker: "remote-worker", state: "paused" });
+        await save(config, root);
+        const before = await readFile(join(root, "config.json"), "utf8");
+        await assert.rejects(
+          setup(root, {
+            role: "worker",
+            run: async () => {
+              assert.fail("must not run commands");
+            },
+            ask: async () => {
+              assert.fail("must not begin pairing");
+            },
+            log: () => {},
+          }),
+          /Cannot switch to worker-only.*connection service/,
+        );
+        assert.equal(await readFile(join(root, "config.json"), "utf8"), before);
+        store.delete(kind, "record");
+        await validateSetupRole(config, "worker", root);
+      } finally {
+        store.close();
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  }
+}

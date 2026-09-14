@@ -1,8 +1,9 @@
 import type { Interface } from "node:readline/promises";
 import type { CrowConfig, AppRegistration } from "./types.mjs";
 import { createServer } from "node:http";
+import { DatabaseSync } from "node:sqlite";
 import { createInterface } from "node:readline/promises";
-import { mkdir, readFile, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, mkdtemp, rm, writeFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir, tmpdir, arch } from "node:os";
 import { defaults, save, validateConfig } from "./config.mjs";
@@ -583,6 +584,47 @@ export function applySetupPort(config: CrowConfig, port: unknown) {
   config.port = selected;
   config.serviceUrl = `http://127.0.0.1:${selected}`;
 }
+export async function validateSetupRole(
+  config: CrowConfig,
+  selectedRole: CrowConfig["role"],
+  root: string,
+) {
+  const removingService = config.role !== "worker" && selectedRole === "worker";
+  const removingLocalWorker = config.role === "both" && selectedRole === "service";
+  if (!removingService && !removingLocalWorker) return;
+  const file = join(root, "service.sqlite");
+  try {
+    await stat(file);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT")
+      return;
+    throw error;
+  }
+  const database = new DatabaseSync(file, { readOnly: true });
+  try {
+    const assigned = database
+      .prepare(
+        `SELECT 1 FROM records
+         WHERE kind IN ('repos', 'jobs')
+           AND (? OR json_extract(value, '$.worker') = ?)
+           AND (kind = 'repos' OR COALESCE(json_extract(value, '$.state'), '')
+             NOT IN ('completed', 'superseded', 'cancelled'))
+         LIMIT 1`,
+      )
+      .get(Number(removingService), config.worker.id);
+    if (assigned) {
+      if (removingService)
+        throw new Error(
+          `Cannot switch to worker-only: repositories or unfinished reviews still require this machine's connection service. Keep role ${config.role}. Set up a fresh worker installation on the other machine; changing roles does not migrate service data.`,
+        );
+      throw new Error(
+        "Cannot switch to service-only: repositories or unfinished reviews still require this machine's local worker. Keep role both. Moving existing assignments to another machine is not supported yet; crow pair creates a new worker and does not migrate repositories or saved sessions. Set up a fresh installation for a new split deployment.",
+      );
+    }
+  } finally {
+    database.close();
+  }
+}
 // Restore only the drain requested by this setup run, including when the
 // service cannot restart. The scheduler reads this persistent row on each claim.
 export async function restartSetupService(
@@ -620,7 +662,7 @@ export async function restartSetupService(
         const state = await administer(config, "status");
         if (
           !(state.jobs || []).some((j) =>
-            ["reviewing", "publishing"].includes(j.state),
+            j.state === "reviewing",
           )
         )
           break;
@@ -681,6 +723,17 @@ export async function setup(
     });
   try {
     await mkdir(root, { recursive: true, mode: 0o700 });
+    const stored: unknown = await json(join(root, "config.json"), null);
+    const config = stored ? validateConfig(stored) : defaults(root);
+    const selectedRole =
+      role || (await ask("Role: both, service, or worker", config.role));
+    if (
+      selectedRole !== "both" &&
+      selectedRole !== "service" &&
+      selectedRole !== "worker"
+    )
+      throw new Error("Choose both, service, or worker");
+    await validateSetupRole(config, selectedRole, root);
     if (isBinary) {
       const executable = await installDownloaded(root, { version: version() });
       log(`Installed Crow at ${executable}`);
@@ -693,16 +746,6 @@ export async function setup(
           'Add ~/.local/bin to your PATH. For this shell, run: export PATH="$HOME/.local/bin:$PATH"',
         );
     }
-    const stored: unknown = await json(join(root, "config.json"), null);
-    const config = stored ? validateConfig(stored) : defaults(root);
-    const selectedRole =
-      role || (await ask("Role: both, service, or worker", config.role));
-    if (
-      selectedRole !== "both" &&
-      selectedRole !== "service" &&
-      selectedRole !== "worker"
-    )
-      throw new Error("Choose both, service, or worker");
     config.role = selectedRole;
     applySetupPort(config, port);
     await save(config, root);
