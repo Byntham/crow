@@ -424,7 +424,10 @@ export async function startService(
           if (
             !current ||
             !["paused", "held"].includes(current.state) ||
-            (current.state === "paused" && !current.session && !current.report)
+            (current.state === "paused" &&
+              current.startedAt &&
+              !current.session &&
+              !current.report)
           )
             return;
         }

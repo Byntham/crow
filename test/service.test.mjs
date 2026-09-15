@@ -454,6 +454,20 @@ test("authorized Crow commands update the existing PR job and ignore malformed c
   }, "command-pause");
   await until(() => f.store.get("jobs", job.id).state === "paused");
   assert.equal(f.store.get("jobs", job.id).trigger, "Pause command");
+  await f.webhook("issue_comment", {
+    action: "created",
+    repository: { full_name: "owner/project" },
+    issue: { number: 1, pull_request: {} },
+    comment: { body: "@crow resume", user: { login: "alice" } },
+  }, "command-queued-resume");
+  await until(() => f.store.get("jobs", job.id).state === "queued");
+  await f.webhook("issue_comment", {
+    action: "created",
+    repository: { full_name: "owner/project" },
+    issue: { number: 1, pull_request: {} },
+    comment: { body: "@crow pause", user: { login: "alice" } },
+  }, "command-pause-again");
+  await until(() => f.store.get("jobs", job.id).state === "paused");
   f.store.updateJob(job.id, { state: "completed" });
   await f.webhook("issue_comment", {
     action: "created",
