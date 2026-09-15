@@ -204,6 +204,7 @@ export interface StatusRecord {
   body: string;
   state: ReviewState;
   trigger?: string;
+  head?: string;
   updatedAt: number;
 }
 export interface RecordMap {

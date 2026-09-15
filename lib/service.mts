@@ -474,6 +474,7 @@ export async function startService(
       prev?.body === text ||
       (prev?.state === j.state &&
         prev?.trigger === j.trigger &&
+        prev?.head === j.head &&
         Date.now() - (prev.updatedAt || 0) < 60000)
     )
       return;
@@ -490,6 +491,7 @@ export async function startService(
       body: text,
       state: j.state,
       trigger: j.trigger,
+      head: j.head,
       updatedAt: Date.now(),
     });
   }
