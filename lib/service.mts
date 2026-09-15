@@ -416,6 +416,18 @@ export async function startService(
             trigger: "Pause command",
           });
       } else {
+        if (e.command === "resume") {
+          const current = store
+            .all("jobs")
+            .filter((j) => j.repo === repo.name && j.number === e.number)
+            .at(-1);
+          if (
+            !current ||
+            !["paused", "held"].includes(current.state) ||
+            (current.state === "paused" && !current.session && !current.report)
+          )
+            return;
+        }
         await enqueue(repo, e.number, {
           manual: true,
           restart: e.command === "restart",
