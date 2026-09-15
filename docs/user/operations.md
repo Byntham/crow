@@ -19,7 +19,7 @@ crow config worker.retry '{"mode":"fixed","count":10,"delayMs":5000}'
 crow repo-config owner/repo --json '{"model":"provider-model-id","effort":"high"}'
 ```
 
-Author policy determines whose PRs Crow can review. Requester policy separately determines who can trigger `@crow review`; it defaults to the operator. Granting someone request permission does not authorize their own PRs or give them configuration access. `--requesters` changes only requester permission, and the target PR must still pass author and draft checks.
+Author policy determines whose PRs Crow can review. Requester policy separately determines who can trigger `@crow review`, `@crow resume`, `@crow restart`, or `@crow pause` in a PR comment; it defaults to the operator. Granting someone request permission does not authorize their own PRs or give them configuration access. `--requesters` changes only requester permission, and the target PR must still pass author and draft checks.
 
 `crow config` hides credentials. Model names and reasoning levels come from `crow models`; Crow does not maintain a model list in its source. If retrieval fails, Crow marks the last successful catalog as cached and reports the error. Saved explicit selections do not change when provider defaults change.
 
@@ -49,6 +49,8 @@ crow release owner/repo
 Initial open PRs remain excluded across restarts unless they receive a qualifying event or you request their inclusion. Startup/recovery catch-up is enabled by default. Batches above the configured threshold of ten are held until you run `crow release`. Change this with `crow config catchUp.threshold 20`; disable automatic catch-up with `crow config catchUp.enabled false`.
 
 A new PR revision supersedes unfinished old work. Completed reports record the actual head and merge base. A later summary links to earlier findings with a brief status so their omission does not imply a fix. Only reassessed findings can be described as fixed or still present.
+
+Crow keeps one editable status comment on each enrolled PR. It records the latest state, commit, and review trigger. New revisions and manual commands update that comment instead of adding another status comment. Commands are accepted only in normal PR conversation comments, not inline review comments. Malformed commands and commands from unauthorized users are ignored.
 
 GitHub gets concise reviewing, retrying, paused, and completed status. Detailed diagnostics stay on the host. A failed review does not publish partial findings. A completed report survives a GitHub publication failure and retries publication without repeating inference.
 

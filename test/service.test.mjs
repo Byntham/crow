@@ -435,6 +435,58 @@ test("ordinary comments and unauthorized explicit requests never queue model wor
   await until(() => f.store.all("jobs").length === 1);
 });
 
+test("authorized Crow commands update the existing PR job and ignore malformed commands", async (t) => {
+  const f = await fixture(t);
+  await f.webhook("issue_comment", {
+    action: "created",
+    repository: { full_name: "owner/project" },
+    issue: { number: 1, pull_request: {} },
+    comment: { body: "@crow review", user: { login: "alice" } },
+  }, "command-review");
+  await until(() => f.store.all("jobs").length === 1);
+  const job = f.store.all("jobs")[0];
+  assert.equal(job.trigger, "Manual request");
+  await f.webhook("issue_comment", {
+    action: "created",
+    repository: { full_name: "owner/project" },
+    issue: { number: 1, pull_request: {} },
+    comment: { body: "@crow pause", user: { login: "alice" } },
+  }, "command-pause");
+  await until(() => f.store.get("jobs", job.id).state === "paused");
+  assert.equal(f.store.get("jobs", job.id).trigger, "Pause command");
+  await f.webhook("issue_comment", {
+    action: "created",
+    repository: { full_name: "owner/project" },
+    issue: { number: 1, pull_request: {} },
+    comment: { body: "@crow resume", user: { login: "alice" } },
+  }, "command-queued-resume");
+  await until(() => f.store.get("jobs", job.id).state === "queued");
+  await f.webhook("issue_comment", {
+    action: "created",
+    repository: { full_name: "owner/project" },
+    issue: { number: 1, pull_request: {} },
+    comment: { body: "@crow pause", user: { login: "alice" } },
+  }, "command-pause-again");
+  await until(() => f.store.get("jobs", job.id).state === "paused");
+  f.store.updateJob(job.id, { state: "completed" });
+  await f.webhook("issue_comment", {
+    action: "created",
+    repository: { full_name: "owner/project" },
+    issue: { number: 1, pull_request: {} },
+    comment: { body: "@crow resume", user: { login: "alice" } },
+  }, "command-completed-resume");
+  await until(() => f.store.events().length === 0);
+  assert.equal(f.store.all("jobs").length, 1);
+  await f.webhook("issue_comment", {
+    action: "created",
+    repository: { full_name: "owner/project" },
+    issue: { number: 1, pull_request: {} },
+    comment: { body: "@crow status now", user: { login: "alice" } },
+  }, "command-malformed");
+  await until(() => f.store.events().length === 0);
+  assert.equal(f.store.events().length, 0);
+});
+
 test("reports cannot become publishable before a validated comparison is recorded", async (t) => {
   const f = await fixture(t);
   const job = await claim(f),

@@ -133,6 +133,7 @@ export interface ReviewJob {
   state: ReviewState;
   manual: boolean;
   restart: boolean;
+  trigger?: string;
   priority: number;
   resumeEpoch: number;
   createdAt: number;
@@ -202,6 +203,8 @@ export interface StatusRecord {
   id: number;
   body: string;
   state: ReviewState;
+  trigger?: string;
+  head?: string;
   updatedAt: number;
 }
 export interface RecordMap {
@@ -220,6 +223,7 @@ export interface CrowEvent {
   action?: string;
   occurredAt?: number;
   request?: boolean;
+  command?: "review" | "resume" | "restart" | "pause";
   actor?: string;
   ref?: string;
 }

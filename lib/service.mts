@@ -180,11 +180,17 @@ function extractEvent(type: unknown, payload: unknown): CrowEvent {
   ) {
     const comment = optionalObject(p.comment),
       user = optionalObject(comment.user);
+    const command = optionalString(comment.body)?.trim();
     return {
       type,
       repo,
       number: optionalNumber(issue.number),
-      request: optionalString(comment.body)?.trim() === "@crow review",
+      request: ["review", "resume", "restart", "pause"].some(
+        (x) => command === `@crow ${x}`,
+      ),
+      ...(command && /^@crow (review|resume|restart|pause)$/.test(command)
+        ? { command: command.slice(6) as "review" | "resume" | "restart" | "pause" }
+        : {}),
       actor: optionalString(user.login),
       ...(comment.created_at
         ? { occurredAt: Date.parse(string(comment.created_at)) }
@@ -261,6 +267,7 @@ export async function startService(
       held = false,
       event = false,
       requester = "",
+      trigger = "",
     } = {},
   ) {
     const { pr } = await refreshPr(repo, n);
@@ -292,7 +299,7 @@ export async function startService(
       store.enroll(repo);
     } else if (repo.excluded?.includes(n))
       return { skipped: "Initial backlog excluded" };
-    return store.queue(repo, pr, { manual, restart, held });
+    return store.queue(repo, pr, { manual, restart, held, trigger });
   }
   async function catchUp(
     name: string,
@@ -376,7 +383,15 @@ export async function startService(
       ].includes(e.action || "") &&
       e.number !== undefined
     )
-      await enqueue(repo, e.number, { event: true });
+      await enqueue(repo, e.number, {
+        event: true,
+        trigger:
+          e.action === "synchronize"
+            ? "Pull request updated"
+            : e.action === "opened"
+              ? "Pull request opened"
+              : `Pull request ${e.action || "event"}`,
+      });
     if (
       e.type === "issue_comment" &&
       e.request &&
@@ -385,7 +400,49 @@ export async function startService(
         (x) => x.toLowerCase() === e.actor?.toLowerCase(),
       )
     )
-      await enqueue(repo, e.number, { manual: true, requester: e.actor });
+      if (e.command === "pause") {
+        for (const j of store
+          .all("jobs")
+          .filter(
+            (j) =>
+              j.repo === repo.name &&
+              j.number === e.number &&
+              activeStates.includes(j.state),
+          ))
+          store.updateJob(j.id, {
+            state: "paused",
+            autoRecover: false,
+            reason: "Paused by the operator",
+            trigger: "Pause command",
+          });
+      } else {
+        if (e.command === "resume") {
+          const current = store
+            .all("jobs")
+            .filter((j) => j.repo === repo.name && j.number === e.number)
+            .at(-1);
+          if (
+            !current ||
+            !["paused", "held"].includes(current.state) ||
+            (current.state === "paused" &&
+              current.startedAt &&
+              !current.session &&
+              !current.report)
+          )
+            return;
+        }
+        await enqueue(repo, e.number, {
+          manual: true,
+          restart: e.command === "restart",
+          requester: e.actor,
+          trigger:
+            e.command === "resume"
+              ? "Resume command"
+              : e.command === "restart"
+                ? "Restart command"
+                : "Manual request",
+        });
+      }
     if (e.type === "push" && e.ref?.startsWith("refs/heads/")) {
       // Event-driven target changes: inspect comparisons again without importing excluded backlog.
       const token = await github.token(repo);
@@ -409,12 +466,16 @@ export async function startService(
       .filter((x) => x.key === j.key)
       .at(-1);
     if (current?.id !== j.id) return;
-    const text = `<!-- crow-status:v1 -->\nCrow: **${j.state}** · [${j.head.slice(0, 8)}](https://github.com/${j.repo}/commit/${j.head})\n\nUpdated ${new Date(j.updatedAt).toISOString()}.${j.reason ? `\n\n${j.reason}` : ""}${j.reviewUrl ? `\n\n[Read review](${j.reviewUrl})` : ""}${j.state === "paused" ? "\n\nUse `crow resume` to continue saved work, or `crow restart` to start again." : ""}`;
+    const icon = j.state === "completed" ? "✅" : j.state === "paused" ? "⏸️" : j.state === "cancelled" ? "❌" : "🔄";
+    const text = `<!-- crow-status:v1 -->\n| Status | Commit | Review trigger |\n| --- | --- | --- |\n| ${icon} ${j.state[0].toUpperCase() + j.state.slice(1)} | [${j.head.slice(0, 8)}](https://github.com/${j.repo}/commit/${j.head}) | ${j.trigger || (j.manual ? "Manual request" : "Pull request event")} |\n\nUpdated ${new Date(j.updatedAt).toISOString()}.${j.reason ? `\n\n${j.reason}` : ""}${j.reviewUrl ? `\n\n[Read review](${j.reviewUrl})` : ""}${j.state === "paused" ? "\n\nComment `@crow resume` to continue saved work, or `@crow restart` to start again." : ""}`;
     const key = `${j.repo}#${j.number}`,
       prev = store.get("status", key);
     if (
       prev?.body === text ||
-      (prev?.state === j.state && Date.now() - (prev.updatedAt || 0) < 60000)
+      (prev?.state === j.state &&
+        prev?.trigger === j.trigger &&
+        prev?.head === j.head &&
+        Date.now() - (prev.updatedAt || 0) < 60000)
     )
       return;
     const c = await github.status(
@@ -429,6 +490,8 @@ export async function startService(
       id: c.id,
       body: text,
       state: j.state,
+      trigger: j.trigger,
+      head: j.head,
       updatedAt: Date.now(),
     });
   }
@@ -499,6 +562,14 @@ export async function startService(
       });
     });
     const current = store.get("jobs", j.id);
+    if (current?.state === "paused") {
+      store.updateJob(j.id, {
+        state: "paused",
+        reviewUrl,
+        reason: "Paused by the operator",
+      });
+      return;
+    }
     store.updateJob(j.id, {
       state: current?.state === "superseded" ? "superseded" : "completed",
       reviewUrl,
