@@ -203,6 +203,7 @@ export interface StatusRecord {
   id: number;
   body: string;
   state: ReviewState;
+  trigger?: string;
   updatedAt: number;
 }
 export interface RecordMap {

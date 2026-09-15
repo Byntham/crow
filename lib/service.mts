@@ -469,7 +469,9 @@ export async function startService(
       prev = store.get("status", key);
     if (
       prev?.body === text ||
-      (prev?.state === j.state && Date.now() - (prev.updatedAt || 0) < 60000)
+      (prev?.state === j.state &&
+        prev?.trigger === j.trigger &&
+        Date.now() - (prev.updatedAt || 0) < 60000)
     )
       return;
     const c = await github.status(
@@ -484,6 +486,7 @@ export async function startService(
       id: c.id,
       body: text,
       state: j.state,
+      trigger: j.trigger,
       updatedAt: Date.now(),
     });
   }
