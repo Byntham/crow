@@ -17,6 +17,7 @@ export interface ReviewSettings {
 }
 export interface CodexProxy {
   baseUrl: string;
+  configFile: string;
 }
 export interface RuntimeReviewSettings extends ReviewSettings {
   codex: string;

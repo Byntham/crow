@@ -360,7 +360,13 @@ export class Delegation {
       parentId: this.context.job.id,
       taskId: task.id,
       session: task.session || null,
-      settings: { ...task.settings, detached: false },
+      settings: {
+        ...task.settings,
+        // Runtime routing belongs to the worker, including tasks saved before
+        // a proxy was configured. Never fall back to a stale child route.
+        codexProxy: this.context.job.settings.codexProxy,
+        detached: false,
+      },
       delegated: true,
     };
     entry.promise = (async () => {

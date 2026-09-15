@@ -82,18 +82,30 @@ function tomlString(text: string, key: string): string | undefined {
   const match = text.match(new RegExp(`^\\s*${key}\\s*=\\s*["']([^"']+)["']`, "m"));
   return match?.[1];
 }
-async function discoverUserProxy(): Promise<{ baseUrl: string; wireApi?: string; token?: string } | null> {
-  if (process.env.CROW_DISABLE_USER_PROXY === "1") return null;
-  const file = join(homedir(), ".codex", "config.toml");
-  const text = await readFile(file, "utf8").catch(() => "");
+async function discoverUserProxy(inheritedFile?: string): Promise<{ baseUrl: string; configFile: string; token?: string } | null> {
+  if (!inheritedFile && process.env.CROW_DISABLE_USER_PROXY === "1") return null;
+  const file = inheritedFile || join(process.env.CODEX_HOME || join(homedir(), ".codex"), "config.toml");
+  const text = await readFile(file, "utf8").catch((error) => {
+    if (!inheritedFile && error.code === "ENOENT") return "";
+    throw new ProviderError("Cannot read the Codex routing configuration.", "config");
+  });
   const provider = tomlString(text, "model_provider");
-  if (!provider || provider === "openai") return null;
+  if (!provider || provider === "openai") {
+    if (inheritedFile) throw new ProviderError("The inherited Codex proxy is no longer configured.", "config");
+    return null;
+  }
   const marker = `[model_providers.${provider}]`;
   const start = text.indexOf(marker);
   const section = start < 0 ? "" : text.slice(start + marker.length).split(/\n\s*\[/, 1)[0];
   const baseUrl = tomlString(section, "base_url");
-  if (!baseUrl) return null;
-  return { baseUrl, wireApi: tomlString(section, "wire_api"), token: tomlString(section, "experimental_bearer_token") };
+  if (!baseUrl) throw new ProviderError("The selected Codex provider has no base_url.", "config");
+  const wireApi = tomlString(section, "wire_api");
+  if (wireApi && wireApi !== "responses")
+    throw new ProviderError("Crow requires a Responses-compatible Codex provider.", "config");
+  const envKey = tomlString(section, "env_key");
+  const token = tomlString(section, "experimental_bearer_token") || (envKey ? process.env[envKey] : undefined);
+  if (!token) throw new ProviderError("The selected Codex proxy has no available bearer token.", "auth");
+  return { baseUrl, configFile: file, token };
 }
 type RpcRequest = (
   method: string,
@@ -314,12 +326,9 @@ export async function providerEnvironment(
   worker: Pick<ProviderSettings, "codexHome" | "codexProxy">,
   root: string,
 ) {
-  if (!worker.codexProxy) {
-    const detected = await discoverUserProxy();
-    if (detected) {
-      worker.codexProxy = { baseUrl: detected.baseUrl };
-      (worker as ProviderSettings & { _detectedProxyToken?: string })._detectedProxyToken = detected.token;
-    }
+  const detected = await discoverUserProxy(worker.codexProxy?.configFile);
+  if (detected) {
+    worker.codexProxy = { baseUrl: detected.baseUrl, configFile: detected.configFile };
   }
   const codexHome = resolve(worker.codexHome || join(root, "codex"));
   const personal = resolve(homedir(), ".codex");
@@ -357,8 +366,7 @@ export async function providerEnvironment(
     XDG_DATA_HOME: join(hostHome, ".local/share"),
     XDG_CACHE_HOME: join(hostHome, ".cache"),
   });
-  const detectedToken = (worker as ProviderSettings & { _detectedProxyToken?: string })._detectedProxyToken;
-  if (detectedToken) env.CROW_CODEX_PROXY_TOKEN = detectedToken;
+  if (detected?.token) env.CROW_CODEX_PROXY_TOKEN = detected.token;
   return { ...env, HOME: hostHome, CODEX_HOME: codexHome };
 }
 const transportConfig = (worker: ProviderSettings): ConfigValues => worker.codexProxy ? {
@@ -553,13 +561,13 @@ export async function authStatus(
   }
 }
 export async function login(worker: ProviderSettings, root: string) {
+  const env = await providerEnvironment(worker, root);
   if (worker.codexProxy) {
     const status = await authStatus(worker, root);
     if (!status.authenticated)
       throw new ProviderError(status.warning || "Proxy configuration failed", status.errorKind || "auth");
     return status;
   }
-  const env = await providerEnvironment(worker, root);
   await processRun(
     worker.codex || "codex",
     [...configArgs(baseConfig(worker)), "login", "--device-auth"],
@@ -578,6 +586,7 @@ export async function discover(
   root: string,
   { signal }: SignalOptions = {},
 ): Promise<ProviderCatalog> {
+  await providerEnvironment(worker, root);
   const cache = join(root, worker.codexProxy
     ? `model-catalog-proxy-${hash(worker.codexProxy)}.json`
     : "model-catalog.json");

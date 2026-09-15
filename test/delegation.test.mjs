@@ -778,3 +778,21 @@ test("manual resume retains completed report model metadata", async (t) => {
   assert.deepEqual(completed.report, report);
   assert.equal(completed.settingsHistory, undefined);
 });
+
+test("new and resumed delegated tasks use the parent's current proxy route", async (t) => {
+  const f = await fixture(t);
+  const route = { baseUrl: "http://127.0.0.1:8317/v1", configFile: join(f.root, "config.toml") };
+  f.context.job.settings.codexProxy = route;
+  await f.delegation.call("start_review_task", { task: "Inspect routing" });
+  await eventually(() => f.controlled.calls.length === 1);
+  assert.deepEqual(f.controlled.calls[0].job.settings.codexProxy, route);
+  await f.delegation.close();
+  const saved = [...f.delegation.tasks.values()][0];
+  assert.equal(saved.settings.codexProxy, undefined);
+  f.context.job.resumeEpoch = 1;
+  const reloaded = await f.reload();
+  await reloaded.call("resume_review_task", { id: saved.id });
+  await eventually(() => f.controlled.calls.length === 2);
+  assert.deepEqual(f.controlled.calls[1].job.settings.codexProxy, route);
+  f.controlled.calls[1].resolve(report);
+});
