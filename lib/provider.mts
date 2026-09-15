@@ -11,7 +11,7 @@ import {
 import { homedir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { inspectionInvocation } from "./runtime.mjs";
-import { atomic, json, cleanEnv, processRun } from "./util.mjs";
+import { atomic, json, cleanEnv, processRun, hash } from "./util.mjs";
 import { schema, validateReport } from "./report.mjs";
 
 import type {
@@ -78,6 +78,35 @@ type ConfigValue =
   | ConfigValue[]
   | { [key: string]: ConfigValue };
 type ConfigValues = Record<string, ConfigValue>;
+function tomlString(text: string, key: string): string | undefined {
+  const match = text.match(new RegExp(`^\\s*${key}\\s*=\\s*["']([^"']+)["']`, "m"));
+  return match?.[1];
+}
+async function discoverUserProxy(inheritedFile?: string): Promise<{ baseUrl: string; configFile: string; token?: string } | null> {
+  if (!inheritedFile && process.env.CROW_DISABLE_USER_PROXY === "1") return null;
+  const file = inheritedFile || join(process.env.CODEX_HOME || join(homedir(), ".codex"), "config.toml");
+  const text = await readFile(file, "utf8").catch((error) => {
+    if (!inheritedFile && error.code === "ENOENT") return "";
+    throw new ProviderError("Cannot read the Codex routing configuration.", "config");
+  });
+  const provider = tomlString(text, "model_provider");
+  if (!provider || provider === "openai") {
+    if (inheritedFile) throw new ProviderError("The inherited Codex proxy is no longer configured.", "config");
+    return null;
+  }
+  const marker = `[model_providers.${provider}]`;
+  const start = text.indexOf(marker);
+  const section = start < 0 ? "" : text.slice(start + marker.length).split(/\n\s*\[/, 1)[0];
+  const baseUrl = tomlString(section, "base_url");
+  if (!baseUrl) throw new ProviderError("The selected Codex provider has no base_url.", "config");
+  const wireApi = tomlString(section, "wire_api");
+  if (wireApi && wireApi !== "responses")
+    throw new ProviderError("Crow requires a Responses-compatible Codex provider.", "config");
+  const envKey = tomlString(section, "env_key");
+  const token = tomlString(section, "experimental_bearer_token") || (envKey ? process.env[envKey] : undefined);
+  if (!token) throw new ProviderError("The selected Codex proxy has no available bearer token.", "auth");
+  return { baseUrl, configFile: file, token };
+}
 type RpcRequest = (
   method: string,
   params?: Record<string, unknown>,
@@ -294,9 +323,13 @@ export function classifyError(error: unknown): ProviderError {
 }
 
 export async function providerEnvironment(
-  worker: Pick<ProviderSettings, "codexHome">,
+  worker: Pick<ProviderSettings, "codexHome" | "codexProxy">,
   root: string,
 ) {
+  const detected = await discoverUserProxy(worker.codexProxy?.configFile);
+  if (detected) {
+    worker.codexProxy = { baseUrl: detected.baseUrl, configFile: detected.configFile };
+  }
   const codexHome = resolve(worker.codexHome || join(root, "codex"));
   const personal = resolve(homedir(), ".codex");
   const actual = await realpath(codexHome).catch(() => codexHome);
@@ -333,11 +366,23 @@ export async function providerEnvironment(
     XDG_DATA_HOME: join(hostHome, ".local/share"),
     XDG_CACHE_HOME: join(hostHome, ".cache"),
   });
+  if (detected?.token) env.CROW_CODEX_PROXY_TOKEN = detected.token;
   return { ...env, HOME: hostHome, CODEX_HOME: codexHome };
 }
-const baseConfig = () => ({
+const transportConfig = (worker: ProviderSettings): ConfigValues => worker.codexProxy ? {
+  model_provider: "crow_proxy",
+  "model_providers.crow_proxy.name": "Crow account proxy",
+  "model_providers.crow_proxy.base_url": worker.codexProxy.baseUrl,
+  "model_providers.crow_proxy.wire_api": "responses",
+  "model_providers.crow_proxy.requires_openai_auth": false,
+  "model_providers.crow_proxy.supports_websockets": false,
+  "model_providers.crow_proxy.env_key": "CROW_CODEX_PROXY_TOKEN",
+} : {
   model_provider: "openai",
   forced_login_method: "chatgpt",
+};
+const baseConfig = (worker: ProviderSettings) => ({
+  ...transportConfig(worker),
   cli_auth_credentials_store: "file",
   approval_policy: "never",
   sandbox_mode: "read-only",
@@ -365,7 +410,7 @@ async function rpc<T>(
     const child = spawn(
       worker.codex || "codex",
       [
-        ...configArgs({ ...baseConfig(), ...extra.config }),
+        ...configArgs({ ...baseConfig(worker), ...extra.config }),
         "app-server",
         "--strict-config",
       ],
@@ -484,6 +529,19 @@ export async function authStatus(
   { signal }: SignalOptions = {},
 ): Promise<AuthStatus> {
   try {
+    await providerEnvironment(worker, root);
+    if (worker.codexProxy) {
+      if (signal?.aborted) throw signal.reason;
+      const probe = await rpc(
+        worker,
+        root,
+        (r) => r("model/list", { limit: 1, includeHidden: false }),
+        { signal },
+      );
+      if (!Array.isArray(probe.data))
+        throw new ProviderError("The configured Codex proxy did not return a model catalog.", "auth");
+      return { authenticated: true, account: { type: "proxy" }, warning: null };
+    }
     const response = await rpc(
       worker,
       root,
@@ -511,9 +569,15 @@ export async function authStatus(
 }
 export async function login(worker: ProviderSettings, root: string) {
   const env = await providerEnvironment(worker, root);
+  if (worker.codexProxy) {
+    const status = await authStatus(worker, root);
+    if (!status.authenticated)
+      throw new ProviderError(status.warning || "Proxy configuration failed", status.errorKind || "auth");
+    return status;
+  }
   await processRun(
     worker.codex || "codex",
-    [...configArgs(baseConfig()), "login", "--device-auth"],
+    [...configArgs(baseConfig(worker)), "login", "--device-auth"],
     { cwd: env.HOME, env, inherit: true },
   );
   const status = await authStatus(worker, root);
@@ -529,17 +593,20 @@ export async function discover(
   root: string,
   { signal }: SignalOptions = {},
 ): Promise<ProviderCatalog> {
-  const cache = join(root, "model-catalog.json");
+  await providerEnvironment(worker, root);
+  const cache = join(root, worker.codexProxy
+    ? `model-catalog-proxy-${hash(worker.codexProxy)}.json`
+    : "model-catalog.json");
   try {
     const result = await rpc(
       worker,
       root,
       async (request) => {
-        const response = await request("account/read", {
+        const response = worker.codexProxy ? { account: { type: "proxy" } } : await request("account/read", {
           refreshToken: false,
         });
         const account = providerAccount(response.account);
-        if (account?.type !== "chatgpt")
+        if (!worker.codexProxy && account?.type !== "chatgpt")
           throw new ProviderError(
             "A ChatGPT subscription login is required for model discovery. Run crow login.",
             "auth",
@@ -573,12 +640,12 @@ export async function discover(
       { signal },
     );
     await atomic(cache, { ...result, retrievedAt: new Date().toISOString() });
-    return { ...result, cached: false, warning: null };
+    return { ...result, account: result.account || { type: worker.codexProxy ? "proxy" : "chatgpt" }, cached: false, warning: null };
   } catch (e) {
     if (signal?.aborted) throw signal.reason || e;
     // An explicit non-subscription account must not be hidden by an old catalog.
     const failure = classifyError(e);
-    if (failure.kind === "auth") throw e;
+    if (["auth", "config"].includes(failure.kind)) throw e;
     const last = record(await json(cache, null));
     const models = Array.isArray(last.models)
       ? last.models
@@ -592,7 +659,7 @@ export async function discover(
       );
     return {
       models,
-      account: providerAccount(last.account) || { type: "chatgpt" },
+      account: providerAccount(last.account) || { type: worker.codexProxy ? "proxy" : "chatgpt" },
       retrievedAt: string(last.retrievedAt),
       cached: true,
       warning: `Current model list could not be retrieved. Showing cached list from ${last.retrievedAt}: ${messageOf(e)}`,
@@ -736,6 +803,7 @@ export async function prepareReview({
   const safeSettings = {
     codex: w.codex,
     codexHome: w.codexHome,
+    codexProxy: w.codexProxy,
     model: w.model,
     effort: w.effort,
     subagents: sub,
@@ -757,7 +825,7 @@ export async function prepareReview({
     guidance,
   });
   const config: ConfigValues = {
-    ...baseConfig(),
+    ...baseConfig(w),
     model: w.model,
     model_reasoning_effort: w.effort,
     developer_instructions: boundary,
@@ -826,12 +894,19 @@ async function verifyPolicy(
     !c ||
     c.sandbox_mode !== "read-only" ||
     c.approval_policy !== "never" ||
-    c.forced_login_method !== "chatgpt"
+    (!worker.codexProxy && c.forced_login_method !== "chatgpt")
   )
     throw new ProviderError(
       "Codex could not apply Crow subscription and inspection permissions. Check host-managed Codex requirements.",
       "config",
     );
+  if (worker.codexProxy) {
+    for (const [key, expected] of Object.entries(transportConfig(worker))) {
+      const actual = key.split(".").reduce<unknown>((value, part) => record(value)[part], c);
+      if (actual !== expected)
+        throw new ProviderError("Codex did not apply the configured Crow proxy transport.", "config");
+    }
+  }
   for (const name of disabled)
     if (features[name] !== false)
       throw new ProviderError(

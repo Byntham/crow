@@ -295,3 +295,24 @@ test("metadata failure keeps transient classification instead of demanding login
     (e) => e.code === "ENOENT",
   );
 });
+
+test("delegated settings reload proxy credentials from the original config under an isolated HOME", async (t) => {
+  const f = await fixture(t, { unauth: true });
+  const configFile = join(f.root, "personal-config.toml");
+  await writeFile(configFile, 'model_provider = "cliproxyapi"\n[model_providers.cliproxyapi]\nbase_url = "http://127.0.0.1:8317/v1"\nwire_api = "responses"\nexperimental_bearer_token = "fixture-proxy-secret"\n');
+  f.worker.codexProxy = { baseUrl: "http://127.0.0.1:8317/v1", configFile };
+  const layout = await prepareReview(f);
+  const saved = JSON.parse(await readFile(join(layout.dir, "delegation-context.json"), "utf8"));
+  assert.ok(!JSON.stringify(saved).includes("fixture-proxy-secret"));
+  const homeBefore = process.env.HOME;
+  process.env.HOME = join(f.root, "isolated-child-home");
+  t.after(() => { if (homeBefore === undefined) delete process.env.HOME; else process.env.HOME = homeBefore; });
+  f.job.settings = saved.job.settings;
+  await runReview(f);
+  const invocation = JSON.parse(await readFile(join(f.root, "invocation.json"), "utf8"));
+  assert.equal(invocation.env.CROW_CODEX_PROXY_TOKEN, "fixture-proxy-secret");
+  assert.ok(invocation.args.includes('model_provider="crow_proxy"'));
+  assert.ok(!invocation.args.includes('forced_login_method="chatgpt"'));
+  await rm(configFile);
+  await assert.rejects(providerEnvironment(f.job.settings, f.root), /routing configuration/);
+});
