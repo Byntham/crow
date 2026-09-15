@@ -542,6 +542,14 @@ export async function startService(
       });
     });
     const current = store.get("jobs", j.id);
+    if (current?.state === "paused") {
+      store.updateJob(j.id, {
+        state: "paused",
+        reviewUrl,
+        reason: "Paused by the operator",
+      });
+      return;
+    }
     store.updateJob(j.id, {
       state: current?.state === "superseded" ? "superseded" : "completed",
       reviewUrl,
