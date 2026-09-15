@@ -381,7 +381,6 @@ const transportConfig = (worker: ProviderSettings): ConfigValues => worker.codex
   model_provider: "openai",
   forced_login_method: "chatgpt",
 };
-const proxyWarning = "Account authentication and routing are managed by the configured proxy. Codex's model catalog does not verify proxy model availability or credentials.";
 const baseConfig = (worker: ProviderSettings) => ({
   ...transportConfig(worker),
   cli_auth_credentials_store: "file",
@@ -533,7 +532,15 @@ export async function authStatus(
     await providerEnvironment(worker, root);
     if (worker.codexProxy) {
       if (signal?.aborted) throw signal.reason;
-      return { authenticated: true, account: { type: "proxy" }, warning: proxyWarning };
+      const probe = await rpc(
+        worker,
+        root,
+        (r) => r("model/list", { limit: 1, includeHidden: false }),
+        { signal },
+      );
+      if (!Array.isArray(probe.data))
+        throw new ProviderError("The configured Codex proxy did not return a model catalog.", "auth");
+      return { authenticated: true, account: { type: "proxy" }, warning: null };
     }
     const response = await rpc(
       worker,
