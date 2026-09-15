@@ -122,7 +122,8 @@ export class Store {
       manual = false,
       restart = false,
       held = false,
-    }: { manual?: boolean; restart?: boolean; held?: boolean } = {},
+      trigger,
+    }: { manual?: boolean; restart?: boolean; held?: boolean; trigger?: string } = {},
   ) {
     return this.tx(() => {
       const key = `${repo.name}#${pr.number}`;
@@ -146,6 +147,7 @@ export class Store {
               : "Restart required: no saved provider session";
           active.retries = 0;
           active.nextAt = 0;
+          if (trigger) active.trigger = trigger;
           this.put("jobs", active.id, active);
         }
         return active;
@@ -166,6 +168,7 @@ export class Store {
         state: held ? "held" : "queued",
         manual,
         restart,
+        trigger,
         priority: held ? 0 : manual ? 2 : 1,
         resumeEpoch: 0,
         createdAt: Date.now(),

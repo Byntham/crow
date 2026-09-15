@@ -177,6 +177,7 @@ function parseJob(value: unknown, config: CrowConfig): ReviewJob {
     "taskId",
   ])
     if (job[key] !== undefined) responseString(job[key]);
+  if (job.trigger !== undefined) responseString(job.trigger);
   for (const key of ["startedAt", "publishAt"])
     if (job[key] !== undefined) responseNumber(job[key]);
   if (job.reason !== undefined && job.reason !== null)
