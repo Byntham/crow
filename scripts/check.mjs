@@ -26,6 +26,6 @@ const tests = spawnSync(
       .filter((file) => file.endsWith(".test.mjs"))
       .map((file) => join(projectRoot, "test", file)),
   ],
-  { cwd: projectRoot, stdio: "inherit" },
+  { cwd: projectRoot, stdio: "inherit", env: { ...process.env, CROW_DISABLE_USER_PROXY: "1" } },
 );
 process.exit(tests.status ?? 1);

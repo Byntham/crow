@@ -15,9 +15,13 @@ export interface ReviewSettings {
   retry: RetrySettings;
   timeoutMs: number;
 }
+export interface CodexProxy {
+  baseUrl: string;
+}
 export interface RuntimeReviewSettings extends ReviewSettings {
   codex: string;
   codexHome: string;
+  codexProxy?: CodexProxy | null;
   detached?: boolean;
 }
 export interface WorkerConfig extends RuntimeReviewSettings {
