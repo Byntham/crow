@@ -12,7 +12,7 @@ The hosted installer is prepared for `birdapp.dev` but has not been deployed yet
 curl -fsSL https://birdapp.dev/install.sh | sh
 ```
 
-The installer downloads and verifies the Linux binary, installs a permanent command, and offers to start setup. Downloads are public; access to Crow's private source repository is not required. Node 24 LTS is included, so users do not need Node, pnpm, or a checkout. See [installation](docs/user/install.md) for install-only mode and the source installation alternative.
+The installer downloads and verifies the Linux binary, installs a permanent command, and offers to start setup. Downloads are public; access to Crow's private source repository is not required. The executable is compiled from Rust, so users do not need a language runtime or a checkout. See [installation](docs/user/install.md) for install-only mode and the source installation alternative.
 
 Setup installs the executable and defaults to running both the connection service and worker on this machine. It guides Tailscale Funnel, creation of your own GitHub App, repository selection, a separate Codex subscription login, and persistent systemd startup. Missing supported Linux dependencies can be installed with your confirmation. Browser steps print URLs you can open on a separate desktop. No browser is required on the host.
 
@@ -40,18 +40,20 @@ Optional review instructions belong in `.crow/review.md`. Crow also reads applic
 
 ## Development
 
-Use Node 24 LTS. The `packageManager` field in `package.json` pins pnpm to 12.3.4. See the [pnpm installation guide](https://pnpm.io/installation) if pnpm is missing. pnpm manages the development workflow; Crow runs on Node. End users do not need pnpm.
+Install Rust with rustup and the Linux C build tools needed to compile bundled SQLite. `rust-toolchain.toml` selects the tested compiler and tools. Git is required for repository inspection.
 
 ```sh
-pnpm install --frozen-lockfile
-pnpm typecheck    # Strict TypeScript checking
-pnpm build        # Check types and emit JavaScript into dist/
-pnpm build:binary # Check types and package this Linux architecture
-pnpm check        # Check types, rebuild, and run the test suite
-pnpm test:runtime # Actual installed Codex, with local synthetic responses
+cargo build --locked
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo build --locked --release --bin crow
+bash scripts/build-release.sh
 ```
 
-Application source lives in `lib/*.mts` and `bin/*.mts`. TypeScript 7 checks it in strict NodeNext mode. Node emits the runnable `.mjs` modules into `dist/`; `pnpm start` builds and runs `dist/bin/crow.mjs`. Release builds bundle the application into a Node single executable. Build scripts, behavioral tests, and runtime probes remain JavaScript; compile-only contract tests use TypeScript. `pnpm test` rebuilds and runs the suite without the separate type check; use `pnpm check` before submitting changes. See the [TypeScript migration design](docs/design/typescript-migration.md) and [binary release design](docs/design/binary-release.md).
+Application code lives in `src/`. One executable runs the CLI, connection service, worker, and private inspection MCP subprocess. SQLite is bundled; HTTPS uses rustls. The official Codex CLI remains a separate executable. `cargo run --bin crow -- help` lists commands. Source and downloaded installations use the same native executable lifecycle.
+
+See the [Rust migration decisions](docs/design/rust-migration.md), [binary release design](docs/design/binary-release.md), and [runtime validation](docs/design/runtime-validation.md).
 
 Tests use local fixtures and simulated provider/GitHub responses. They do not publish comments or run provider inference. Live subscription refresh, provider behavior across interruptions, and networking account authorization still require validation on an enrolled installation. Capability checks do not prove those live behaviors. See [runtime validation](docs/design/runtime-validation.md) for what the actual CLI probes establish.
 

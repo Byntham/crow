@@ -4,7 +4,7 @@ This document describes setup and deployment decisions. See the [quickstart](../
 
 ## One setup flow
 
-Distribute a Linux binary with the official Node runtime embedded. The operator runs the hosted installer from `birdapp.dev`. It downloads and verifies the matching archive from `downloads.birdapp.dev`, then invokes `crow install` to create a permanent CLI command and offer setup. Direct binary installation remains available. No source checkout, Node installation, or package manager is required for this path. Source installation remains available for developers. See [binary releases](binary-release.md) for packaging and verification.
+Distribute a native Linux executable compiled from Rust. The operator runs the hosted installer from `birdapp.dev`. It downloads and verifies the matching archive from `downloads.birdapp.dev`, then invokes `crow install` to create a permanent CLI command and offer setup. Direct binary installation remains available. No source checkout, Node installation, or package manager is required for this path. Source installation remains available for developers. See [binary releases](binary-release.md) for packaging and verification.
 
 Use one `crow setup` command with three roles:
 

@@ -1,35 +1,25 @@
 # Native binary releases
 
-Crow releases contain one executable with the official Node 24 LTS runtime embedded through Node's single executable application support. Users do not need a source checkout, Node, pnpm, or a TypeScript compiler. Git, Codex, and the selected network ingress remain separate programs because Crow invokes them as independent tools.
-
-The initial targets are Linux x64 and Linux arm64. These builds use glibc and the system C++ runtime, matching the official Node Linux distribution requirements. They are suitable for supported Ubuntu hosts such as gibo. Alpine and other musl distributions are not supported by these artifacts. macOS and Windows binaries are outside this release configuration.
+Crow releases contain a Rust executable with bundled SQLite and rustls for HTTPS. Git, Codex, and the selected ingress client remain separate programs. Linux x64 and arm64 builds use glibc. Alpine, macOS, and Windows are outside the release configuration.
 
 ## Build and release
 
-On the target architecture, using the supported official Node 24 runtime:
+On the target architecture with stable Rust and a C compiler:
 
 ```sh
-pnpm install --frozen-lockfile
-pnpm check
-pnpm build:binary
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+bash scripts/build-release.sh
 ```
 
-The build bundles the TypeScript entry points with esbuild, creates a Node SEA preparation blob, and injects it into a copy of the same Node executable with postject. The runtime's `node:sqlite` implementation stays built in. Version metadata is a SEA asset. The executable dispatches its inspection MCP subprocess through a private command, so neither entry point requires extracted JavaScript files.
+Cargo embeds the version from `Cargo.toml`. The private `_inspection-mcp` command runs from the same binary, without extracting code or locating a language runtime. Release builds use thin link-time optimization and strip debug symbols.
 
-`dist-release` receives `crow-vVERSION-linux-x64.tar.gz` or `crow-vVERSION-linux-arm64.tar.gz`, plus `SHA256SUMS`. Each archive contains `crow` and `THIRD_PARTY_NOTICES`, including the embedded Node runtime's complete license notices. Use `node scripts/build-binary.mjs --out DIRECTORY` to choose another output directory. Build each architecture separately, then combine the checksum files when assembling a release.
+`dist-release` receives `crow-vVERSION-linux-x64.tar.gz` or `crow-vVERSION-linux-arm64.tar.gz`, plus `SHA256SUMS` and build metadata. Archives contain `crow` and `THIRD_PARTY_NOTICES`. Each architecture builds and tests natively in GitHub Actions. Version tags must match `Cargo.toml`.
 
-The GitHub workflow builds and tests both architectures natively. A version tag must match `package.json`. Builds produce private workflow artifacts only. Publication uses a separate manual workflow that verifies the selected successful build, uploads immutable R2 objects, checks the public downloads, and updates `latest.txt` last. Website deployment is also manual. Neither code pushes nor version tags publish downloads. See [hosted distribution](../maintainer/hosted-distribution.md) for account setup and the publication procedure.
+Builds produce private workflow artifacts. A separate manual publication workflow verifies the selected build's source and version, uploads immutable objects, verifies public downloads, and updates `latest.txt` last. Website deployment is also manual. See [hosted distribution](../maintainer/hosted-distribution.md).
 
-## Runtime safeguards and verification
+## Runtime verification
 
-The SEA configuration disables runtime flag extensions, so `NODE_OPTIONS` cannot inject a module or change runtime flags when Crow starts. Snapshots and V8 code caches are disabled. The same Node executable generates and receives the preparation blob.
+Native integration tests start the executable using temporary configuration and real SQLite, check CLI and MCP behavior, and stop it through Linux signals. They do not require GitHub credentials or provider inference. Release packaging validates ELF architecture, archive entries, checksums, and the executable's reported version.
 
-The packaged smoke tests run with an empty executable search path and a deliberately invalid `NODE_OPTIONS`. They verify help and version output, the embedded inspection MCP entry point, and a real SQLite service startup and shutdown. The service test uses temporary local configuration and no GitHub App or Codex account.
-
-```sh
-mkdir -p /tmp/crow-binary-check
-tar -xzf dist-release/crow-v*-linux-x64.tar.gz -C /tmp/crow-binary-check
-CROW_TEST_BINARY=/tmp/crow-binary-check/crow node --test test/binary.test.mjs
-```
-
-The uncompressed executable includes the Node runtime and is approximately 127 MB before application code. The compressed release download is smaller. The build and smoke tests verify local behavior; real GitHub onboarding and subscription authentication still require account-level testing.
+Live GitHub onboarding, subscription authentication, and external ingress authorization still require an enrolled installation. Local fixtures cannot establish those account-dependent behaviors.

@@ -44,7 +44,7 @@ crow catch-up owner/repo --include-backlog
 crow release owner/repo
 ```
 
-`resume` continues saved work when the comparison is still current. If no usable session exists, Crow reports that a restart is required. `restart` explicitly begins fresh work. `review` also requests a fresh review of a previously completed comparison. Duplicate active requests coalesce.
+`resume` continues saved work when the comparison is still current. A review paused before it started can resume without a session. An interrupted review with no usable session requires a restart. `restart` explicitly begins fresh work. `review` also requests a fresh review of a previously completed comparison. Duplicate active requests coalesce.
 
 Initial open PRs remain excluded across restarts unless they receive a qualifying event or you request their inclusion. Startup/recovery catch-up is enabled by default. Batches above the configured threshold of ten are held until you run `crow release`. Change this with `crow config catchUp.threshold 20`; disable automatic catch-up with `crow config catchUp.enabled false`.
 
@@ -69,13 +69,15 @@ crow update
 crow cleanup
 ```
 
-`crow status` checks for updates at most once per day and reports available versions. Binary installations check the public stable version at `downloads.birdapp.dev/latest.txt`; source installations check the checkout's configured upstream. Offline update checks do not prevent status output. Download checks do not require GitHub authentication.
+`crow status` checks for updates at most once per day and reports available versions. All installations check the public stable version at `downloads.birdapp.dev/latest.txt`. Offline update checks do not prevent status output. Download checks do not require GitHub authentication.
+
+`crow start` and `crow service-restart` wait until the process reports readiness. Stopping an active review preserves its saved session; use `crow resume` to continue it.
 
 The native user systemd service starts after reboot and continues after logout. `crow run` runs in the foreground for another service manager.
 
-For a binary installation, `crow update` downloads the published stable release for the host architecture from `downloads.birdapp.dev` and verifies its SHA-256 checksum and reported version before stopping the service. It drains active work, switches the installed executable, and restarts Crow. It verifies that the new process finished initialization and restores the previous executable if startup fails. There is no source checkout or local build step. Only an explicitly published stable version is an update candidate. The hosted endpoint must be deployed before this update path is available.
+`crow update` downloads the published stable release for the host architecture from `downloads.birdapp.dev` and verifies its SHA-256 checksum and reported version before stopping the service. It drains active work, switches the installed executable, and restarts Crow. It verifies that the new process finished initialization and restores the previous executable if startup fails. There is no source checkout or local build step. Only an explicitly published stable version is an update candidate. The hosted endpoint must be deployed before this update path is available.
 
-For a source installation, `crow update` fetches the checkout's configured upstream, requires a clean tree, drains active reviews, stops Crow, applies a fast-forward update, runs checks, and starts the service. Keep the source checkout available for these updates. Neither update path replaces your Codex installation. If an update fails, inspect the reported error before running `crow start`.
+Updates do not modify source checkouts or replace your Codex installation. If an update fails, inspect the reported error before running `crow start`.
 
 Session/diagnostic retention defaults to seven days after completion, supersession, or PR closure. Paused sessions remain while their comparison is relevant. Compact review records remain while the repository is enrolled. Cleanup does not delete GitHub comments.
 
@@ -102,4 +104,4 @@ Provider authentication and sessions are not backed up or transferred. A restore
 - A worker that cannot connect needs the service URL and its own pairing token. Private Serve alone does not make GitHub webhook delivery possible.
 - Funnel setup preserves existing routes. If all supported ports are occupied, free a port or choose Cloudflare/existing HTTPS. Account-level Funnel permissions may require a tailnet administrator.
 - `crow doctor --runtime` checks provider capabilities without inference. It cannot prove live concurrent authentication refresh or provider interruption behavior.
-- For systemd errors, run `crow logs`, verify the installed executable still exists, and ensure the user has lingering enabled. Source installations also need their selected Node executable. Do not use `sudo crow setup` to fix a user-service permission error.
+- For systemd errors, run `crow logs`, verify the installed executable still exists, and ensure the user has lingering enabled. Do not use `sudo crow setup` to fix a user-service permission error.
