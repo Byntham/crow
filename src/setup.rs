@@ -26,31 +26,86 @@ fn string<'a>(value: &'a Value, key: &str) -> &'a str {
     value[key].as_str().unwrap_or("")
 }
 
-async fn ask(label: &str, fallback: &str) -> Result<String> {
-    let label = label.to_owned();
-    let fallback = fallback.to_owned();
-    tokio::task::spawn_blocking(move || {
-        print!(
-            "{label}{}: ",
-            if fallback.is_empty() {
-                String::new()
-            } else {
-                format!(" [{fallback}]")
-            }
-        );
-        io::stdout().flush()?;
-        let mut answer = String::new();
-        if io::stdin().read_line(&mut answer)? == 0 {
-            bail!("Setup requires interactive input. Run crow setup in a terminal.");
+struct PromptInput {
+    fd: std::os::fd::RawFd,
+    flags: libc::c_int,
+}
+
+impl PromptInput {
+    fn new(fd: std::os::fd::RawFd) -> io::Result<Self> {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+        {
+            return Err(io::Error::last_os_error());
         }
-        let answer = answer.trim();
-        Ok(if answer.is_empty() {
-            fallback
+        Ok(Self { fd, flags })
+    }
+
+    async fn line(&self) -> io::Result<String> {
+        let mut bytes = Vec::new();
+        loop {
+            // Read only through the newline. Later prompts and child processes
+            // must retain any answers already waiting on the same stdin.
+            let mut byte = 0_u8;
+            let count = unsafe { libc::read(self.fd, (&mut byte as *mut u8).cast(), 1) };
+            match count {
+                0 => break,
+                1 => {
+                    bytes.push(byte);
+                    if byte == b'\n' {
+                        break;
+                    }
+                    if bytes.len() % 1024 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                _ => match io::Error::last_os_error() {
+                    error if error.kind() == io::ErrorKind::Interrupted => continue,
+                    error if error.kind() == io::ErrorKind::WouldBlock => {
+                        // Unlike tokio::io::stdin, this leaves no blocking task
+                        // waiting for input when setup or its runtime shuts down.
+                        // It also supports redirected regular files, unlike epoll.
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    error => return Err(error),
+                },
+            }
+        }
+        String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+}
+
+impl Drop for PromptInput {
+    fn drop(&mut self) {
+        unsafe { libc::fcntl(self.fd, libc::F_SETFL, self.flags) };
+    }
+}
+
+async fn ask(label: &str, fallback: &str) -> Result<String> {
+    let input = PromptInput::new(libc::STDIN_FILENO)?;
+    print!(
+        "{label}{}: ",
+        if fallback.is_empty() {
+            String::new()
         } else {
-            answer.to_owned()
-        })
+            format!(" [{fallback}]")
+        }
+    );
+    io::stdout().flush()?;
+    let answer = tokio::select! {
+        biased;
+        result = operations::interrupted() => { result?; bail!("Setup interrupted. Run crow setup to continue."); }
+        answer = input.line() => answer?,
+    };
+    if answer.is_empty() {
+        bail!("Setup requires interactive input. Run crow setup in a terminal.");
+    }
+    let answer = answer.trim();
+    Ok(if answer.is_empty() {
+        fallback.to_owned()
+    } else {
+        answer.to_owned()
     })
-    .await?
 }
 
 async fn choose(label: &str, fallback: &str, choices: &[(&str, &str)]) -> Result<String> {
@@ -1306,6 +1361,126 @@ async fn setup_provider(config: &mut Value, root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_subprocess() {
+        let Some(directory) = std::env::var_os("CROW_PROMPT_TEST_DIRECTORY") else {
+            return;
+        };
+        let directory = PathBuf::from(directory);
+        let flags = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_GETFL) };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            // Registration previously polled and then dropped this listener.
+            assert!(tokio::time::timeout(Duration::from_millis(10), operations::interrupted()).await.is_err());
+            if std::env::var("CROW_PROMPT_TEST_MODE").unwrap() == "answers" {
+                let first = ask("First", "default").await.unwrap();
+                assert_eq!(unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_GETFL) }, flags);
+                let second = ask("Second", "default").await.unwrap();
+                assert_eq!(unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_GETFL) }, flags);
+                let third = ask("Third", "default");
+                tokio::pin!(third);
+                tokio::select! {
+                    result = &mut third => panic!("Partial UTF-8 input completed prematurely: {result:?}"),
+                    _ = tokio::time::sleep(Duration::from_millis(20)) => {},
+                }
+                util::atomic(&directory.join("ready.json"), &json!([first, second])).unwrap();
+                assert_eq!(third.await.unwrap(), "尾");
+                assert_eq!(unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_GETFL) }, flags);
+                assert!(ask("EOF", "default").await.unwrap_err().to_string().contains("interactive input"));
+            } else {
+                let prompt = ask("Waiting for input", "default");
+                tokio::pin!(prompt);
+                tokio::select! {
+                    result = &mut prompt => panic!("Prompt completed before its signal: {result:?}"),
+                    _ = tokio::time::sleep(Duration::from_millis(20)) => {},
+                }
+                util::atomic(&directory.join("ready.json"), &json!(true)).unwrap();
+                assert!(prompt.await.unwrap_err().to_string().contains("Setup interrupted"));
+            }
+            assert_eq!(unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_GETFL) }, flags);
+        });
+        // This must also finish. Cancelling a spawn_blocking stdin reader would
+        // return from ask but leave runtime destruction waiting for stdin EOF.
+        drop(runtime);
+    }
+
+    async fn prompt_child(mode: &str, signal: Option<i32>) {
+        use tokio::io::AsyncWriteExt;
+        let directory = tempfile::tempdir().unwrap();
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "setup::tests::prompt_subprocess", "--nocapture"])
+            .env("CROW_PROMPT_TEST_DIRECTORY", directory.path())
+            .env("CROW_PROMPT_TEST_MODE", mode)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        // Child::wait closes its own stdin; retain a separate handle to prove
+        // signal cancellation also shuts down the runtime without stdin EOF.
+        let mut input = child.stdin.take();
+        let test = async {
+            input
+                .as_mut()
+                .unwrap()
+                .write_all(if mode == "answers" {
+                    b" r\xc3\xa9view \n\n\xe5"
+                } else {
+                    b"partial input"
+                })
+                .await?;
+            while !directory.path().join("ready.json").exists() {
+                anyhow::ensure!(
+                    child.try_wait()?.is_none(),
+                    "Prompt subprocess exited before becoming ready"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if let Some(signal) = signal {
+                anyhow::ensure!(
+                    unsafe { libc::kill(child.id().unwrap() as i32, signal) } == 0,
+                    "Could not signal prompt subprocess"
+                );
+                // Keep stdin open until the child and its Tokio runtime exit.
+            } else {
+                anyhow::ensure!(
+                    util::read_json(&directory.path().join("ready.json"))?
+                        == Some(json!(["réview", "default"])),
+                    "Prompt answers did not preserve defaults and UTF-8"
+                );
+                input.as_mut().unwrap().write_all(b"\xb0\xbe").await?;
+                drop(input.take());
+            }
+            Ok::<_, anyhow::Error>(child.wait().await?)
+        };
+        match tokio::time::timeout(Duration::from_secs(5), test).await {
+            Ok(Ok(status)) => assert!(status.success(), "Prompt subprocess failed: {status}"),
+            error => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                panic!(
+                    "Prompt subprocess failed or did not exit while stdin remained open: {error:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prompts_exit_on_signals_after_registration_without_stdin_eof() {
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            prompt_child("signal", Some(signal)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn prompts_preserve_queued_answers_partial_utf8_defaults_and_eof() {
+        prompt_child("answers", None).await;
+    }
 
     struct RestartProbe {
         calls: std::sync::Mutex<Vec<&'static str>>,

@@ -49,7 +49,7 @@ Two opt-in tests passed against the installed Codex executable with synthetic lo
 
 ## Completed verification
 
-The native default suite passes 191 tests. Two installed-Codex probes also pass in both synthetic subscription and environment-key proxy modes. The proxy probes assert bearer authentication on every parent and child request. Formatting and warnings are checked with Cargo; release smoke checks exercise the extracted executable and its permanent launcher.
+The native default suite passes 194 tests. Two installed-Codex probes also pass in both synthetic subscription and environment-key proxy modes. The proxy probes assert bearer authentication on every parent and child request. Formatting and warnings are checked with Cargo; release smoke checks exercise the extracted executable and its permanent launcher.
 
 The port also repairs interrupted update drains without cancelling active reviews, restores the selected runtime after failed activation, and removes an installer's own launcher if a post-rename durability check fails. Fault-injection tests cover these recovery paths.
 
