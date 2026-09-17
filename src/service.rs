@@ -915,7 +915,10 @@ impl Service {
                 return Ok(Value::Null);
             };
             let dispatch=async {
-                let (pr,token)=self.refresh(&self.repo(s(&job,"repo"))?,n(&job,"number")).await?;
+                let assigned_repo = self.repo(s(&job,"repo"))?;
+                let (pr,_) = self.refresh(&assigned_repo,n(&job,"number")).await?;
+                // Publication credentials stay in the service. Workers only fetch source.
+                let token = self.github.checkout_token(&assigned_repo).await?;
                 if !self.owns(s(&job,"id"),s(&job,"lease"),"reviewing")? {return Ok(Value::Null);}
                 let repo=self.repo(s(&job,"repo"))?;
                 if !eligible(&repo,&pr) || pr["head"]["sha"]!=job["head"] || pr["base"]["ref"]!=job["target"] || repo["worker"]!=job["worker"] {
@@ -1663,6 +1666,9 @@ mod tests {
                 .insert(std::thread::current().id());
             Ok("installation-token".to_owned())
         }
+        async fn checkout_token(&self, _: &Value) -> Result<String> {
+            Ok("checkout-token".to_owned())
+        }
         async fn pr(&self, _: &Value, number: i64, _: &str) -> Result<Value> {
             self.pr_calls.fetch_add(1, Ordering::Relaxed);
             let pr = self
@@ -1846,6 +1852,59 @@ mod tests {
             self.handle.close().await.unwrap();
             drop(self.root);
         }
+    }
+    #[tokio::test]
+    async fn workers_receive_only_their_assigned_jobs_and_checkout_tokens() {
+        let f = Fixture::new().await;
+        f.handle
+            .admin(
+                "pair",
+                &json!({"id":"second-worker","token":"s".repeat(64)}),
+            )
+            .await
+            .unwrap();
+        let mut other_repo = f.handle.service.repo("owner/project").unwrap();
+        other_repo["name"] = json!("owner/other");
+        other_repo["worker"] = json!("second-worker");
+        f.handle
+            .service
+            .db(|db| db.enroll(&other_repo).map(|_| ()))
+            .unwrap();
+        f.queue().await;
+        f.handle
+            .service
+            .enqueue(&other_repo, 1, &json!({}))
+            .await
+            .unwrap();
+        let (_, first) = f
+            .call(
+                "/worker/next",
+                s(&f.config["worker"], "token"),
+                Some(json!({"active":[]})),
+            )
+            .await;
+        let (_, second) = f
+            .call("/worker/next", &"s".repeat(64), Some(json!({"active":[]})))
+            .await;
+        assert_eq!(first["job"]["repo"], "owner/project");
+        assert_eq!(second["job"]["repo"], "owner/other");
+        for work in [&first, &second] {
+            assert_eq!(work["token"], "checkout-token");
+            assert!(!work.to_string().contains("installation-token"));
+        }
+        let (_, stolen) = f
+            .call(
+                "/worker/heartbeat",
+                &"s".repeat(64),
+                Some(json!({"id":first["job"]["id"],"lease":first["job"]["lease"]})),
+            )
+            .await;
+        assert_eq!(stolen["cancel"], true);
+        let (_, next) = f
+            .call("/worker/next", &"s".repeat(64), Some(json!({"active":[]})))
+            .await;
+        assert!(next.is_null());
+        f.close().await;
     }
     #[tokio::test]
     async fn http_auth_health_and_status_redaction() {

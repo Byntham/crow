@@ -1,6 +1,6 @@
 # Hosted distribution
 
-These files prepare public installation of Crow while the source repository stays private. Nothing in a pull request deploys the site or publishes binaries. R2 has been enabled in the operator's Cloudflare account; the bucket, Pages project, domains, credentials, and first publication still need setup.
+The hosted installer and binary downloads are live while the source repository stays private. Nothing in a pull request deploys the site or publishes binaries. The R2 bucket, Pages project, domains, and workflow credentials are configured; use the publication and deployment workflows below for updates. Resource-creation instructions are retained for recovery.
 
 | Resource                               | Name            | Public address                  |
 | -------------------------------------- | --------------- | ------------------------------- |

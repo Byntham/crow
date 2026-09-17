@@ -376,6 +376,141 @@ pub fn app_manifest(config: &Value, name: &str) -> Value {
     json!({"name":name,"url":origin,"hook_attributes":{"url":format!("{origin}/webhooks/github"),"active":true},"redirect_url":format!("{origin}/setup/callback"),"public":config["appRegistration"]["visibility"] != "private","default_permissions":{"contents":"read","metadata":"read","pull_requests":"write","issues":"write"},"default_events":["pull_request","push","issue_comment"]})
 }
 
+pub fn validate_app_requirements(app: &Value) -> Result<()> {
+    if !matches!(
+        app["permissions"]["contents"].as_str(),
+        Some("read" | "write")
+    ) || app["permissions"]["pull_requests"] != "write"
+        || app["permissions"]["issues"] != "write"
+    {
+        bail!(
+            "The GitHub App needs Contents: read, Pull requests: write, and Issues: write. Update its permissions in GitHub App settings and approve any pending installation changes, then rerun crow setup."
+        );
+    }
+    for event in ["pull_request", "push", "issue_comment"] {
+        if !app["events"]
+            .as_array()
+            .is_some_and(|events| events.contains(&json!(event)))
+        {
+            bail!(
+                "The GitHub App must subscribe to {event}. Update its events in GitHub App settings, then rerun crow setup."
+            );
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_app_webhook(hook: &Value, expected: &str) -> Result<()> {
+    if hook["url"] != expected || hook["content_type"] != "json" || hook["insecure_ssl"] != "0" {
+        bail!(
+            "The GitHub App webhook must use {expected}, JSON content, and SSL verification. Check the App's webhook settings."
+        );
+    }
+    Ok(())
+}
+
+// Persist the secret before changing GitHub. A timeout may mean the PATCH succeeded;
+// retries must reuse that secret rather than orphaning the App connection.
+async fn finish_existing_app(
+    config: &mut Value,
+    root: &Path,
+    github: &dyn GitHubApi,
+    token: &str,
+) -> Result<()> {
+    if !config["app"].is_null() {
+        bail!(
+            "An App is already configured. Connecting another App requires an explicit migration."
+        );
+    }
+    config::save(root, config)?;
+    let pending = &config["pendingApp"];
+    let expected = format!("{}/webhooks/github", string(config, "publicUrl"));
+    if pending["webhookUrl"] != expected {
+        bail!(
+            "The public HTTPS address changed during App connection. Restore the saved address before rerunning setup."
+        );
+    }
+    github.request("/app/hook/config", Some(token), "PATCH", Some(&json!({
+        "url":expected, "content_type":"json", "insecure_ssl":"0",
+        "secret":pending["app"]["webhookSecret"]
+    }))).await.context("Could not configure the App webhook. Credentials are saved; rerun crow setup to retry.")?;
+    let hook = github
+        .request("/app/hook/config", Some(token), "GET", None)
+        .await?;
+    validate_app_webhook(&hook, &expected)?;
+    let mut completed = config.clone();
+    completed["app"] = pending["app"].clone();
+    completed.as_object_mut().unwrap().remove("pendingApp");
+    config::save(root, &completed)?;
+    *config = completed;
+    Ok(())
+}
+
+async fn connect_existing_app(config: &mut Value, root: &Path) -> Result<()> {
+    let mut app = if config["pendingApp"].is_object() {
+        println!("Resuming the saved GitHub App connection.");
+        config["pendingApp"]["app"].clone()
+    } else {
+        println!(
+            "\nOpen your GitHub App's settings. You need permission to manage the App, not just an installation. Generate or locate its private key and copy the PEM file to this machine."
+        );
+        let id = ask("GitHub App ID", "")
+            .await?
+            .parse::<u64>()
+            .context("Enter the numeric App ID, not the client ID or installation ID")?;
+        if id == 0 {
+            bail!("The GitHub App ID must be positive");
+        }
+        let path = ask("Private-key PEM file path", "").await?;
+        let path = if let Some(relative) = path.strip_prefix("~/") {
+            user_home()?.join(relative)
+        } else {
+            PathBuf::from(path)
+        };
+        let pem =
+            std::fs::read_to_string(path).context("Could not read the private-key PEM file")?;
+        json!({"id":id,"pem":pem,"webhookSecret":format!("{}{}",util::id(),util::id()),"botId":null})
+    };
+    let token = crate::github::jwt(&app)?;
+    let github = crate::github::GitHub::new(Some(app.clone()));
+    let metadata = github.request("/app", Some(&token), "GET", None).await?;
+    if metadata["id"] != app["id"] {
+        bail!("GitHub authenticated a different App ID");
+    }
+    validate_app_requirements(&metadata)?;
+    let slug = string(&metadata, "slug");
+    if slug.is_empty() || !slug.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-') {
+        bail!("GitHub returned an invalid App slug");
+    }
+    app["slug"] = json!(slug);
+    let hook = github
+        .request("/app/hook/config", Some(&token), "GET", None)
+        .await?;
+    let expected = format!("{}/webhooks/github", string(config, "publicUrl"));
+    if config["pendingApp"].is_object() && config["pendingApp"]["webhookUrl"] != expected {
+        bail!(
+            "The public HTTPS address changed during App connection. Restore the saved address before rerunning setup."
+        );
+    }
+    println!(
+        "\nConnect GitHub App {slug} (ID {})\nCurrent webhook: {}\nCrow webhook: {expected}\n\nCrow will replace this App's webhook URL and secret, use JSON, and enable SSL verification. Keep Webhook Active enabled in the App's GitHub settings.\nUse one Crow service per App. Stop any previous service before continuing, even if its webhook URL is the same. Workers should pair with this service.\nConnecting the App does not restore review history, repository assignments, or worker sessions. Use crow backup/restore to preserve service state when moving an installation.",
+        app["id"],
+        string(&hook, "url")
+    );
+    if !confirm(
+        "Is the previous service stopped, if any, and should Crow configure this App's webhook?",
+        false,
+    )
+    .await?
+    {
+        bail!("App connection cancelled. GitHub was not changed.");
+    }
+    config["pendingApp"] = json!({"app":app,"webhookUrl":expected});
+    // The operator may spend longer than a JWT's lifetime checking the old service.
+    let token = crate::github::jwt(&config["pendingApp"]["app"])?;
+    finish_existing_app(config, root, &github, &token).await
+}
+
 pub fn registration_action(registration: &Value, state: &str) -> Result<String> {
     if state.len() != 64
         || !state
@@ -1018,6 +1153,8 @@ fn validate_model_selection(models: &[Value], selected: &Value, label: &str) -> 
 
 pub async fn setup(root: &Path, options: &Value) -> Result<()> {
     util::private_dir(root)?;
+    let _setup_lock = util::acquire_lock(&root.join("setup.lock"))
+        .context("Another setup may be running. Finish it before starting setup again.")?;
     let mut config = match util::read_json(&root.join("config.json"))? {
         Some(value) if !value.is_null() => config::load(root)?,
         _ => config::defaults(root),
@@ -1160,7 +1297,24 @@ pub async fn setup(root: &Path, options: &Value) -> Result<()> {
             install_tunnel_service(&config).await?;
         }
         if config["app"].is_null() {
-            register_app(&mut config, root).await?;
+            let connection = if config["pendingApp"].is_object() {
+                "existing".to_owned()
+            } else {
+                choose(
+                    "Connect a GitHub App",
+                    "create",
+                    &[
+                        ("create", "Create a new GitHub App."),
+                        ("existing", "Connect an App you already manage."),
+                    ],
+                )
+                .await?
+            };
+            if connection == "existing" {
+                connect_existing_app(&mut config, root).await?;
+            } else {
+                register_app(&mut config, root).await?;
+            }
         }
         if config["app"].is_null() {
             bail!("GitHub App registration did not complete");
@@ -1327,6 +1481,144 @@ async fn setup_provider(config: &mut Value, root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct AppConnectionProbe {
+        root: PathBuf,
+        fail: bool,
+        calls: std::sync::Mutex<Vec<Value>>,
+    }
+    #[async_trait::async_trait]
+    impl GitHubApi for AppConnectionProbe {
+        async fn request(
+            &self,
+            path: &str,
+            _: Option<&str>,
+            method: &str,
+            body: Option<&Value>,
+        ) -> Result<Value> {
+            assert_eq!(path, "/app/hook/config");
+            if method == "PATCH" {
+                let saved = config::load(&self.root)?;
+                assert!(saved["app"].is_null());
+                assert_eq!(
+                    body.unwrap()["secret"],
+                    saved["pendingApp"]["app"]["webhookSecret"]
+                );
+                self.calls.lock().unwrap().push(body.unwrap().clone());
+                if self.fail {
+                    bail!("injected timeout after GitHub accepts the change");
+                }
+            }
+            Ok(
+                json!({"url":"https://crow.example/webhooks/github","content_type":"json","insecure_ssl":"0"}),
+            )
+        }
+    }
+
+    fn pending_app_config(root: &Path) -> Value {
+        let mut config = config::defaults(root);
+        config["publicUrl"] = json!("https://crow.example");
+        config["pendingApp"] = json!({"app":{"id":42,"pem":"private-key","slug":"my-crow","webhookSecret":"saved-secret","botId":null},"webhookUrl":"https://crow.example/webhooks/github"});
+        config
+    }
+
+    #[tokio::test]
+    async fn existing_app_connection_recovers_with_the_same_credentials_after_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let mut config = pending_app_config(root.path());
+        let mut probe = AppConnectionProbe {
+            root: root.path().to_owned(),
+            fail: true,
+            calls: Default::default(),
+        };
+        assert!(
+            finish_existing_app(&mut config, root.path(), &probe, "jwt")
+                .await
+                .is_err()
+        );
+        let saved = config::load(root.path()).unwrap();
+        assert!(saved["app"].is_null());
+        assert_eq!(
+            std::fs::metadata(root.path().join("config.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        probe.fail = false;
+        let mut resumed = saved.clone();
+        finish_existing_app(&mut resumed, root.path(), &probe, "jwt")
+            .await
+            .unwrap();
+        assert_eq!(resumed["app"], saved["pendingApp"]["app"]);
+        assert!(resumed.get("pendingApp").is_none());
+        assert_eq!(config::load(root.path()).unwrap(), resumed);
+        let calls = probe.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], calls[1]);
+    }
+
+    #[tokio::test]
+    async fn existing_app_connection_refuses_replacement_and_destination_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = pending_app_config(root.path());
+        let probe = AppConnectionProbe {
+            root: root.path().to_owned(),
+            fail: false,
+            calls: Default::default(),
+        };
+        config["app"] = config["pendingApp"]["app"].clone();
+        assert!(
+            finish_existing_app(&mut config, root.path(), &probe, "jwt")
+                .await
+                .is_err()
+        );
+        config["app"] = Value::Null;
+        config["publicUrl"] = json!("https://different.example");
+        assert!(
+            finish_existing_app(&mut config, root.path(), &probe, "jwt")
+                .await
+                .is_err()
+        );
+        assert!(probe.calls.lock().unwrap().is_empty());
+        assert!(!root.path().join("config.json").exists());
+    }
+
+    #[test]
+    fn existing_app_requirements_and_webhook_are_checked() {
+        let app = json!({"permissions":{"contents":"read","pull_requests":"write","issues":"write"},"events":["pull_request","push","issue_comment"]});
+        validate_app_requirements(&app).unwrap();
+        for permission in ["contents", "pull_requests", "issues"] {
+            let mut invalid = app.clone();
+            invalid["permissions"][permission] = json!("none");
+            assert!(validate_app_requirements(&invalid).is_err());
+        }
+        for event in ["pull_request", "push", "issue_comment"] {
+            let mut invalid = app.clone();
+            invalid["events"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|e| e != event);
+            assert!(validate_app_requirements(&invalid).is_err());
+        }
+        let mut broader = app;
+        broader["permissions"]["contents"] = json!("write");
+        validate_app_requirements(&broader).unwrap();
+        let expected = "https://crow.example/webhooks/github";
+        let hook = json!({"url":expected,"content_type":"json","insecure_ssl":"0"});
+        validate_app_webhook(&hook, expected).unwrap();
+        for (key, value) in [
+            ("url", "https://old.example/webhooks/github"),
+            ("content_type", "form"),
+            ("insecure_ssl", "1"),
+        ] {
+            let mut invalid = hook.clone();
+            invalid[key] = json!(value);
+            assert!(validate_app_webhook(&invalid, expected).is_err());
+        }
+    }
 
     #[test]
     fn prompt_subprocess() {

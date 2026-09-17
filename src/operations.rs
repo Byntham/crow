@@ -1,4 +1,5 @@
 //! User-service lifecycle, diagnostics, and transactional native updates.
+use crate::github::GitHubApi;
 use crate::{install, util};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -696,21 +697,19 @@ pub async fn doctor(config: &Value, root: &Path, runtime: bool) -> Result<Value>
                 .filter(|v| v.is_object())
                 .context("GitHub App registration incomplete")?;
             let token = crate::github::jwt(app_config)?;
-            let response = client()?
-                .get("https://api.github.com/app")
-                .bearer_auth(token)
-                .header("User-Agent", "Crow")
-                .header("Accept", "application/vnd.github+json")
-                .send()
-                .await?
-                .error_for_status()?;
-            let app: Value = response.json().await?;
-            if app["permissions"]["contents"] != "read"
-                || app["permissions"]["pull_requests"] != "write"
-                || app["permissions"]["issues"] != "write"
-            {
-                bail!("GitHub App permissions do not match Crow requirements");
-            }
+            let github = crate::github::GitHub::new(Some(app_config.clone()));
+            let app = github.request("/app", Some(&token), "GET", None).await?;
+            crate::setup::validate_app_requirements(&app)?;
+            let hook = github
+                .request("/app/hook/config", Some(&token), "GET", None)
+                .await?;
+            crate::setup::validate_app_webhook(
+                &hook,
+                &format!(
+                    "{}/webhooks/github",
+                    config["publicUrl"].as_str().unwrap_or("")
+                ),
+            )?;
             Ok(app["slug"].clone())
         }
         .await;

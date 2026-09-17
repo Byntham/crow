@@ -153,6 +153,9 @@ pub trait GitHubApi: Send + Sync {
     async fn token(&self, repo: &Value) -> Result<String> {
         bail!("GitHub token is not implemented")
     }
+    async fn checkout_token(&self, repo: &Value) -> Result<String> {
+        bail!("GitHub checkout token is not implemented")
+    }
     async fn pr(&self, repo: &Value, n: i64, token: &str) -> Result<Value> {
         bail!("GitHub pr is not implemented")
     }
@@ -238,6 +241,31 @@ impl GitHub {
     }
     fn require_app(&self) -> Result<&Value> {
         self.app.as_ref().context("Complete GitHub App setup first")
+    }
+    async fn installation_token(&self, repo: &Value, permissions: Value) -> Result<String> {
+        let token = jwt(self.require_app()?)?;
+        let name = string(&repo["name"])?;
+        crate::util::repo_name(name)?;
+        let installation = match &repo["installation"] {
+            Value::String(s) => s.clone(),
+            Value::Number(n) => n.to_string(),
+            _ => bail!("Invalid GitHub installation identifier"),
+        };
+        if installation.is_empty() || !installation.bytes().all(|c| c.is_ascii_digit()) {
+            bail!("Invalid GitHub installation identifier");
+        }
+        let body =
+            json!({"repositories":[name.split('/').nth(1).unwrap()],"permissions":permissions});
+        let result = self
+            .request(
+                &format!("/app/installations/{installation}/access_tokens"),
+                Some(&token),
+                "POST",
+                Some(&body),
+            )
+            .await?;
+        object(&result)?;
+        Ok(string(&result["token"])?.into())
     }
     pub fn path(&self, repo: &Value) -> Result<String> {
         let name = if repo.is_string() {
@@ -391,28 +419,15 @@ impl GitHubApi for GitHub {
         Ok(self.request_headers(path, token, method, body).await?.0)
     }
     async fn token(&self, repo: &Value) -> Result<String> {
-        let token = jwt(self.require_app()?)?;
-        let name = string(&repo["name"])?;
-        crate::util::repo_name(name)?;
-        let installation = match &repo["installation"] {
-            Value::String(s) => s.clone(),
-            Value::Number(n) => n.to_string(),
-            _ => bail!("Invalid GitHub installation identifier"),
-        };
-        if installation.is_empty() || !installation.bytes().all(|c| c.is_ascii_digit()) {
-            bail!("Invalid GitHub installation identifier");
-        }
-        let body = json!({"repositories":[name.split('/').nth(1).unwrap()],"permissions":{"contents":"read","pull_requests":"write","issues":"write","metadata":"read"}});
-        let result = self
-            .request(
-                &format!("/app/installations/{installation}/access_tokens"),
-                Some(&token),
-                "POST",
-                Some(&body),
-            )
-            .await?;
-        object(&result)?;
-        Ok(string(&result["token"])?.into())
+        self.installation_token(
+            repo,
+            json!({"contents":"read","pull_requests":"write","issues":"write","metadata":"read"}),
+        )
+        .await
+    }
+    async fn checkout_token(&self, repo: &Value) -> Result<String> {
+        self.installation_token(repo, json!({"contents":"read","metadata":"read"}))
+            .await
     }
     async fn pr(&self, repo: &Value, n: i64, token: &str) -> Result<Value> {
         pull_request(
@@ -756,6 +771,25 @@ mod tests {
                 .to_string()
                 .contains("Complete GitHub App setup first")
         );
+        h.abort();
+    }
+    #[tokio::test]
+    async fn worker_tokens_only_grant_source_read_access_to_one_repository() {
+        let (gh, m, h) = mock(Some(app())).await;
+        m.json(json!({"token":"read-only-token"}));
+        assert_eq!(gh.checkout_token(&repo()).await.unwrap(), "read-only-token");
+        m.push(403, HeaderMap::new(), json!({}));
+        assert!(gh.checkout_token(&repo()).await.is_err());
+        let calls = m.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "must not fall back to a broader token");
+        for call in calls.iter() {
+            assert_eq!(call.path, "/app/installations/1/access_tokens");
+            assert_eq!(call.method, "POST");
+            assert_eq!(
+                call.body,
+                json!({"repositories":["project"],"permissions":{"contents":"read","metadata":"read"}})
+            );
+        }
         h.abort();
     }
     #[tokio::test]
