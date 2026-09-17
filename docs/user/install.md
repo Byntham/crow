@@ -12,7 +12,7 @@ From an SSH terminal on the machine that will run Crow, use:
 curl -fsSL https://birdapp.dev/install.sh | sh
 ```
 
-Run this as your normal user, without sudo. The installer detects Linux x64 or ARM64, checks prerequisites, downloads a versioned archive from `downloads.birdapp.dev`, and verifies its checksum before extraction. It then installs the binary and offers to start setup. Ubuntu with systemd is the supported guided setup platform. These binaries require glibc; Alpine and other musl distributions are unsupported.
+Run this as your normal user, without sudo. The installer detects Linux x64 or ARM64, checks prerequisites, downloads a versioned archive from `downloads.birdapp.dev`, and verifies its checksum before extraction. It then installs the binary and offers to start setup. Ubuntu with systemd is the supported guided setup platform. Release binaries are static and do not require a particular glibc version; Ubuntu 20.04 and Debian 11 remain supported. Guided installation still targets glibc distributions because Codex and other external tools have separate platform requirements. Alpine and other musl distributions are outside this supported installation path.
 
 The bootstrap needs common Linux tools including `curl`, `tar`, and `sha256sum`. It explains missing prerequisites before installation. Crow setup offers installation of missing supported dependencies such as Git, GitHub CLI, Codex, and the chosen ingress client. GitHub login happens during setup to connect your repositories, not to download Crow.
 

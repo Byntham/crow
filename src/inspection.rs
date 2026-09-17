@@ -849,8 +849,8 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
             definitions.push(tool);
         }
     }
-    let mut stdin = BufReader::new(tokio::io::stdin());
-    let mut stdout = tokio::io::stdout();
+    let mut stdin = BufReader::new(crate::process::NonblockingIo::stdin()?);
+    let mut stdout = crate::process::NonblockingIo::stdout()?;
     #[cfg(unix)]
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let stop = async {
@@ -890,7 +890,13 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
                 _=>json!({"error":{"code":-32601,"message":"Unsupported method"}}),
             };
             let mut response=response; response["jsonrpc"]="2.0".into(); response["id"]=id;
-            stdout.write_all(response.to_string().as_bytes()).await?; stdout.write_all(b"\n").await?; stdout.flush().await?;
+            let write = async {
+                stdout.write_all(response.to_string().as_bytes()).await?;
+                stdout.write_all(b"\n").await?;
+                stdout.flush().await
+            };
+            tokio::select! { _ = &mut stop => break, result = write => result? }
+
         } Ok::<_,anyhow::Error>(())
     }.await;
     if let Some(delegation) = delegation {

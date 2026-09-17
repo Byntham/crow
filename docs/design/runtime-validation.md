@@ -9,7 +9,7 @@ cargo clippy --locked --all-targets -- -D warnings
 
 The original TypeScript baseline passed 321 tests, with five skipped, before migration. The Rust tests exercise the new implementation; the historical baseline is not proof that the port preserves every behavior.
 
-The ordinary suite currently passes 203 tests. It checks durable receipts and jobs, separate worker/admin authentication, inspection permissions, merge-base comparisons, recovery, report validation, provider policy, setup callbacks, encrypted backups, installation, and retention. Linux subprocess tests exercise cancellation and cleanup. Setup prompt tests keep stdin open while sending SIGINT and SIGTERM after registration listeners have been dropped; both the prompt and its runtime must exit without waiting for EOF.
+The ordinary suite currently passes 211 tests. It checks durable receipts and jobs, separate worker/admin authentication, inspection permissions, merge-base comparisons, recovery, report validation, provider policy, setup callbacks, encrypted backups, installation, and retention. Linux subprocess tests exercise cancellation and cleanup. Setup prompt tests keep stdin open while sending SIGINT and SIGTERM after registration listeners have been dropped; both the prompt and its runtime must exit without waiting for EOF.
 
 Opt-in installed-Codex tests use temporary synthetic authentication and a loopback Responses API. They must not use an operator's live account or perform model inference:
 
@@ -27,8 +27,9 @@ Fixtures and installed-runtime probes do not establish real subscription entitle
 To repeat the executable lifecycle checks against an optimized build:
 
 ```sh
-cargo build --locked --release --bin crow
-CROW_TEST_BINARY="$PWD/target/release/crow" cargo test --locked --test native_cli
+scripts/build-release.sh
+CROW_TEST_BINARY="$PWD/target/x86_64-unknown-linux-musl/release/crow" \
+  cargo test --locked --test native_cli --test human_cli --test inspection_mcp_port
 ```
 
 ## Live installation validation
@@ -44,3 +45,7 @@ Live testing found and fixed GitHub delivery IDs exceeding the inherited JavaScr
 The final optimized binary passed installation/MCP smoke checks and all three executable lifecycle tests. `crow doctor --runtime` passed against the installed binary, including public HTTPS, App permissions, pairing, proxy authentication, Codex capabilities, and enabled systemd startup. Restart followed immediately by status succeeded. The final startup logs had no delivery-audit error. The test PR was closed without merging, the original configuration was restored exactly, and the service was left active and undrained with only the two pre-existing paused reviews outstanding. A process scan found one native Crow daemon and no legacy Crow process.
 
 PR review added regressions for bounded same-origin GitHub redirects without cross-origin credential forwarding, omitted guidance metadata remaining resumable and reconcilable after publication, and delegated resume/restart/final-save failures preserving retryable state. These tests use local HTTP fixtures, SQLite, and deterministic filesystem write failures.
+
+Release builds use static musl executables to preserve compatibility with older supported glibc distributions. Packaging rejects dynamic loaders and shared-library dependencies. CI runs each architecture in an empty chroot. MCP subprocess regressions keep stdin or unread stdout open while sending SIGINT and SIGTERM, and cover large responses, request-size boundaries, and redirected files. Set `CROW_TEST_BINARY` for the installed-Codex probes to exercise the packaged MCP executable.
+
+The final x64 static executable passed all 16 CLI, MCP, and service lifecycle tests, extracted-archive installation and checksum checks, and both installed-Codex probes in each synthetic authentication mode. Version and help also ran in an empty root under PRoot; the previous GNU executable failed the same check because its loader was absent. Native CI uses chroot for this check.

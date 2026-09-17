@@ -132,6 +132,81 @@ fn octal(header: &[u8], start: usize, len: usize) -> Result<usize> {
     );
     Ok(usize::from_str_radix(value, 8)?)
 }
+/// Versioned glibc imports are avoided by shipping a static musl executable.
+/// Inspect program headers directly so the publisher never runs release code.
+fn validate_static_executable(bytes: &[u8], architecture: &str) -> Result<()> {
+    ensure!(
+        bytes.len() >= 64
+            && &bytes[..4] == b"\x7fELF"
+            && bytes[4] == 2
+            && bytes[5] == 1
+            && bytes[6] == 1
+            && u16::from_le_bytes([bytes[18], bytes[19]])
+                == if architecture == "x64" { 62 } else { 183 },
+        "Release does not contain a Linux {architecture} ELF64 executable."
+    );
+    let word = |offset: usize| u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap());
+    let quad = |offset: usize| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+    ensure!(
+        matches!(word(16), 2 | 3) && word(52) == 64 && word(54) == 56 && word(56) > 0,
+        "Malformed ELF executable headers."
+    );
+    let start = usize::try_from(quad(32)).context("ELF program table offset overflow")?;
+    let end = start
+        .checked_add(usize::from(word(56)) * 56)
+        .context("ELF program table size overflow")?;
+    ensure!(
+        start >= 64 && end <= bytes.len(),
+        "Truncated ELF program table."
+    );
+    let mut loadable = false;
+    for header in bytes[start..end].as_chunks::<56>().0 {
+        let kind = u32::from_le_bytes(header[..4].try_into().unwrap());
+        ensure!(
+            kind != 3,
+            "Release executable requires a dynamic loader; build the static musl target."
+        );
+        if kind != 1 && kind != 2 {
+            continue;
+        }
+        let offset = usize::try_from(u64::from_le_bytes(header[8..16].try_into().unwrap()))?;
+        let size = usize::try_from(u64::from_le_bytes(header[32..40].try_into().unwrap()))?;
+        let end = offset
+            .checked_add(size)
+            .context("ELF segment size overflow")?;
+        ensure!(end <= bytes.len(), "Truncated ELF segment.");
+        if kind == 1 {
+            loadable = true;
+            continue;
+        }
+        // Static PIE has a dynamic relocation table, but no shared dependencies.
+        ensure!(size >= 16 && size % 16 == 0, "Malformed ELF dynamic table.");
+        let mut terminated = false;
+        for entry in bytes[offset..end].as_chunks::<16>().0 {
+            let tag = u64::from_le_bytes(entry[..8].try_into().unwrap());
+            if tag == 0 {
+                terminated = true;
+                break;
+            }
+            ensure!(
+                !matches!(tag, 1 | 0x7fff_fffd | 0x7fff_ffff),
+                "Release executable requires shared libraries; build the static musl target."
+            );
+        }
+        ensure!(terminated, "Unterminated ELF dynamic table.");
+    }
+    ensure!(loadable, "ELF executable has no loadable segment.");
+    Ok(())
+}
+
+fn release_target(architecture: &str) -> &'static str {
+    match architecture {
+        "x64" => "x86_64-unknown-linux-musl",
+        "arm64" => "aarch64-unknown-linux-musl",
+        _ => unreachable!("release architecture was validated"),
+    }
+}
+
 fn validate_archive(bytes: &[u8], architecture: &str) -> Result<()> {
     ensure!(ARCHES.contains(&architecture), "Unknown architecture.");
     ensure!(
@@ -181,16 +256,7 @@ fn validate_archive(bytes: &[u8], architecture: &str) -> Result<()> {
             "Unexpected or malformed release archive entry."
         );
         if name == "crow" {
-            let b = &unpacked[offset + 512..end];
-            ensure!(
-                b.len() >= 64
-                    && &b[..4] == b"\x7fELF"
-                    && b[4] == 2
-                    && b[5] == 1
-                    && u16::from_le_bytes([b[18], b[19]])
-                        == if architecture == "x64" { 62 } else { 183 },
-                "Release does not contain a Linux {architecture} ELF64 executable."
-            );
+            validate_static_executable(&unpacked[offset + 512..end], architecture)?;
         }
         offset = end
             .checked_add((512 - size % 512) % 512)
@@ -278,6 +344,7 @@ fn assemble(directory: &Path, r: &Request) -> Result<Vec<ReleaseFile>> {
             m["version"] == r.version
                 && m["commit"] == r.commit
                 && m["arch"] == arch
+                && m["target"] == release_target(arch)
                 && m["archive"] == archive
                 && m["sha256"] == sha
                 && m["executableVersion"] == r.version,
@@ -589,19 +656,14 @@ fn license_files(directory: &Path, depth: u8) -> Result<Vec<PathBuf>> {
     found.sort();
     Ok(found)
 }
-fn notices() -> Result<String> {
-    let compiler = String::from_utf8(checked_output(Command::new("rustc").arg("-vV"))?)?;
-    let host = compiler
-        .lines()
-        .find_map(|line| line.strip_prefix("host: "))
-        .context("Missing rustc host target")?;
+fn notices(target: &str) -> Result<String> {
     let metadata: Value = serde_json::from_slice(&checked_output(Command::new("cargo").args([
         "metadata",
         "--locked",
         "--format-version",
         "1",
         "--filter-platform",
-        host,
+        target,
     ]))?)?;
     let resolved: BTreeSet<&str> = metadata["resolve"]["nodes"]
         .as_array()
@@ -610,8 +672,11 @@ fn notices() -> Result<String> {
         .filter_map(|node| node["id"].as_str())
         .collect();
     let mut result = String::from(
-        "Crow includes Rust libraries and the Rust standard library.\nDependency license declarations and distributed notices follow.\n",
+        "Crow includes Rust libraries, the Rust standard library, and musl libc.\nDependency license declarations and distributed notices follow.\n",
     );
+    result.push_str("\n===== musl libc =====\n");
+    result.push_str(include_str!("../../licenses/MUSL-COPYRIGHT"));
+    result.push('\n');
     for package in metadata["packages"]
         .as_array()
         .context("Missing Cargo packages")?
@@ -718,7 +783,9 @@ fn pack(executable: &Path, out: &Path) -> Result<()> {
         "Packaged executable version mismatch"
     );
     let binary = bounded_file(executable, MAX_UNPACKED)?;
-    let notices = notices()?;
+    validate_static_executable(&binary, arch)?;
+    let target = release_target(arch);
+    let notices = notices(target)?;
     fs::create_dir_all(out)?;
     let stage = tempfile::tempdir_in(out)?;
     let archive = format!("crow-v{version}-linux-{arch}.tar.gz");
@@ -750,7 +817,7 @@ fn pack(executable: &Path, out: &Path) -> Result<()> {
         stage.path().join("build-metadata.json"),
         format!(
             "{}\n",
-            json!({"version":version,"executableVersion":actual.trim(),"arch":arch,"archive":archive,"sha256":sha,"commit":commit})
+            json!({"version":version,"executableVersion":actual.trim(),"arch":arch,"archive":archive,"sha256":sha,"commit":commit,"target":target})
         ),
     )?;
     for name in [&archive, "SHA256SUMS", "build-metadata.json"] {
@@ -919,10 +986,21 @@ mod tests {
         )
         .unwrap()
     }
-    fn archive(arch: &str) -> Vec<u8> {
-        let mut binary = vec![0; 64];
-        binary[..6].copy_from_slice(b"\x7fELF\x02\x01");
+    fn static_elf(arch: &str) -> Vec<u8> {
+        let mut binary = vec![0; 120];
+        binary[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        binary[16..18].copy_from_slice(&2u16.to_le_bytes());
         binary[18..20].copy_from_slice(&(if arch == "x64" { 62u16 } else { 183u16 }).to_le_bytes());
+        binary[32..40].copy_from_slice(&64u64.to_le_bytes());
+        binary[52..54].copy_from_slice(&64u16.to_le_bytes());
+        binary[54..56].copy_from_slice(&56u16.to_le_bytes());
+        binary[56..58].copy_from_slice(&1u16.to_le_bytes());
+        binary[64..68].copy_from_slice(&1u32.to_le_bytes());
+        binary[96..104].copy_from_slice(&120u64.to_le_bytes());
+        binary
+    }
+    fn archive(arch: &str) -> Vec<u8> {
+        let binary = static_elf(arch);
         let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
         for (name, bytes) in [
             ("crow", binary.as_slice()),
@@ -1065,6 +1143,43 @@ mod tests {
         );
     }
     #[test]
+    fn static_release_check_rejects_loader_shared_dependencies_and_truncated_tables() {
+        for arch in ARCHES {
+            validate_static_executable(&static_elf(arch), arch).unwrap();
+        }
+        let mut dynamic = static_elf("x64");
+        dynamic[64..68].copy_from_slice(&3u32.to_le_bytes()); // PT_INTERP
+        assert!(
+            validate_static_executable(&dynamic, "x64")
+                .unwrap_err()
+                .to_string()
+                .contains("dynamic loader")
+        );
+        let mut truncated = static_elf("x64");
+        truncated[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(validate_static_executable(&truncated, "x64").is_err());
+        truncated = static_elf("x64");
+        truncated[56..58].copy_from_slice(&2u16.to_le_bytes());
+        assert!(validate_static_executable(&truncated, "x64").is_err());
+        let mut pie = static_elf("x64");
+        pie.resize(208, 0);
+        pie[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN static PIE
+        pie[56..58].copy_from_slice(&2u16.to_le_bytes());
+        pie[120..124].copy_from_slice(&2u32.to_le_bytes()); // PT_DYNAMIC
+        pie[128..136].copy_from_slice(&176u64.to_le_bytes());
+        pie[152..160].copy_from_slice(&32u64.to_le_bytes());
+        pie[176..184].copy_from_slice(&7u64.to_le_bytes()); // DT_RELA, allowed
+        validate_static_executable(&pie, "x64").unwrap();
+        pie[176..184].copy_from_slice(&1u64.to_le_bytes()); // DT_NEEDED, rejected
+        assert!(
+            validate_static_executable(&pie, "x64")
+                .unwrap_err()
+                .to_string()
+                .contains("shared libraries")
+        );
+    }
+
+    #[test]
     fn assembly_checks_hashes_source_and_exact_artifacts() {
         let dir = tempfile::tempdir().unwrap();
         let r = request_fixture();
@@ -1076,7 +1191,7 @@ mod tests {
             let sha = digest(&bytes);
             fs::write(path.join(&name), bytes).unwrap();
             fs::write(path.join("SHA256SUMS"), format!("{sha}  {name}\n")).unwrap();
-            fs::write(path.join("build-metadata.json"),json!({"version":r.version,"executableVersion":r.version,"commit":r.commit,"arch":arch,"archive":name,"sha256":sha}).to_string()).unwrap();
+            fs::write(path.join("build-metadata.json"),json!({"version":r.version,"executableVersion":r.version,"commit":r.commit,"arch":arch,"archive":name,"sha256":sha,"target":release_target(arch)}).to_string()).unwrap();
         }
         assert_eq!(assemble(dir.path(), &r).unwrap().len(), 3);
         let mut changed = r.clone();

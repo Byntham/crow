@@ -42,6 +42,8 @@ Optional review instructions belong in `.crow/review.md`. Crow also reads applic
 
 ## Development
 
+Ordinary Cargo builds use the host toolchain. Release packaging additionally needs `musl-tools` and `binutils` to build and verify static Linux executables.
+
 Install Rust with rustup and the Linux C build tools needed to compile bundled SQLite. `rust-toolchain.toml` selects the tested compiler and tools. Git is required for repository inspection.
 
 ```sh

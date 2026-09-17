@@ -26,63 +26,29 @@ fn string<'a>(value: &'a Value, key: &str) -> &'a str {
     value[key].as_str().unwrap_or("")
 }
 
-struct PromptInput {
-    fd: std::os::fd::RawFd,
-    flags: libc::c_int,
-}
-
-impl PromptInput {
-    fn new(fd: std::os::fd::RawFd) -> io::Result<Self> {
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
-        {
-            return Err(io::Error::last_os_error());
+async fn prompt_line(input: &mut crate::process::NonblockingIo<'_>) -> io::Result<String> {
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    loop {
+        // Read only through the newline. Later prompts and child processes
+        // must retain any answers already waiting on the same stdin.
+        let mut byte = [0_u8];
+        if input.read(&mut byte).await? == 0 {
+            break;
         }
-        Ok(Self { fd, flags })
-    }
-
-    async fn line(&self) -> io::Result<String> {
-        let mut bytes = Vec::new();
-        loop {
-            // Read only through the newline. Later prompts and child processes
-            // must retain any answers already waiting on the same stdin.
-            let mut byte = 0_u8;
-            let count = unsafe { libc::read(self.fd, (&mut byte as *mut u8).cast(), 1) };
-            match count {
-                0 => break,
-                1 => {
-                    bytes.push(byte);
-                    if byte == b'\n' {
-                        break;
-                    }
-                    if bytes.len() % 1024 == 0 {
-                        tokio::task::yield_now().await;
-                    }
-                }
-                _ => match io::Error::last_os_error() {
-                    error if error.kind() == io::ErrorKind::Interrupted => continue,
-                    error if error.kind() == io::ErrorKind::WouldBlock => {
-                        // Unlike tokio::io::stdin, this leaves no blocking task
-                        // waiting for input when setup or its runtime shuts down.
-                        // It also supports redirected regular files, unlike epoll.
-                        tokio::time::sleep(Duration::from_millis(20)).await;
-                    }
-                    error => return Err(error),
-                },
-            }
+        bytes.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
         }
-        String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        if bytes.len().is_multiple_of(1024) {
+            tokio::task::yield_now().await;
+        }
     }
-}
-
-impl Drop for PromptInput {
-    fn drop(&mut self) {
-        unsafe { libc::fcntl(self.fd, libc::F_SETFL, self.flags) };
-    }
+    String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 async fn ask(label: &str, fallback: &str) -> Result<String> {
-    let input = PromptInput::new(libc::STDIN_FILENO)?;
+    let mut input = crate::process::NonblockingIo::stdin()?;
     print!(
         "{label}{}: ",
         if fallback.is_empty() {
@@ -95,7 +61,7 @@ async fn ask(label: &str, fallback: &str) -> Result<String> {
     let answer = tokio::select! {
         biased;
         result = operations::interrupted() => { result?; bail!("Setup interrupted. Run crow setup to continue."); }
-        answer = input.line() => answer?,
+        answer = prompt_line(&mut input) => answer?,
     };
     if answer.is_empty() {
         bail!("Setup requires interactive input. Run crow setup in a terminal.");

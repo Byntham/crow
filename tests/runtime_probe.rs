@@ -352,7 +352,10 @@ impl Fixture {
             .join(" ");
         let inspection_arg = shell_quote(&format!(
             "mcp_servers.crow_inspection.command={}",
-            json!(env!("CARGO_BIN_EXE_crow"))
+            json!(
+                std::env::var("CROW_TEST_BINARY")
+                    .unwrap_or_else(|_| env!("CARGO_BIN_EXE_crow").to_owned())
+            )
         ));
         // exec keeps the fixture-owned PID, allowing cancellation assertions without a wrapper child.
         let provider_name = if proxy_env_key {

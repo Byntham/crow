@@ -10,6 +10,159 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+/// Cancellable I/O for a descriptor that would otherwise block a Tokio worker.
+/// The caller must be its only reader/writer while this guard exists. Original
+/// file status flags are restored before another prompt or child uses the fd.
+/// Regular files cannot register with epoll, so they use direct nonblocking I/O.
+pub(crate) struct NonblockingIo<'a> {
+    fd: std::os::fd::BorrowedFd<'a>,
+    flags: libc::c_int,
+    readiness: Option<tokio::io::unix::AsyncFd<std::os::fd::BorrowedFd<'a>>>,
+    retry: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<'a> NonblockingIo<'a> {
+    pub(crate) fn new(fd: std::os::fd::BorrowedFd<'a>) -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd;
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        if flags == -1
+            || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut io = Self {
+            fd,
+            flags,
+            readiness: None,
+            retry: None,
+        };
+        match tokio::io::unix::AsyncFd::new(fd) {
+            Ok(readiness) => io.readiness = Some(readiness),
+            Err(error) if error.raw_os_error() == Some(libc::EPERM) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(io)
+    }
+
+    fn poll_io(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        write: bool,
+        mut operation: impl FnMut(libc::c_int) -> std::io::Result<usize>,
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        use std::{
+            os::fd::AsRawFd,
+            task::{Poll, ready},
+        };
+        if let Some(readiness) = &self.readiness {
+            loop {
+                let mut ready = ready!(if write {
+                    readiness.poll_write_ready(cx)
+                } else {
+                    readiness.poll_read_ready(cx)
+                })?;
+                match operation(self.fd.as_raw_fd()) {
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        ready.clear_ready()
+                    }
+                    result => return Poll::Ready(result),
+                }
+            }
+        }
+        loop {
+            if let Some(retry) = &mut self.retry {
+                if retry.as_mut().poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                self.retry = None;
+            }
+            match operation(self.fd.as_raw_fd()) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    self.retry = Some(Box::pin(tokio::time::sleep(Duration::from_millis(20))));
+                }
+                result => return Poll::Ready(result),
+            }
+        }
+    }
+}
+
+impl NonblockingIo<'static> {
+    pub(crate) fn stdin() -> std::io::Result<Self> {
+        // The process owns its standard descriptors for its lifetime. Borrow
+        // them without closing them when an I/O guard is dropped.
+        Self::new(unsafe { std::os::fd::BorrowedFd::borrow_raw(libc::STDIN_FILENO) })
+    }
+    pub(crate) fn stdout() -> std::io::Result<Self> {
+        Self::new(unsafe { std::os::fd::BorrowedFd::borrow_raw(libc::STDOUT_FILENO) })
+    }
+}
+
+impl tokio::io::AsyncRead for NonblockingIo<'_> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::task::{Poll, ready};
+        if buffer.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let available = buffer.initialize_unfilled();
+        let count = ready!(self.get_mut().poll_io(cx, false, |fd| {
+            let count = unsafe { libc::read(fd, available.as_mut_ptr().cast(), available.len()) };
+            if count < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(count as usize)
+            }
+        }))?;
+        buffer.advance(count);
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl tokio::io::AsyncWrite for NonblockingIo<'_> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if bytes.is_empty() {
+            return std::task::Poll::Ready(Ok(0));
+        }
+        self.get_mut().poll_io(cx, true, |fd| {
+            let count = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+            if count < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(count as usize)
+            }
+        })
+    }
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        // Writes go directly to the descriptor; this type has no output buffer.
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.poll_flush(cx)
+    }
+}
+
+impl Drop for NonblockingIo<'_> {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_SETFL, self.flags) };
+    }
+}
+
 pub type LineCallback =
     Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
 pub struct RunOptions {
@@ -268,6 +421,54 @@ pub async fn run(program: &str, args: &[String], options: RunOptions) -> Result<
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn nonblocking_input_restores_flags_and_supports_regular_files() {
+        use std::{
+            io::{Seek, Write},
+            os::fd::{AsFd, AsRawFd},
+        };
+        let mut file = tempfile::tempfile().unwrap();
+        let expected = "file input 尾\n".repeat(1024);
+        file.write_all(expected.as_bytes()).unwrap();
+        file.rewind().unwrap();
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        {
+            let mut input = NonblockingIo::new(file.as_fd()).unwrap();
+            let mut actual = String::new();
+            input.read_to_string(&mut actual).await.unwrap();
+            assert_eq!(actual, expected);
+        }
+        assert_eq!(
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) },
+            flags
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_input_leaves_no_reader_and_restores_existing_flags() {
+        use std::os::{
+            fd::{AsFd, AsRawFd},
+            unix::net::UnixStream,
+        };
+        for already_nonblocking in [false, true] {
+            let (read, _write) = UnixStream::pair().unwrap();
+            read.set_nonblocking(already_nonblocking).unwrap();
+            let flags = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_GETFL) };
+            {
+                let mut input = NonblockingIo::new(read.as_fd()).unwrap();
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(30), input.read(&mut [0]))
+                        .await
+                        .is_err()
+                );
+            }
+            assert_eq!(
+                unsafe { libc::fcntl(read.as_raw_fd(), libc::F_GETFL) },
+                flags
+            );
+        }
+    }
     use super::*;
     #[tokio::test]
     async fn arguments_are_literal_and_output_is_bounded() {
