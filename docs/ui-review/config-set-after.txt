@@ -1,0 +1,4 @@
+$ crow config worker.concurrency 4
+
+Saved worker.concurrency.
+Run crow service-restart to apply it.

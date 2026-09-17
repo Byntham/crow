@@ -1,0 +1,10 @@
+$ crow backup --help
+
+Usage: crow backup --passphrase-file <PASSPHRASE_FILE> <FILE>
+
+Arguments:
+  <FILE>  
+
+Options:
+      --passphrase-file <PASSPHRASE_FILE>  
+  -h, --help                               Print help

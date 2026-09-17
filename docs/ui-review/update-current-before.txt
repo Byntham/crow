@@ -1,0 +1,8 @@
+$ crow update
+
+{
+  "updated": false,
+  "message": "Crow is current."
+}
+
+Capture method: saved operation response; no update was performed.

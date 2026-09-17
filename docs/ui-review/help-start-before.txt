@@ -1,0 +1,6 @@
+$ crow start --help
+
+Usage: crow start
+
+Options:
+  -h, --help  Print help

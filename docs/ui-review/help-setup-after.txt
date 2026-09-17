@@ -1,0 +1,37 @@
+$ crow setup --help
+
+Set up GitHub access, a review worker, and the service
+
+Usage: crow setup [OPTIONS]
+
+Options:
+      --role <ROLE>
+          What this machine runs: both, the service, or a worker
+          
+          [possible values: both, service, worker]
+
+      --format <FORMAT>
+          Result format; JSON is available for noninteractive commands
+
+          Possible values:
+          - text: Readable summaries and tables
+          - json: Structured command results for scripts
+          
+          [default: text]
+
+      --ingress <INGRESS>
+          How GitHub reaches the service over HTTPS
+          
+          [possible values: funnel, cloudflare, existing]
+
+      --port <PORT>
+          Local port for the service
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Examples:
+  crow setup
+  crow setup --role worker
+
+The service receives GitHub events. Workers run reviews. Choose both for one machine.

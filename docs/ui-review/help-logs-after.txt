@@ -1,0 +1,18 @@
+$ crow logs --help
+
+Follow service logs; press Ctrl-C to stop watching
+
+Usage: crow logs [OPTIONS]
+
+Options:
+      --format <FORMAT>
+          Result format; JSON is available for noninteractive commands
+
+          Possible values:
+          - text: Readable summaries and tables
+          - json: Structured command results for scripts
+          
+          [default: text]
+
+  -h, --help
+          Print help (see a summary with '-h')

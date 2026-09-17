@@ -1,0 +1,3 @@
+$ crow run
+
+Crow service running.

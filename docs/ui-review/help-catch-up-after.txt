@@ -1,0 +1,25 @@
+$ crow catch-up --help
+
+Find eligible open pull requests that need a review
+
+Usage: crow catch-up [OPTIONS] [REPO]
+
+Arguments:
+  [REPO]
+          Limit to OWNER/REPO; omit to check all enrolled repositories
+
+Options:
+      --include-backlog
+          Also include pull requests opened before enrollment
+
+      --format <FORMAT>
+          Result format; JSON is available for noninteractive commands
+
+          Possible values:
+          - text: Readable summaries and tables
+          - json: Structured command results for scripts
+          
+          [default: text]
+
+  -h, --help
+          Print help (see a summary with '-h')

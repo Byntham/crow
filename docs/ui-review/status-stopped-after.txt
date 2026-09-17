@@ -1,0 +1,5 @@
+$ crow status
+
+Crow worker
+
+Worker is not running. Run crow start, then crow doctor to check this worker.

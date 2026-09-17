@@ -1,0 +1,9 @@
+$ crow cleanup
+
+{
+  "cleaned": true
+}
+{
+  "removed": [],
+  "warnings": []
+}

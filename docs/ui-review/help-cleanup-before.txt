@@ -1,0 +1,6 @@
+$ crow cleanup --help
+
+Usage: crow cleanup
+
+Options:
+  -h, --help  Print help

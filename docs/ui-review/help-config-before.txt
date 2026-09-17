@@ -1,0 +1,10 @@
+$ crow config --help
+
+Usage: crow config [KEY] [VALUE]
+
+Arguments:
+  [KEY]    
+  [VALUE]  
+
+Options:
+  -h, --help  Print help

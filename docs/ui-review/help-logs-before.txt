@@ -1,0 +1,6 @@
+$ crow logs --help
+
+Usage: crow logs
+
+Options:
+  -h, --help  Print help

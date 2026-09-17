@@ -1,0 +1,4 @@
+$ crow cleanup
+
+Service history cleanup complete.
+No expired worker files to remove.

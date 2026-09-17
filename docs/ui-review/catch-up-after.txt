@@ -1,0 +1,6 @@
+$ crow catch-up
+
+Catch-up scan complete.
+
+  Repository    Queued  Held for approval
+  acme/website  2       0

@@ -1,0 +1,18 @@
+$ crow undrain --help
+
+Accept new reviews again after crow drain
+
+Usage: crow undrain [OPTIONS]
+
+Options:
+      --format <FORMAT>
+          Result format; JSON is available for noninteractive commands
+
+          Possible values:
+          - text: Readable summaries and tables
+          - json: Structured command results for scripts
+          
+          [default: text]
+
+  -h, --help
+          Print help (see a summary with '-h')

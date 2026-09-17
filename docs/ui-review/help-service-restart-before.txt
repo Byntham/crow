@@ -1,0 +1,6 @@
+$ crow service-restart --help
+
+Usage: crow service-restart
+
+Options:
+  -h, --help  Print help

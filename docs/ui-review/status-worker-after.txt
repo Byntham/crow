@@ -1,0 +1,12 @@
+$ crow status
+
+Crow worker
+  Status              Running
+  Service connection  Connected
+  Last reported       2026-09-17 01:08 UTC
+
+Active reviews (1)
+  Pull request      Status
+  acme/website #42  Reviewing
+
+This is the worker's last report. Run crow doctor to check its health.

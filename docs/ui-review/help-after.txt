@@ -1,0 +1,62 @@
+$ crow --help
+
+Review GitHub pull requests with your own Crow service
+
+Usage: crow [OPTIONS] [COMMAND]
+
+Commands:
+  install          Install Crow on this machine and start setup
+  setup            Set up GitHub access, a review worker, and the service
+  status           Show repositories, workers, and recent reviews
+  doctor           Check the installation and explain any problems
+  logs             Follow service logs; press Ctrl-C to stop watching
+  enroll           Enable automatic reviews for a GitHub repository
+  review           Request a review of a pull request
+  pause            Pause a review and keep its saved work
+  resume           Continue a paused review from its saved work
+  restart          Start a fresh review, replacing the previous attempt
+  catch-up         Find eligible open pull requests that need a review
+  policy           Choose whose pull requests are reviewed and who can request reviews
+  repo-config      Set review options for one repository
+  config           Show settings, or change a setting on this machine
+  start            Start Crow in the background
+  stop             Stop Crow's background service
+  service-restart  Restart the background service to apply configuration changes
+  login            Sign in to the review provider on this worker
+  models           List available review models and reasoning levels
+  update           Install the latest Crow release and restart the service
+  release          Queue reviews held back after a large catch-up batch
+  pair             Create credentials for connecting another worker
+  cleanup          Remove expired review records and local review files
+  drain            Stop accepting new reviews while current reviews finish
+  undrain          Accept new reviews again after crow drain
+  run              Run Crow in this terminal until you press Ctrl-C
+  backup           Save an encrypted backup of this installation
+  restore          Restore a backup, replacing settings and history on this machine
+  version          Show the installed Crow version
+  help             Print this message or the help of the given subcommand(s)
+
+Options:
+      --version
+          Show the installed Crow version
+
+      --format <FORMAT>
+          Result format; JSON is available for noninteractive commands
+
+          Possible values:
+          - text: Readable summaries and tables
+          - json: Structured command results for scripts
+          
+          [default: text]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Get started:
+  crow setup                    Set up this machine
+  crow enroll owner/repo        Start reviewing a repository
+  crow status                   See reviews and worker health
+
+Use crow <command> --help for details and examples.
+For scripts: crow status --format json
+CROW_HOME sets the installation directory (default: ~/.local/share/crow).

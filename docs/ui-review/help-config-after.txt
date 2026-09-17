@@ -1,0 +1,40 @@
+$ crow config --help
+
+Show settings, or change a setting on this machine
+
+Usage: crow config [OPTIONS] [KEY] [VALUE]
+
+Arguments:
+  [KEY]
+          Setting to change; omit to show current settings
+
+  [VALUE]
+          Text, number, true/false, null, or a JSON object as appropriate
+
+Options:
+      --format <FORMAT>
+          Result format; JSON is available for noninteractive commands
+
+          Possible values:
+          - text: Readable summaries and tables
+          - json: Structured command results for scripts
+          
+          [default: text]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Examples:
+  crow config
+  crow config worker.model MODEL
+  crow config worker.effort high
+  crow config worker.concurrency 2
+  crow config catchUp.enabled true
+
+Editable settings:
+  worker.model, worker.effort, worker.concurrency, worker.timeoutMs
+  worker.subagents, worker.retry (JSON objects)
+  catchUp.enabled, catchUp.threshold, auditIntervalMs, retentionDays
+
+Choose MODEL from crow models. Use null to reset the model or reasoning level.
+Restart Crow after changes with crow service-restart.

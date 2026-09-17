@@ -1,0 +1,12 @@
+$ crow resume --help
+
+Usage: crow resume [OPTIONS] <REPO> <NUMBER>
+
+Arguments:
+  <REPO>    
+  <NUMBER>  
+
+Options:
+      --model <MODEL>    
+      --effort <EFFORT>  
+  -h, --help             Print help

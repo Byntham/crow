@@ -1,0 +1,9 @@
+$ crow install --help
+
+Install this native executable
+
+Usage: crow install [OPTIONS]
+
+Options:
+      --no-setup  
+  -h, --help      Print help

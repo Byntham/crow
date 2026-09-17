@@ -1,0 +1,10 @@
+$ crow restart --help
+
+Usage: crow restart <REPO> <NUMBER>
+
+Arguments:
+  <REPO>    
+  <NUMBER>  
+
+Options:
+  -h, --help  Print help

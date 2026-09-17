@@ -1,0 +1,33 @@
+$ crow models
+
+{
+  "models": [
+    {
+      "id": "provider-default",
+      "model": "provider-default",
+      "defaultReasoningEffort": "medium",
+      "supportedReasoningEfforts": [
+        {
+          "reasoningEffort": "medium"
+        }
+      ]
+    },
+    {
+      "id": "second",
+      "model": "second",
+      "defaultReasoningEffort": "medium",
+      "supportedReasoningEfforts": [
+        {
+          "reasoningEffort": "medium"
+        }
+      ]
+    }
+  ],
+  "account": {
+    "type": "chatgpt",
+    "planType": "pro"
+  },
+  "retrievedAt": "2026-09-17T01:08:24.885186660+00:00",
+  "cached": false,
+  "warning": null
+}

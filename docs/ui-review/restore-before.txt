@@ -1,0 +1,9 @@
+$ crow restore /home/alice/.local/share/crow/crow.backup --passphrase-file /home/alice/.local/share/crow/passphrase
+
+{
+  "root": "/home/alice/.local/share/crow",
+  "files": [
+    "config.json"
+  ],
+  "requiresProviderLogin": true
+}

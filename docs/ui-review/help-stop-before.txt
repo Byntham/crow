@@ -1,0 +1,6 @@
+$ crow stop --help
+
+Usage: crow stop
+
+Options:
+  -h, --help  Print help

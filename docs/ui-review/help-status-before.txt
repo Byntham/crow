@@ -1,0 +1,6 @@
+$ crow status --help
+
+Usage: crow status
+
+Options:
+  -h, --help  Print help

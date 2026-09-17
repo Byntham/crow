@@ -1,0 +1,15 @@
+$ crow doctor
+
+Crow health check: all 4 checks passed.
+
+[OK] connection service reachable
+  Crow is reachable.
+
+[OK] worker pairing
+  review-worker
+
+[OK] subscription authentication
+  ChatGPT subscription
+
+[OK] persistent startup
+  enabled, active

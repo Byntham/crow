@@ -1,0 +1,22 @@
+$ crow release --help
+
+Queue reviews held back after a large catch-up batch
+
+Usage: crow release [OPTIONS] [REPO]
+
+Arguments:
+  [REPO]
+          Limit to OWNER/REPO; omit to release all held reviews
+
+Options:
+      --format <FORMAT>
+          Result format; JSON is available for noninteractive commands
+
+          Possible values:
+          - text: Readable summaries and tables
+          - json: Structured command results for scripts
+          
+          [default: text]
+
+  -h, --help
+          Print help (see a summary with '-h')

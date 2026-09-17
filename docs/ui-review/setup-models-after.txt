@@ -1,0 +1,37 @@
+$ crow setup
+
+
+Crow setup
+
+Connect GitHub, choose a review model, and start Crow in the background.
+Press Enter to accept the value in brackets. You can rerun crow setup to continue.
+
+What should run on this machine?
+  1. both         Receive GitHub events and run reviews. Recommended.
+  2. service      Receive GitHub events; send reviews to another machine.
+  3. worker       Run reviews for a Crow service on another machine.
+Choose a number or name [both]: worker
+
+Crow installed. Settings and review history: /home/alice/.local/share/crow
+
+To use the crow command in this terminal, run:
+  export PATH="$HOME/.local/bin:$PATH"
+
+Connect this worker
+Run crow pair on your service machine, then enter its connection details.
+Connection-service HTTPS URL: https://crow.example.com
+Worker ID from crow pair [review-worker]: review-worker
+Worker token from crow pair: fixture-pairing-token-with-32-characters
+
+Choose how Crow reviews code
+
+Review model
+  1. provider-default
+  2. second
+Choose a number or name [provider-default]: provider-default
+
+Higher reasoning levels give the model more time to work on each review.
+
+Reasoning level
+  1. medium
+Choose a number or name [medium]: Error: Setup requires interactive input. Run crow setup in a terminal.

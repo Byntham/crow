@@ -1,0 +1,45 @@
+$ crow repo-config --help
+
+Set review options for one repository
+
+Usage: crow repo-config [OPTIONS] <--json <OBJECT>|--model <MODEL>|--effort <EFFORT>|--timeout-seconds <TIMEOUT_SECONDS>|--reset> <REPO>
+
+Arguments:
+  <REPO>
+          Repository in OWNER/REPO format
+
+Options:
+      --json <OBJECT>
+          Advanced: review overrides as a JSON object
+
+      --format <FORMAT>
+          Result format; JSON is available for noninteractive commands
+
+          Possible values:
+          - text: Readable summaries and tables
+          - json: Structured command results for scripts
+          
+          [default: text]
+
+      --model <MODEL>
+          Model to use for this repository; see crow models
+
+      --effort <EFFORT>
+          Reasoning level for this repository; see crow models
+
+      --timeout-seconds <TIMEOUT_SECONDS>
+          Review time limit in seconds; 0 means no limit
+
+      --reset
+          Remove repository overrides and use the worker defaults
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Examples:
+  crow repo-config owner/repo --model MODEL --effort high
+  crow repo-config owner/repo --reset
+  crow repo-config owner/repo --json '{"retry":{"count":3}}'
+
+Choose MODEL from crow models. Each call replaces this repository's overrides.
+Omitted options use worker defaults.

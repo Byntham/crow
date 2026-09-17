@@ -1,0 +1,15 @@
+Browser screenshot of the exact setup page template using sample values.
+
+Crow setup
+
+Return to your terminal
+
+This setup link is no longer valid
+
+The link may have already been used, or it may belong to another setup session.
+
+Check your Crow setup terminal for the next step. If setup has stopped, run
+
+crow setup
+
+to continue.

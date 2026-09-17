@@ -1,0 +1,10 @@
+$ crow pause --help
+
+Usage: crow pause <REPO> <NUMBER>
+
+Arguments:
+  <REPO>    
+  <NUMBER>  
+
+Options:
+  -h, --help  Print help

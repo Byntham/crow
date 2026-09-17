@@ -1,0 +1,3 @@
+Browser screenshot of the exact setup page template using sample values.
+
+Invalid or already used setup callback. Return to your terminal.

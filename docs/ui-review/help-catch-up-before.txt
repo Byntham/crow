@@ -1,0 +1,10 @@
+$ crow catch-up --help
+
+Usage: crow catch-up [OPTIONS] [REPO]
+
+Arguments:
+  [REPO]  
+
+Options:
+      --include-backlog  
+  -h, --help             Print help

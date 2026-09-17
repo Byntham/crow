@@ -1,0 +1,24 @@
+$ crow repo-config acme/website --json {"model":"provider-default","effort":"medium"}
+
+{
+  "name": "acme/website",
+  "installation": 12345,
+  "worker": "review-worker",
+  "policy": "selected",
+  "authors": [
+    "alice",
+    "bob"
+  ],
+  "requesters": [
+    "alice"
+  ],
+  "settings": {
+    "model": "provider-default",
+    "effort": "medium"
+  },
+  "enrolledAt": 1789520904131,
+  "excluded": [
+    12,
+    13
+  ]
+}

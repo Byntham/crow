@@ -1,0 +1,6 @@
+$ crow login --help
+
+Usage: crow login
+
+Options:
+  -h, --help  Print help

@@ -1,0 +1,15 @@
+Browser screenshot of the exact setup page template using sample values.
+
+Crow setup
+
+Step 1 of 2 · Create your app
+
+Connect Crow to GitHub
+
+Create a GitHub App so Crow can read pull requests and post reviews on your behalf.
+
+GitHub will show the requested permissions and ask you to confirm. You will then choose which repositories Crow can access.
+
+Create GitHub App
+
+Keep your Crow setup terminal open while you complete these steps.

@@ -1,0 +1,3 @@
+$ crow status
+
+Error: Crow is not configured. Run crow setup.

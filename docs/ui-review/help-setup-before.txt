@@ -1,0 +1,11 @@
+$ crow setup --help
+
+Configure an independent Crow installation
+
+Usage: crow setup [OPTIONS]
+
+Options:
+      --role <ROLE>        [possible values: both, service, worker]
+      --ingress <INGRESS>  [possible values: funnel, cloudflare, existing]
+      --port <PORT>        
+  -h, --help               Print help

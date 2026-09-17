@@ -1,0 +1,14 @@
+$ crow status
+
+Crow status
+  Service             Accepting reviews
+  Overview            0 repositories / 0 workers / 0 reviews
+
+Repositories
+  No repositories enrolled. Run crow enroll OWNER/REPO to add one.
+
+Workers
+  No workers paired. Run crow pair to connect a worker.
+
+Open reviews (0)
+  No reviews waiting or running.

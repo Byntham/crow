@@ -1,0 +1,3 @@
+$ crow stop
+
+Crow stopped. Run crow start when you are ready.

@@ -1,0 +1,21 @@
+$ crow doctor --help
+
+Check the installation and explain any problems
+
+Usage: crow doctor [OPTIONS]
+
+Options:
+      --runtime
+          Also check Codex capabilities without running a review
+
+      --format <FORMAT>
+          Result format; JSON is available for noninteractive commands
+
+          Possible values:
+          - text: Readable summaries and tables
+          - json: Structured command results for scripts
+          
+          [default: text]
+
+  -h, --help
+          Print help (see a summary with '-h')

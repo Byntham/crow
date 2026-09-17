@@ -1,0 +1,12 @@
+$ crow enroll --help
+
+Usage: crow enroll [OPTIONS] <REPO>
+
+Arguments:
+  <REPO>  
+
+Options:
+      --include-backlog  
+      --reenroll         
+      --worker <WORKER>  
+  -h, --help             Print help

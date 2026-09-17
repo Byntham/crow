@@ -1,0 +1,6 @@
+$ crow drain --help
+
+Usage: crow drain
+
+Options:
+  -h, --help  Print help

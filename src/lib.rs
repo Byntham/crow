@@ -6,6 +6,7 @@ pub mod github;
 pub mod inspection;
 pub mod install;
 pub mod operations;
+pub mod output;
 pub mod process;
 pub mod provider;
 pub mod report;

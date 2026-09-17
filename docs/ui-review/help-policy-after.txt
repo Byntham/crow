@@ -1,0 +1,36 @@
+$ crow policy --help
+
+Choose whose pull requests are reviewed and who can request reviews
+
+Usage: crow policy [OPTIONS] <--authors <USER,USER>|--everyone|--requesters <USER,USER>> <REPO>
+
+Arguments:
+  <REPO>
+          Repository in OWNER/REPO format
+
+Options:
+      --authors <USER,USER>
+          Review pull requests from these comma-separated GitHub usernames
+
+      --everyone
+          Review pull requests from all authors
+
+      --format <FORMAT>
+          Result format; JSON is available for noninteractive commands
+
+          Possible values:
+          - text: Readable summaries and tables
+          - json: Structured command results for scripts
+          
+          [default: text]
+
+      --requesters <USER,USER>
+          Allow these comma-separated GitHub usernames to request reviews
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Examples:
+  crow policy owner/repo --authors alice,bob
+  crow policy owner/repo --everyone
+  crow policy owner/repo --requesters alice,bob

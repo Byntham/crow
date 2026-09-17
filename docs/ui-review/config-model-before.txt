@@ -1,0 +1,3 @@
+$ crow config worker.model provider-default
+
+Crow: expected value at line 1 column 1

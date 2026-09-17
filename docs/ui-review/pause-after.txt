@@ -1,0 +1,4 @@
+$ crow pause acme/website 42
+
+Pause requested for acme/website #42.
+Use crow resume OWNER/REPO NUMBER to continue saved work.

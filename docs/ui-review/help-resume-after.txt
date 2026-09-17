@@ -1,0 +1,33 @@
+$ crow resume --help
+
+Continue a paused review from its saved work
+
+Usage: crow resume [OPTIONS] <REPO> <NUMBER>
+
+Arguments:
+  <REPO>
+          Repository in OWNER/REPO format
+
+  <NUMBER>
+          Pull request number, for example 42
+
+Options:
+      --model <MODEL>
+          Change the review model; see crow models
+
+      --effort <EFFORT>
+          Change the reasoning level; see crow models
+
+      --format <FORMAT>
+          Result format; JSON is available for noninteractive commands
+
+          Possible values:
+          - text: Readable summaries and tables
+          - json: Structured command results for scripts
+          
+          [default: text]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Example: crow resume owner/repo 42

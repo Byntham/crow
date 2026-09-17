@@ -1,0 +1,10 @@
+$ crow repo-config --help
+
+Usage: crow repo-config --json <JSON> <REPO>
+
+Arguments:
+  <REPO>  
+
+Options:
+      --json <JSON>  
+  -h, --help         Print help

@@ -1,0 +1,5 @@
+$ crow install --no-setup
+
+Installed Crow 0.3.0 at /home/alice/.local/share/crow/current/crow
+To use crow in this shell, run: export PATH='/home/alice/.local/bin':"$PATH"
+Start or continue setup with: CROW_HOME='/home/alice/.local/share/crow' '/home/alice/.local/share/crow/current/crow' setup

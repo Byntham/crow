@@ -1,0 +1,21 @@
+$ crow enroll acme/website
+
+{
+  "name": "acme/website",
+  "installation": 12345,
+  "worker": "review-worker",
+  "policy": "selected",
+  "authors": [
+    "alice",
+    "bob"
+  ],
+  "requesters": [
+    "alice"
+  ],
+  "settings": {},
+  "enrolledAt": 1789520904131,
+  "excluded": [
+    12,
+    13
+  ]
+}

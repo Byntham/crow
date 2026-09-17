@@ -1,0 +1,6 @@
+$ crow update --help
+
+Usage: crow update
+
+Options:
+  -h, --help  Print help
