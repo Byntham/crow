@@ -9,7 +9,7 @@ cargo clippy --locked --all-targets -- -D warnings
 
 The original TypeScript baseline passed 321 tests, with five skipped, before migration. The Rust tests exercise the new implementation; the historical baseline is not proof that the port preserves every behavior.
 
-The ordinary suite currently passes 194 tests. It checks durable receipts and jobs, separate worker/admin authentication, inspection permissions, merge-base comparisons, recovery, report validation, provider policy, setup callbacks, encrypted backups, installation, and retention. Linux subprocess tests exercise cancellation and cleanup. Setup prompt tests keep stdin open while sending SIGINT and SIGTERM after registration listeners have been dropped; both the prompt and its runtime must exit without waiting for EOF.
+The ordinary suite currently passes 203 tests. It checks durable receipts and jobs, separate worker/admin authentication, inspection permissions, merge-base comparisons, recovery, report validation, provider policy, setup callbacks, encrypted backups, installation, and retention. Linux subprocess tests exercise cancellation and cleanup. Setup prompt tests keep stdin open while sending SIGINT and SIGTERM after registration listeners have been dropped; both the prompt and its runtime must exit without waiting for EOF.
 
 Opt-in installed-Codex tests use temporary synthetic authentication and a loopback Responses API. They must not use an operator's live account or perform model inference:
 
@@ -42,3 +42,5 @@ The flow also checked drain and undrain, queued pause/resume without a provider 
 Live testing found and fixed GitHub delivery IDs exceeding the inherited JavaScript safe-integer limit. Delivery IDs now use exact unsigned 64-bit integers. CLI start/restart now wait for the native readiness signal, and successful doctor checks summarize capabilities and job counts instead of dumping history and help output.
 
 The final optimized binary passed installation/MCP smoke checks and all three executable lifecycle tests. `crow doctor --runtime` passed against the installed binary, including public HTTPS, App permissions, pairing, proxy authentication, Codex capabilities, and enabled systemd startup. Restart followed immediately by status succeeded. The final startup logs had no delivery-audit error. The test PR was closed without merging, the original configuration was restored exactly, and the service was left active and undrained with only the two pre-existing paused reviews outstanding. A process scan found one native Crow daemon and no legacy Crow process.
+
+PR review added regressions for bounded same-origin GitHub redirects without cross-origin credential forwarding, omitted guidance metadata remaining resumable and reconcilable after publication, and delegated resume/restart/final-save failures preserving retryable state. These tests use local HTTP fixtures, SQLite, and deterministic filesystem write failures.

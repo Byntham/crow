@@ -295,17 +295,17 @@ impl Delegation {
     }
     async fn update(&self, id: &str, change: impl FnOnce(&mut Value)) -> Result<()> {
         let _order = self.inner.persistence.lock().await;
-        let snapshot = {
-            let mut state = self.inner.state.lock().unwrap();
-            let task = state
-                .tasks
-                .get_mut(id)
-                .ok_or_else(|| anyhow!("Unknown delegated task ID"))?;
-            change(task);
-            task["updatedAt"] = json!(now());
-            task.clone()
-        };
-        atomic(&self.inner.dir.join(format!("{id}.json")), &snapshot).await
+        let mut snapshot = self.task(id)?;
+        change(&mut snapshot);
+        snapshot["updatedAt"] = json!(now());
+        atomic(&self.inner.dir.join(format!("{id}.json")), &snapshot).await?;
+        self.inner
+            .state
+            .lock()
+            .unwrap()
+            .tasks
+            .insert(id.to_owned(), snapshot);
+        Ok(())
     }
     fn task(&self, id: &str) -> Result<Value> {
         self.inner
@@ -406,7 +406,11 @@ impl Delegation {
             })
             .await?;
             if let Some(old) = predecessor {
-                self.update(old, |_| {}).await?;
+                self.update(old, |task| {
+                    task["state"] = json!("superseded");
+                    task["replacement"] = json!(id);
+                })
+                .await?;
             }
             Ok::<_, anyhow::Error>(())
         }
@@ -679,23 +683,19 @@ impl Delegation {
         self.check_retry(id).await?;
         let replacement = task_id();
         let next = json!({"id":replacement,"task":task["task"],"settings":task["settings"],"state":"queued","createdAt":now(),"consecutiveFailures":task["consecutiveFailures"].as_u64().unwrap_or(0),"outputFailures":task["outputFailures"].as_u64().unwrap_or(0),"replaces":id,"operatorResumeEpoch":self.inner.epoch});
-        {
-            let mut state = self.inner.state.lock().unwrap();
-            let old = state.tasks.get_mut(id).unwrap();
-            old["state"] = json!("superseded");
-            old["replacement"] = json!(replacement);
-            state.tasks.insert(replacement.clone(), next);
-        }
+        self.inner
+            .state
+            .lock()
+            .unwrap()
+            .tasks
+            .insert(replacement.clone(), next);
         let result = self.launch(&replacement, Some(id)).await;
         if result.is_err() {
             self.inner.state.lock().unwrap().tasks.remove(&replacement);
-            self.update(id, |t| {
-                t["state"] = json!("paused");
-                remove(t, &["replacement"]);
-            })
-            .await?;
+            let rollback = self.update(id, |t| *t = task).await;
             let _ =
                 tokio::fs::remove_file(self.inner.dir.join(format!("{replacement}.json"))).await;
+            rollback?;
         }
         result
     }
@@ -742,6 +742,162 @@ mod tests {
         d.call("wait_review_task", &json!({"id":id,"timeoutMs":30000}))
             .await
             .unwrap()
+    }
+    async fn paused_task(d: &Delegation, session: Option<&str>) -> Value {
+        let mut task = json!({"id":"ab12","task":"inspect","createdAt":now(),"state":"paused","settings":d.inner.context["job"]["settings"],"consecutiveFailures":1,"outputFailures":1,"errorKind":"transient","nextAttemptAt":0});
+        task["settings"]["subagents"]["max"] = json!(0);
+        if let Some(session) = session {
+            task["session"] = json!(session);
+        }
+        atomic(&d.inner.dir.join("ab12.json"), &task).await.unwrap();
+        d.inner
+            .state
+            .lock()
+            .unwrap()
+            .tasks
+            .insert("ab12".into(), task.clone());
+        task
+    }
+    // A directory at the destination makes atomic rename fail even when tests run as root.
+    async fn block_task_write(d: &Delegation, id: &str) -> (PathBuf, PathBuf) {
+        let path = d.inner.dir.join(format!("{id}.json"));
+        let saved = path.with_extension("saved");
+        tokio::fs::rename(&path, &saved).await.unwrap();
+        tokio::fs::create_dir(&path).await.unwrap();
+        (path, saved)
+    }
+    async fn unblock_task_write(path: &Path, saved: &Path) {
+        tokio::fs::remove_dir(path).await.unwrap();
+        tokio::fs::rename(saved, path).await.unwrap();
+    }
+    #[tokio::test]
+    async fn failed_resume_persistence_preserves_paused_task_and_releases_slot() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tmp = tempfile::tempdir().unwrap();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let count = runs.clone();
+        let runner: Runner = Arc::new(move |_, _, _, _, _, _| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(json!({"summary":"done","findings":[]})) })
+        });
+        let d = Delegation::init_with_runner(context(tmp.path(), 1), runner)
+            .await
+            .unwrap();
+        let original = paused_task(&d, Some("saved-session")).await;
+        let (path, saved) = block_task_write(&d, "ab12").await;
+        assert!(
+            d.call("resume_review_task", &json!({"id":"ab12"}))
+                .await
+                .is_err()
+        );
+        assert_eq!(d.task("ab12").unwrap(), original);
+        assert_eq!(d.view("ab12").unwrap()["canResume"], true);
+        assert!(d.inner.state.lock().unwrap().active.is_empty());
+        assert_eq!(d.inner.slots.available_permits(), 1);
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&tokio::fs::read(&saved).await.unwrap()).unwrap(),
+            original
+        );
+        unblock_task_write(&path, &saved).await;
+        d.call("resume_review_task", &json!({"id":"ab12"}))
+            .await
+            .unwrap();
+        assert_eq!(complete(&d, "ab12").await["state"], "completed");
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn failed_restart_predecessor_save_keeps_original_retryable_and_removes_replacement() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tmp = tempfile::tempdir().unwrap();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let count = runs.clone();
+        let runner: Runner = Arc::new(move |_, _, _, _, _, _| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(json!({"summary":"done","findings":[]})) })
+        });
+        let d = Delegation::init_with_runner(context(tmp.path(), 1), runner)
+            .await
+            .unwrap();
+        let original = paused_task(&d, None).await;
+        // Replacement persistence succeeds; both predecessor persistence and rollback fail.
+        let (path, saved) = block_task_write(&d, "ab12").await;
+        assert!(
+            d.call("restart_review_task", &json!({"id":"ab12"}))
+                .await
+                .is_err()
+        );
+        assert_eq!(d.task("ab12").unwrap(), original);
+        assert_eq!(d.view("ab12").unwrap()["canRestart"], true);
+        assert_eq!(d.inner.state.lock().unwrap().tasks.len(), 1);
+        assert!(d.inner.state.lock().unwrap().active.is_empty());
+        assert_eq!(d.inner.slots.available_permits(), 1);
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        let mut entries = tokio::fs::read_dir(&d.inner.dir).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            assert!(
+                entry.path() == path || entry.path() == saved,
+                "orphaned replacement: {:?}",
+                entry.path()
+            );
+        }
+        unblock_task_write(&path, &saved).await;
+        let restarted = d
+            .call("restart_review_task", &json!({"id":"ab12"}))
+            .await
+            .unwrap();
+        let id = restarted["id"].as_str().unwrap();
+        assert_eq!(complete(&d, id).await["state"], "completed");
+        assert_eq!(d.view("ab12").unwrap()["state"], "superseded");
+        assert_eq!(d.view("ab12").unwrap()["replacement"], id);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn failed_final_save_does_not_publish_report_and_preserves_saved_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let signal = ready.clone();
+        let gate = release.clone();
+        let runner: Runner = Arc::new(move |_, _, _, _, callbacks, _| {
+            let ready = signal.clone();
+            let release = gate.clone();
+            Box::pin(async move {
+                callbacks.on_session.unwrap()(json!("saved-session")).await?;
+                ready.notify_one();
+                release.notified().await;
+                Ok(json!({"summary":"done","findings":[]}))
+            })
+        });
+        let d = Delegation::init_with_runner(context(tmp.path(), 1), runner)
+            .await
+            .unwrap();
+        let started = d
+            .call("start_review_task", &json!({"task":"inspect"}))
+            .await
+            .unwrap();
+        let id = started["id"].as_str().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), ready.notified())
+            .await
+            .unwrap();
+        let (path, saved) = block_task_write(&d, id).await;
+        release.notify_one();
+        let status = complete(&d, id).await;
+        assert_eq!(status["state"], "paused");
+        assert_eq!(status["canResume"], true);
+        assert!(status.get("report").is_none());
+        assert_eq!(d.task(id).unwrap()["session"], "saved-session");
+        assert_eq!(d.inner.slots.available_permits(), 1);
+        unblock_task_write(&path, &saved).await;
+        d.call("resume_review_task", &json!({"id":id}))
+            .await
+            .unwrap();
+        release.notify_one();
+        assert_eq!(complete(&d, id).await["report"]["summary"], "done");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&tokio::fs::read(&path).await.unwrap()).unwrap()["state"],
+            "completed"
+        );
     }
     #[tokio::test]
     async fn concurrency_is_reserved_before_launch_and_close_saves_sessions() {

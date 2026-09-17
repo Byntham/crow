@@ -214,7 +214,24 @@ impl GitHub {
             origin: origin.into().trim_end_matches('/').into(),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
-                .redirect(reqwest::redirect::Policy::none())
+                .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                    // GitHub redirects renamed repositories. Permit those without
+                    // sending credentials to another origin or following loops forever.
+                    let target = attempt.url();
+                    let same_origin = attempt
+                        .previous()
+                        .first()
+                        .is_some_and(|initial| initial.origin() == target.origin());
+                    if !same_origin
+                        || !target.username().is_empty()
+                        || target.password().is_some()
+                        || attempt.previous().len() > 10
+                    {
+                        attempt.stop()
+                    } else {
+                        attempt.follow()
+                    }
+                }))
                 .build()
                 .expect("TLS client initialization"),
         }
@@ -774,7 +791,7 @@ mod tests {
         h.abort();
     }
     #[tokio::test]
-    async fn bearer_requests_never_follow_redirects() {
+    async fn bearer_requests_never_follow_cross_origin_redirects() {
         let (gh, m, h) = mock(None).await;
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -789,6 +806,136 @@ mod tests {
         assert_eq!(error.downcast_ref::<GitHubError>().unwrap().status, 302);
         assert_eq!(m.calls.lock().unwrap().len(), 1);
         h.abort();
+    }
+    #[tokio::test]
+    async fn renamed_repository_redirects_preserve_authentication_and_method_semantics() {
+        let (gh, m, h) = mock(None).await;
+        let mut headers = HeaderMap::new();
+        headers.insert("location", "/repositories/42/pulls/3".parse().unwrap());
+        m.push(301, headers, Value::Null);
+        m.json(valid_pr());
+        assert_eq!(
+            gh.pr(&repo(), 3, "installation-token").await.unwrap()["number"],
+            3
+        );
+        {
+            let calls = m.calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[1].path, "/repositories/42/pulls/3");
+            assert_eq!(calls[1].method, "GET");
+            assert_eq!(
+                calls[1].headers["authorization"],
+                "Bearer installation-token"
+            );
+        }
+        // Temporary/permanent redirects retain a publication request and its body.
+        for status in [307, 308] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "location",
+                format!("{}/repositories/42/pulls/3/reviews", gh.origin)
+                    .parse()
+                    .unwrap(),
+            );
+            m.push(status, headers, Value::Null);
+            m.json(json!({"id":5,"html_url":"https://github.com/new/name/pull/3#review-5"}));
+            gh.publish(&repo(), 3, "installation-token", "review text", "head", &[])
+                .await
+                .unwrap();
+            let calls = m.calls.lock().unwrap();
+            let request = calls.last().unwrap();
+            assert_eq!(request.method, "POST");
+            assert_eq!(
+                request.body,
+                json!({"commit_id":"head","event":"COMMENT","body":"review text","comments":[]})
+            );
+            assert_eq!(
+                request.headers["authorization"],
+                "Bearer installation-token"
+            );
+        }
+        h.abort();
+    }
+    #[tokio::test]
+    async fn redirects_follow_fetch_post_rewrite_semantics() {
+        let (gh, m, h) = mock(None).await;
+        for status in [301, 302, 303] {
+            let mut headers = HeaderMap::new();
+            headers.insert("location", "/result".parse().unwrap());
+            m.push(status, headers, Value::Null);
+            m.json(json!({"ok":true}));
+            assert_eq!(
+                gh.request(
+                    "/submit",
+                    Some("token"),
+                    "POST",
+                    Some(&json!({"request":true}))
+                )
+                .await
+                .unwrap(),
+                json!({"ok":true})
+            );
+            let calls = m.calls.lock().unwrap();
+            let request = calls.last().unwrap();
+            assert_eq!(request.method, "GET");
+            assert_eq!(request.body, Value::Null);
+            assert!(!request.headers.contains_key("content-type"));
+        }
+        h.abort();
+    }
+    #[tokio::test]
+    async fn redirect_chains_stop_at_foreign_origins_or_embedded_credentials() {
+        let (gh, m, h) = mock(None).await;
+        let (foreign, fm, fh) = mock(None).await;
+        for location in [
+            format!("{}/collect", foreign.origin),
+            gh.origin.replacen("http://", "http://user:password@", 1) + "/collect",
+        ] {
+            let mut first = HeaderMap::new();
+            first.insert("location", "/same-origin".parse().unwrap());
+            m.push(307, first, Value::Null);
+            let mut second = HeaderMap::new();
+            second.insert("location", location.parse().unwrap());
+            m.push(307, second, Value::Null);
+            let before = m.calls.lock().unwrap().len();
+            let error = gh
+                .request(
+                    "/app",
+                    Some("app-secret"),
+                    "POST",
+                    Some(&json!({"secret":"payload"})),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.downcast_ref::<GitHubError>().unwrap().status, 307);
+            assert_eq!(m.calls.lock().unwrap().len(), before + 2);
+            assert!(fm.calls.lock().unwrap().is_empty());
+        }
+        h.abort();
+        fh.abort();
+    }
+    #[tokio::test]
+    async fn redirect_loops_and_long_chains_are_bounded() {
+        for cyclic in [true, false] {
+            let (gh, m, h) = mock(None).await;
+            for index in 0..11 {
+                let mut headers = HeaderMap::new();
+                let location = if cyclic {
+                    "/start".to_owned()
+                } else {
+                    format!("/step-{}", index + 1)
+                };
+                headers.insert("location", location.parse().unwrap());
+                m.push(301, headers, Value::Null);
+            }
+            let error = gh
+                .request("/start", Some("token"), "GET", None)
+                .await
+                .unwrap_err();
+            assert_eq!(error.downcast_ref::<GitHubError>().unwrap().status, 301);
+            assert_eq!(m.calls.lock().unwrap().len(), 11);
+            h.abort();
+        }
     }
     #[tokio::test]
     async fn status_discovery_checks_author_and_recreates_deleted_comment() {

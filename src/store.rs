@@ -200,6 +200,20 @@ impl Store {
         })
     }
     pub fn update_job(&self, key: &str, patch: &Value, lease: Option<&str>) -> Result<Value> {
+        self.edit_job(key, lease, |job| {
+            job.as_object_mut()
+                .context("Invalid persisted job")?
+                .extend(patch.as_object().context("Invalid job patch")?.clone());
+            Ok(())
+        })
+    }
+    /// Edit a freshly loaded job under its lease, including removal of optional fields.
+    pub fn edit_job(
+        &self,
+        key: &str,
+        lease: Option<&str>,
+        edit: impl FnOnce(&mut Value) -> Result<()>,
+    ) -> Result<Value> {
         self.tx(|store| {
             let mut job = store.get("jobs", key)?.context("Review ownership lost")?;
             if let Some(lease) = lease.filter(|s| !s.is_empty())
@@ -207,9 +221,7 @@ impl Store {
             {
                 bail!("Review ownership lost");
             }
-            job.as_object_mut()
-                .context("Invalid persisted job")?
-                .extend(patch.as_object().context("Invalid job patch")?.clone());
+            edit(&mut job)?;
             job["updatedAt"] = json!(now());
             store.put("jobs", key, &job)?;
             Ok(job)

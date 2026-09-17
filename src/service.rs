@@ -1017,7 +1017,26 @@ impl Service {
                         string(v, field)?;
                     }
                 }
-                self.update(id,json!({"comparison":c,"guidanceFingerprint":a["guidanceFingerprint"],"guidanceTargetSha":a.get("guidanceTargetSha").unwrap_or(&c["targetSha"])}),Some(lease))?;
+                self.db(|db| {
+                    db.edit_job(id, Some(lease), |current| {
+                        current["comparison"] = c.clone();
+                        current["guidanceTargetSha"] = a
+                            .get("guidanceTargetSha")
+                            .unwrap_or(&c["targetSha"])
+                            .clone();
+                        // Undefined in the worker protocol means absent in saved
+                        // jobs and review markers, never an explicit JSON null.
+                        if let Some(fingerprint) = a.get("guidanceFingerprint") {
+                            current["guidanceFingerprint"] = fingerprint.clone();
+                        } else {
+                            current
+                                .as_object_mut()
+                                .ok_or_else(|| anyhow!("Invalid job"))?
+                                .remove("guidanceFingerprint");
+                        }
+                        Ok(())
+                    })
+                })?;
                 Ok(json!({"ok":true}))
             }
             "report" => {
@@ -1929,6 +1948,72 @@ mod tests {
         assert_eq!(f.claim().await["id"], new["id"]);
         f.close().await;
     }
+    #[tokio::test]
+    async fn comparison_without_guidance_remains_resumable_and_reconcilable() {
+        let f = Fixture::new().await;
+        let job = f.prepared().await;
+        assert!(f.job(s(&job, "id")).get("guidanceFingerprint").is_none());
+        f.handle
+            .service
+            .update(s(&job, "id"), json!({"state":"queued"}), None)
+            .unwrap();
+        let dispatch = f.worker("next", json!({"active":[]})).await.unwrap();
+        crate::worker::validate_response(
+            &config::defaults(f.root.path()),
+            "next",
+            dispatch.clone(),
+        )
+        .unwrap();
+        let resumed = &dispatch["job"];
+        f.report(resumed).await;
+        f.publish_tick().await;
+        let published = f.github.published.lock().unwrap()[0].clone();
+        let metadata = report::metadata(s(&published, "body")).unwrap();
+        assert_eq!(metadata["job"], job["id"]);
+        assert!(metadata.get("guidance").is_none());
+
+        // A lost acknowledgment must reconcile the authenticated review marker
+        // instead of publishing the same completed report a second time.
+        f.github.reviews.lock().unwrap().push(json!({
+            "user":{"id":42},"body":published["body"],
+            "html_url":"https://github.com/owner/project/pull/1#pullrequestreview-1"
+        }));
+        f.handle
+            .service
+            .update(s(&job, "id"), json!({"state":"publishing"}), None)
+            .unwrap();
+        f.publish_tick().await;
+        assert_eq!(f.job(s(&job, "id"))["state"], "completed");
+        assert_eq!(f.github.published.lock().unwrap().len(), 1);
+        f.close().await;
+    }
+
+    #[tokio::test]
+    async fn comparison_omission_clears_previous_guidance_but_null_is_invalid() {
+        let f = Fixture::new().await;
+        let job = f.prepared().await;
+        let mut args = json!({"id":job["id"],"lease":job["lease"],"comparison":comparison(),"guidanceFingerprint":"saved-guidance"});
+        f.worker("comparison", args.clone()).await.unwrap();
+        assert_eq!(
+            f.job(s(&job, "id"))["guidanceFingerprint"],
+            "saved-guidance"
+        );
+        args["guidanceFingerprint"] = Value::Null;
+        assert!(f.worker("comparison", args.clone()).await.is_err());
+        assert_eq!(
+            f.job(s(&job, "id"))["guidanceFingerprint"],
+            "saved-guidance"
+        );
+        args.as_object_mut().unwrap().remove("guidanceFingerprint");
+        f.worker("comparison", args).await.unwrap();
+        assert!(f.job(s(&job, "id")).get("guidanceFingerprint").is_none());
+        assert_eq!(
+            f.job(s(&job, "id"))["guidanceTargetSha"],
+            comparison()["targetSha"]
+        );
+        f.close().await;
+    }
+
     #[tokio::test]
     async fn report_requires_comparison_and_is_durable_before_publication() {
         let f = Fixture::new().await;
