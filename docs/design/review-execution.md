@@ -64,7 +64,7 @@ Rule changes apply when the next review starts and do not automatically queue ex
 
 ## Manual requests and replies
 
-The operator can request a review through the terminal. On GitHub, `@crow review` requests another review, including for an unchanged commit. GitHub requests are limited to the operator and explicitly authorized accounts. The PR must still satisfy the enrolled repository's author policy and draft restrictions. Requests for a revision already queued or running do not create duplicate jobs.
+The operator can request a review through the terminal. On GitHub, `/crow review` requests another review, including for an unchanged commit. GitHub requests are limited to the operator and explicitly authorized accounts. The PR must still satisfy the enrolled repository's author policy and draft restrictions. Requests for a revision already queued or running do not create duplicate jobs.
 
 When usable incomplete session state exists for the same PR comparison, an ordinary review request resumes it. If the comparison has already received a completed review, the request starts a fresh review. A separate explicit restart command begins the analysis again instead of continuing the saved session.
 

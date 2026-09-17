@@ -29,6 +29,6 @@ An installation lives in `~/.local/share/crow`. Set `CROW_HOME` before invoking 
 
 If port 8787 is already occupied, choose another local port before onboarding with `crow setup --port 9887`. An established installation needs an explicit route migration to change ports.
 
-A normal authorized PR event starts a review. Request one manually with `crow review owner/repo 123` or an authorized `@crow review` comment. Authorized PR conversation comments can also use `@crow resume`, `@crow restart`, and `@crow pause`. Manual requests still respect draft and author policies.
+A normal authorized PR event starts a review. Request one manually with `crow review owner/repo 123` or an authorized `/crow review` comment. Authorized PR conversation comments can also use `/crow resume`, `/crow restart`, and `/crow pause`. Post the command as the entire comment. The older `@crow` prefix remains supported for compatibility, but `/crow` avoids mentioning an unrelated GitHub account. Manual requests still respect draft and author policies.
 
 If setup stops, fix the reported issue and rerun it. Saved App credentials, model selections, and existing repository policies are retained. Re-running setup does not reset an enrolled repository's backlog policy.

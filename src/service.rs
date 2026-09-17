@@ -399,7 +399,7 @@ impl Service {
             body.push_str(&format!("\n\n[Read review]({})", s(j, "reviewUrl")));
         }
         if state == "paused" {
-            body.push_str("\n\nComment `@crow resume` to continue saved work, or `@crow restart` to start again.");
+            body.push_str("\n\nComment `/crow resume` to continue saved work, or `/crow restart` to start again.");
         }
         let key = s(j, "key");
         let prev = self.get("status", key)?;
@@ -1214,7 +1214,8 @@ fn extract_event(event_type: &str, payload: &Value) -> Result<Value> {
             let comment = &payload["comment"];
             let command = comment["body"].as_str().unwrap_or("").trim();
             let command = command
-                .strip_prefix("@crow ")
+                .strip_prefix("/crow ")
+                .or_else(|| command.strip_prefix("@crow "))
                 .filter(|c| ["review", "resume", "restart", "pause"].contains(c));
             out["request"] = json!(command.is_some());
             if let Some(command) = command {
@@ -1604,6 +1605,67 @@ mod tests {
     use sha2::Sha256;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::Semaphore;
+
+    #[test]
+    fn pr_comment_commands_accept_slash_and_legacy_prefixes() {
+        for prefix in ["/crow", "@crow"] {
+            for command in ["review", "resume", "restart", "pause"] {
+                let payload = json!({
+                    "action": "created",
+                    "repository": {"full_name": "owner/project"},
+                    "issue": {"number": 1, "pull_request": {}},
+                    "comment": {
+                        "body": format!(" \n{prefix} {command}\n "),
+                        "user": {"login": "alice"}
+                    }
+                });
+                let event = extract_event("issue_comment", &payload).unwrap();
+                assert_eq!(event["request"], true);
+                assert_eq!(event["command"], command);
+                assert_eq!(event["actor"], "alice");
+                assert_eq!(event["number"], 1);
+            }
+        }
+    }
+
+    #[test]
+    fn pr_comment_commands_ignore_prose_quotes_and_other_events() {
+        for prefix in ["/crow", "@crow"] {
+            let mut payload = json!({
+                "action": "created",
+                "repository": {"full_name": "owner/project"},
+                "issue": {"number": 1, "pull_request": {}},
+                "comment": {"user": {"login": "alice"}}
+            });
+            for body in [
+                prefix.to_owned(),
+                format!("{prefix} unknown"),
+                format!("{prefix} review please"),
+                format!("Please run {prefix} review"),
+                format!("{prefix} review\n{prefix} pause"),
+                format!("`{prefix} pause`"),
+                format!("```\n{prefix} pause\n```"),
+                format!("> {prefix} pause"),
+            ] {
+                payload["comment"]["body"] = json!(body);
+                let event = extract_event("issue_comment", &payload).unwrap();
+                assert_eq!(event["request"], false, "{body}");
+                assert!(event.get("command").is_none(), "{body}");
+            }
+            payload["comment"]["body"] = json!(format!("{prefix} review"));
+            payload["action"] = json!("edited");
+            assert_eq!(
+                extract_event("issue_comment", &payload).unwrap()["type"],
+                "ignored"
+            );
+            payload["action"] = json!("created");
+            payload["issue"]["pull_request"] = Value::Null;
+            assert_eq!(
+                extract_event("issue_comment", &payload).unwrap()["type"],
+                "ignored"
+            );
+        }
+    }
 
     struct Gate {
         entered: Semaphore,
