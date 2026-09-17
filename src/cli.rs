@@ -226,7 +226,7 @@ Editable settings:
   worker.subagents, worker.retry (JSON objects)
   catchUp.enabled, catchUp.threshold, auditIntervalMs, retentionDays
 
-Choose MODEL from crow models. Use null to reset the model or reasoning level.
+Choose the model and reasoning level from crow models.
 Restart Crow after changes with crow service-restart."
     )]
     Config {
@@ -302,7 +302,7 @@ fn setting_value(key: &str, input: &str) -> Result<Value> {
         }
         if input.starts_with('"') {
             return serde_json::from_str(input)
-                .context("Use a model or reasoning level as plain text, or null to reset it");
+                .context("Use a model or reasoning level as plain text; see crow models");
         }
         return Ok(json!(input));
     }

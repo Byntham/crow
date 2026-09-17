@@ -789,11 +789,8 @@ pub async fn install_command(root: &Path, no_setup: bool) -> Result<()> {
         );
     }
     let quote = |p: &Path| format!("'{}'", p.to_string_lossy().replace('\'', "'\"'\"'"));
-    let command = if on_path {
-        "crow".to_owned()
-    } else {
-        quote(&bin.join("crow"))
-    };
+    // PATH can contain the installation directory after an older Crow executable.
+    let command = quote(&bin.join("crow"));
     let default_root = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?)
         .join(".local/share/crow");
     let prefix = if absolute(root)? == absolute(&default_root)? {

@@ -29,7 +29,7 @@ Author policy determines whose PRs Crow can review. Requester policy separately 
 
 `crow config` hides credentials. Model names and reasoning levels come from `crow models`; Crow does not maintain a model list in its source. If retrieval fails, Crow marks the last successful catalog as cached and reports the error. Saved explicit selections do not change when provider defaults change.
 
-Model and effort settings accept plain text. Numbers, booleans, and nested settings use JSON values. `crow config worker.model null` restores the provider default. Use `crow config --format json` to inspect the full configuration with credentials hidden.
+Model and effort settings accept plain text. Numbers, booleans, and nested settings use JSON values. Choose an available model and reasoning level from `crow models`; reviews require both selections. Use `crow config --format json` to inspect the full configuration with credentials hidden.
 
 Workers default to three active PR reviews, with up to eight subagents each. The subagent limit is a ceiling. `inherit` uses the parent model and effort; `configured` requires `model` and `effort` in the subagent settings. There is no mode allowing a reviewer to choose its own model policy.
 

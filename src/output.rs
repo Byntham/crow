@@ -345,7 +345,7 @@ fn status(v: &Value) -> String {
                     if w["lastSeen"].as_i64().unwrap_or(0) == 0 {
                         "Awaiting connection".into()
                     } else {
-                        scalar(&w["defaults"]["model"]).replace("Not set", "Provider default")
+                        scalar(&w["defaults"]["model"]).replace("Not set", "Not configured")
                     },
                 ]
             })
@@ -606,7 +606,7 @@ fn settings(out: &mut String, v: &Value) {
                 out,
                 label,
                 if value.is_null() {
-                    "Provider default".into()
+                    "Not configured; choose with crow models".into()
                 } else {
                     scalar(value)
                 },
@@ -890,7 +890,7 @@ mod tests {
         ] {
             assert!(!output.contains(secret));
         }
-        assert!(output.contains("Provider default"));
+        assert!(output.contains("Not configured; choose with crow models"));
         assert!(output.contains("No limit"));
         assert!(output.contains("1 hour"));
     }
