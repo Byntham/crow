@@ -53,6 +53,44 @@ async fn ask(label: &str, fallback: &str) -> Result<String> {
     .await?
 }
 
+async fn choose(label: &str, fallback: &str, choices: &[(&str, &str)]) -> Result<String> {
+    println!("\n{label}");
+    for (index, (value, description)) in choices.iter().enumerate() {
+        if description.is_empty() || description == value {
+            println!("  {}. {value}", index + 1);
+        } else {
+            println!("  {}. {value:<12} {description}", index + 1);
+        }
+    }
+    loop {
+        let answer = ask("Choose a number or name", fallback).await?;
+        if let Ok(number) = answer.parse::<usize>()
+            && let Some((value, _)) = number.checked_sub(1).and_then(|i| choices.get(i))
+        {
+            return Ok((*value).to_owned());
+        }
+        if let Some((value, _)) = choices
+            .iter()
+            .find(|(value, _)| value.eq_ignore_ascii_case(&answer))
+        {
+            return Ok((*value).to_owned());
+        }
+        println!("Choose one of the options above. Press Enter to keep {fallback}.");
+    }
+}
+
+async fn confirm(label: &str, fallback: bool) -> Result<bool> {
+    loop {
+        let answer = ask(label, if fallback { "Y/n" } else { "y/N" }).await?;
+        match answer.to_ascii_lowercase().as_str() {
+            "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            "y/n" => return Ok(fallback),
+            _ => println!("Enter yes or no."),
+        }
+    }
+}
+
 pub async fn ensure_command(command: &str) -> Result<()> {
     if operations::run(command, &["--version"], false)
         .await
@@ -61,12 +99,11 @@ pub async fn ensure_command(command: &str) -> Result<()> {
         return Ok(());
     }
     if !cfg!(target_os = "linux")
-        || ask(
-            &format!("{command} is missing. Install the official Linux package using sudo? yes/no"),
-            "yes",
+        || !confirm(
+            &format!("{command} is missing. Install the official Linux package using sudo?"),
+            true,
         )
         .await?
-            != "yes"
     {
         bail!("Install {command}, then rerun crow setup.");
     }
@@ -181,7 +218,10 @@ async fn tailscale_mutate(args: &[&str]) -> Result<()> {
     match operations::run("tailscale", args, true).await {
         Ok(_) => Ok(()),
         Err(error) => {
-            if ask("Tailscale did not complete the command. If it reported missing system permissions, retry this command with sudo? yes/no", "no").await? != "yes" { return Err(error); }
+            println!("Tailscale could not complete the command. Check its message above.");
+            if !confirm("If it needs system permissions, retry with sudo?", false).await? {
+                return Err(error);
+            }
             let mut sudo = vec!["tailscale"];
             sudo.extend_from_slice(args);
             operations::run("sudo", &sudo, true).await?;
@@ -354,6 +394,13 @@ fn html_escape(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+fn setup_page(title: &str, step: &str, body: &str) -> String {
+    include_str!("setup_page.html")
+        .replace("__TITLE__", &html_escape(title))
+        .replace("__STEP__", &html_escape(step))
+        .replace("__BODY__", body)
+}
+
 struct RegistrationState {
     config: Mutex<Value>,
     root: PathBuf,
@@ -399,10 +446,14 @@ async fn registration_handler(
     if util::equal(uri.path(), &state.secret_path) {
         return setup_response(
             StatusCode::OK,
-            format!(
-                "<!doctype html><meta charset=\"utf-8\"><title>Set up Crow</title><h1>Create your Crow GitHub App</h1><p>GitHub will ask you to confirm the App. Then return here to install it.</p><form action=\"{}\" method=\"post\"><input type=\"hidden\" name=\"manifest\" value=\"{}\"><button>Create GitHub App</button></form>",
-                html_escape(&state.action),
-                html_escape(&state.manifest.to_string())
+            setup_page(
+                "Connect Crow to GitHub",
+                "Step 1 of 2 · Create your app",
+                &format!(
+                    "<p>Create a GitHub App so Crow can read pull requests and post reviews on your behalf.</p><p>GitHub will show the requested permissions and ask you to confirm. You will then choose which repositories Crow can access.</p><form action=\"{}\" method=\"post\"><input type=\"hidden\" name=\"manifest\" value=\"{}\"><button>Create GitHub App</button></form><p class=\"note\">Keep your Crow setup terminal open while you complete these steps.</p>",
+                    html_escape(&state.action),
+                    html_escape(&state.manifest.to_string())
+                ),
             ),
             "text/html",
         );
@@ -432,8 +483,12 @@ async fn registration_handler(
     {
         return setup_response(
             StatusCode::BAD_REQUEST,
-            "Invalid or already used setup callback. Return to your terminal.".into(),
-            "text/plain",
+            setup_page(
+                "This setup link is no longer valid",
+                "Return to your terminal",
+                "<p>The link may have already been used, or it may belong to another setup session.</p><p>Check your Crow setup terminal for the next step. If setup has stopped, run <code>crow setup</code> to continue.</p>",
+            ),
+            "text/html",
         );
     }
     let result: Result<String> = async {
@@ -446,15 +501,19 @@ async fn registration_handler(
         config::save(&state.root, &config)?;
         let mut install = url::Url::parse("https://github.com/apps/")?;
         install.path_segments_mut().map_err(|_| anyhow::anyhow!("Invalid GitHub URL"))?.pop_if_empty().push(string(&app, "slug")).push("installations").push("new");
-        Ok(format!("<!doctype html><meta charset=\"utf-8\"><h1>App created</h1><p><a href=\"{}\">Install Crow and select repositories</a>, then return to your terminal.</p>",html_escape(install.as_str())))
+        Ok(setup_page("Your GitHub App is ready", "Step 2 of 2 · Choose repositories", &format!("<p>Install your app on GitHub and choose the repositories it can access.</p><a class=\"button\" href=\"{}\">Choose repositories on GitHub</a><p>Then return to your terminal and press Enter to continue setup.</p><p class=\"note\">You will choose which repositories Crow should review in the terminal.</p>",html_escape(install.as_str()))))
     }.await;
     let (response, outcome) = match result {
         Ok(body) => (setup_response(StatusCode::OK, body, "text/html"), Ok(())),
         Err(error) => (
             setup_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "Setup failed. See the Crow terminal for details.".into(),
-                "text/plain",
+                setup_page(
+                    "Could not finish connecting to GitHub",
+                    "Return to your terminal",
+                    "<p>Crow could not complete the GitHub App registration.</p><p>Your Crow setup terminal has the error details. Resolve the issue there, then run <code>crow setup</code> to continue.</p>",
+                ),
+                "text/html",
             ),
             Err(error),
         ),
@@ -473,14 +532,15 @@ pub async fn register_app(config: &mut Value, root: &Path) -> Result<()> {
         .filter(|v| v.is_object())
         .cloned()
         .unwrap_or_else(|| json!({"ownerType":"personal","visibility":"public"}));
-    let owner_type = ask(
-        "GitHub App owner: personal or organization",
+    let owner_type = choose(
+        "Who should own the GitHub App?",
         string(&previous, "ownerType"),
+        &[
+            ("personal", "Your GitHub account"),
+            ("organization", "A GitHub organization you administer"),
+        ],
     )
     .await?;
-    if !matches!(owner_type.as_str(), "personal" | "organization") {
-        bail!("Choose personal or organization App ownership");
-    }
     let organization = if owner_type == "organization" {
         Some(
             ask(
@@ -493,16 +553,17 @@ pub async fn register_app(config: &mut Value, root: &Path) -> Result<()> {
         None
     };
     println!(
-        "A public App can be installed on your personal and organization accounts. No Marketplace listing is created; only repositories you explicitly enroll can use Crow. A private App is limited to its owning account."
+        "\nThis does not change repository visibility or create a Marketplace listing.\nCrow reviews only repositories you enroll."
     );
-    let visibility = ask(
-        "App installation scope: public or private",
+    let visibility = choose(
+        "Where can this app be installed?",
         string(&previous, "visibility"),
+        &[
+            ("public", "Personal and organization accounts"),
+            ("private", "Only the app owner's account"),
+        ],
     )
     .await?;
-    if !matches!(visibility.as_str(), "public" | "private") {
-        bail!("Choose public or private App visibility");
-    }
     config["appRegistration"] = json!({"ownerType":owner_type,"visibility":visibility});
     if let Some(organization) = organization {
         config["appRegistration"]["organization"] = json!(organization);
@@ -554,7 +615,7 @@ pub async fn register_app(config: &mut Value, root: &Path) -> Result<()> {
             .await
     });
     println!(
-        "Open this URL on your desktop: {}/setup/{secret}",
+        "\nOpen this link in your browser to connect GitHub:\n  {}/setup/{secret}\n\nWaiting for GitHub. Keep this terminal open.",
         string(config, "publicUrl")
     );
     let result = tokio::select! {
@@ -940,22 +1001,48 @@ pub async fn setup(root: &Path, options: &Value) -> Result<()> {
         Some(value) if !value.is_null() => config::load(root)?,
         _ => config::defaults(root),
     };
+    println!(
+        "\nCrow setup\n\nConnect GitHub, choose a review model, and start Crow in the background.\nPress Enter to accept the value in brackets. You can rerun crow setup to continue."
+    );
     let role = match options["role"].as_str() {
         Some(role) => role.to_owned(),
-        None => ask("Role: both, service, or worker", string(&config, "role")).await?,
+        None => {
+            choose(
+                "What should run on this machine?",
+                string(&config, "role"),
+                &[
+                    (
+                        "both",
+                        "Receive GitHub events and run reviews. Recommended.",
+                    ),
+                    (
+                        "service",
+                        "Receive GitHub events; send reviews to another machine.",
+                    ),
+                    (
+                        "worker",
+                        "Run reviews for a Crow service on another machine.",
+                    ),
+                ],
+            )
+            .await?
+        }
     };
     if !matches!(role.as_str(), "both" | "service" | "worker") {
         bail!("Choose both, service, or worker");
     }
     validate_setup_role(&config, &role, root)?;
-    let executable = crate::install::install_downloaded(root).await?;
-    println!("Installed Crow at {}", executable.display());
+    crate::install::install_downloaded(root).await?;
+    println!(
+        "\nCrow installed. Settings and review history: {}",
+        root.display()
+    );
     let local_bin = user_home()?.join(".local/bin");
     if !std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         .any(|path| path == local_bin)
     {
         println!(
-            "Add ~/.local/bin to your PATH. For this shell, run: export PATH=\"$HOME/.local/bin:$PATH\""
+            "\nTo use the crow command in this terminal, run:\n  export PATH=\"$HOME/.local/bin:$PATH\""
         );
     }
     config["role"] = json!(role);
@@ -963,6 +1050,9 @@ pub async fn setup(root: &Path, options: &Value) -> Result<()> {
     config::save(root, &config)?;
     let mut identity = Value::Null;
     if role == "worker" {
+        println!(
+            "\nConnect this worker\nRun crow pair on your service machine, then enter its connection details."
+        );
         let previous = string(&config, "serviceUrl");
         config["serviceUrl"] = json!(util::https_url(
             &ask(
@@ -984,6 +1074,7 @@ pub async fn setup(root: &Path, options: &Value) -> Result<()> {
         config["worker"]["token"] = json!(token);
         config::save(root, &config)?;
     } else {
+        println!("\nConnect GitHub");
         ensure_command("gh").await?;
         identity = github_identity(true).await?;
         let operator = string(&config, "operator");
@@ -1001,9 +1092,20 @@ pub async fn setup(root: &Path, options: &Value) -> Result<()> {
             } else if let Some(ingress) = options["ingress"].as_str() {
                 ingress.to_owned()
             } else {
-                ask(
-                    "Public HTTPS: funnel, cloudflare, or existing",
+                println!(
+                    "\nGitHub needs a public HTTPS address to send pull request events to Crow."
+                );
+                choose(
+                    "How should GitHub reach this machine?",
                     string(&config["ingress"], "type"),
+                    &[
+                        ("funnel", "Tailscale Funnel. No domain needed."),
+                        (
+                            "cloudflare",
+                            "Cloudflare Tunnel. Use a domain in your account.",
+                        ),
+                        ("existing", "Use an HTTPS address you already manage."),
+                    ],
                 )
                 .await?
             };
@@ -1019,8 +1121,13 @@ pub async fn setup(root: &Path, options: &Value) -> Result<()> {
                     configure_cloudflare(&mut config, root, &hostname).await?;
                 }
                 "existing" => {
-                    config["publicUrl"] =
-                        json!(util::https_url(&ask("Public HTTPS origin", "").await?)?);
+                    config["publicUrl"] = json!(util::https_url(
+                        &ask(
+                            "Public HTTPS address, for example https://crow.example.com",
+                            ""
+                        )
+                        .await?
+                    )?);
                     config["ingress"] = json!({"type":"existing"});
                 }
                 _ => bail!("Choose funnel, cloudflare, or existing"),
@@ -1038,7 +1145,7 @@ pub async fn setup(root: &Path, options: &Value) -> Result<()> {
             bail!("GitHub App registration did not complete");
         }
         println!(
-            "Install/select repositories on your desktop: https://github.com/apps/{}/installations/new",
+            "\nInstall the app and choose repositories in your browser:\n  https://github.com/apps/{}/installations/new",
             string(&config["app"], "slug")
         );
         ask("Press Enter when the App is installed", "").await?;
@@ -1065,7 +1172,10 @@ pub async fn setup(root: &Path, options: &Value) -> Result<()> {
             );
             String::new()
         } else {
-            ask("Repositories to enroll, owner/name separated by commas; blank to keep current selection","").await?
+            println!(
+                "\nChoose repositories for automatic reviews\nEnter GitHub names such as owner/api, owner/website.\nOnly pull requests from your account will be reviewed by default.\nPress Enter to keep your current selection. Add repositories later with crow enroll."
+            );
+            ask("Repositories", "").await?
         };
         let mut enrolled: HashSet<String> = current["repos"]
             .as_array()
@@ -1083,32 +1193,40 @@ pub async fn setup(root: &Path, options: &Value) -> Result<()> {
                 continue;
             }
             let result = operations::admin(&config,"enroll",&json!({"repo":name,"githubToken":identity["token"],"worker":config["worker"]["id"],"policy":"selected","authors":[config["operator"]],"includeBacklog":false})).await?;
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!("{}", crate::output::render("enroll", &result));
         }
     }
     let result = operations::doctor(&config, root, true).await?;
-    println!("{}", serde_json::to_string_pretty(&result)?);
+    println!("{}", crate::output::render("doctor", &result));
     if result["ok"] != true {
         bail!("Some setup checks failed. Fix the reported issue and rerun crow setup.");
     }
     println!(
-        "Crow is running persistently. Setup did not start a test review. Use crow status to see activity."
+        "\nSetup complete. Crow is running in the background.\n\n  crow status     See connected repositories and review activity\n  crow doctor     Check your installation\n\nNo test review was started."
+    );
+    println!(
+        "{}",
+        match role.as_str() {
+            "worker" => "This worker will process reviews sent by your Crow service.",
+            "service" => "Pair a worker and enroll repositories to start reviews.",
+            _ => "New eligible pull requests in enrolled repositories will trigger reviews.",
+        }
     );
     Ok(())
 }
 
 async fn setup_provider(config: &mut Value, root: &Path) -> Result<()> {
+    println!("\nChoose how Crow reviews code");
     ensure_command("git").await?;
     if operations::run(string(&config["worker"], "codex"), &["--version"], false)
         .await
         .is_err()
     {
-        if ask(
-            "Codex is missing. Install the latest official standalone Codex package? yes/no",
-            "yes",
+        if !confirm(
+            "Codex is missing. Install the latest official standalone Codex package?",
+            true,
         )
         .await?
-            != "yes"
         {
             bail!("Install Codex and rerun setup.");
         }
@@ -1127,23 +1245,26 @@ async fn setup_provider(config: &mut Value, root: &Path) -> Result<()> {
         .as_array()
         .context("The provider returned no model catalog")?;
     let initial = models.iter().find(|model| model["isDefault"] == true).or_else(|| models.iter().find(|model| !string(&config["worker"],"model").is_empty() && model["model"] == config["worker"]["model"])).context("The provider did not report a default model. Retry model discovery before completing initial setup.")?;
-    for model in models {
-        println!(
-            "{}: {}",
-            model["model"].as_str().unwrap_or(string(model, "id")),
-            model["displayName"]
-                .as_str()
-                .unwrap_or(string(model, "model"))
-        );
-    }
     let previous = string(&config["worker"], "model");
-    let selected = ask(
+    let model_choices: Vec<_> = models
+        .iter()
+        .map(|model| {
+            (
+                model["model"].as_str().unwrap_or(string(model, "id")),
+                model["displayName"]
+                    .as_str()
+                    .unwrap_or(string(model, "model")),
+            )
+        })
+        .collect();
+    let selected = choose(
         "Review model",
         if previous.is_empty() {
             initial["model"].as_str().unwrap_or(string(initial, "id"))
         } else {
             previous
         },
+        &model_choices,
     )
     .await?;
     let model = models
@@ -1155,20 +1276,23 @@ async fn setup_provider(config: &mut Value, root: &Path) -> Result<()> {
         .as_array()
         .context("The selected model did not report reasoning levels")?;
     let previous = string(&config["worker"], "effort");
-    let effort = ask(
-        &format!(
-            "Reasoning level ({})",
-            efforts
-                .iter()
-                .filter_map(|e| e["reasoningEffort"].as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+    println!("\nHigher reasoning levels give the model more time to work on each review.");
+    let effort_choices: Vec<_> = efforts
+        .iter()
+        .filter_map(|effort| {
+            effort["reasoningEffort"]
+                .as_str()
+                .map(|name| (name, string(effort, "description")))
+        })
+        .collect();
+    let effort = choose(
+        "Reasoning level",
         if previous.is_empty() {
             string(model, "defaultReasoningEffort")
         } else {
             previous
         },
+        &effort_choices,
     )
     .await?;
     if !efforts.iter().any(|e| e["reasoningEffort"] == effort) {

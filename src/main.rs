@@ -3,7 +3,10 @@ use anyhow::Result;
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
-        eprintln!("Crow: {error:#}");
+        eprintln!("Error: {error}");
+        for cause in error.chain().skip(1) {
+            eprintln!("  Cause: {cause}");
+        }
         std::process::exit(1);
     }
 }

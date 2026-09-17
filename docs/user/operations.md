@@ -2,6 +2,10 @@
 
 Use `crow help` for command syntax. Configuration changes take effect after `crow service-restart`; stopping preserves interrupted work where the provider has saved a usable session.
 
+Commands show readable summaries by default. `crow status` lists repositories, workers, and recent reviews; `crow doctor` shows which checks passed and what needs attention. Review commands show the resulting state and relevant next steps.
+
+For scripts, add `--format json`, for example `crow status --format json`. This returns the structured result, including details omitted from the summary. Update notices go to stderr so they do not interrupt JSON output. `pair` and `cleanup` each return one JSON document. Interactive setup, login, installation, foreground execution, and streaming logs use text output.
+
 ## Review policy and settings
 
 ```sh
@@ -12,22 +16,28 @@ crow policy owner/repo --requesters alice,bob
 crow config
 crow models
 crow config worker.concurrency 3
-crow config worker.model '"provider-model-id"'
-crow config worker.effort '"high"'
+crow config worker.model provider-model-id
+crow config worker.effort high
 crow config worker.subagents '{"mode":"inherit","max":8}'
 crow config worker.retry '{"mode":"fixed","count":10,"delayMs":5000}'
-crow repo-config owner/repo --json '{"model":"provider-model-id","effort":"high"}'
+crow repo-config owner/repo --model provider-model-id --effort high
+crow repo-config owner/repo --timeout-seconds 1800
+crow repo-config owner/repo --reset
 ```
 
 Author policy determines whose PRs Crow can review. Requester policy separately determines who can trigger `@crow review`, `@crow resume`, `@crow restart`, or `@crow pause` in a PR comment; it defaults to the operator. Granting someone request permission does not authorize their own PRs or give them configuration access. `--requesters` changes only requester permission, and the target PR must still pass author and draft checks.
 
 `crow config` hides credentials. Model names and reasoning levels come from `crow models`; Crow does not maintain a model list in its source. If retrieval fails, Crow marks the last successful catalog as cached and reports the error. Saved explicit selections do not change when provider defaults change.
 
+Model and effort settings accept plain text. Numbers, booleans, and nested settings use JSON values. Choose an available model and reasoning level from `crow models`; reviews require both selections. Use `crow config --format json` to inspect the full configuration with credentials hidden.
+
 Workers default to three active PR reviews, with up to eight subagents each. The subagent limit is a ceiling. `inherit` uses the parent model and effort; `configured` requires `model` and `effort` in the subagent settings. There is no mode allowing a reviewer to choose its own model policy.
 
 On a service-only host, override settings remain pending provider validation until the assigned worker starts a review. Invalid settings pause work with an actionable error; Crow does not substitute another model.
 
 Repository overrides support `model`, `effort`, `subagents`, `retry`, and `timeoutMs`. A timeout of zero means no fixed runtime limit. Progressive retries use delays of 5 seconds, 15 seconds, 30 seconds, 1 minute, 2 minutes, then 5 minutes. Longer provider waits and shared outage cooldowns take precedence. Quota and authentication failures pause work without an API-key fallback.
+
+Each `repo-config` call replaces that repository's overrides; omitted settings use worker defaults. Use `--reset` to remove all overrides. Advanced settings remain available through `--json`, for example `crow repo-config owner/repo --json '{"retry":{"mode":"fixed","count":3,"delayMs":5000}}'`. This input option is separate from the `--format json` output option.
 
 Optional `.crow/review.md` holds review-specific guidance. It is not generated during setup. Normal coding agents are not instructed to read it. Crow also reads applicable `AGENTS.md` files. Both come from the pinned target branch so a PR cannot replace its own review instructions. Rule changes apply to the next review; they do not trigger a backlog automatically.
 

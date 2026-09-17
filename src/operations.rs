@@ -167,7 +167,11 @@ pub async fn admin(config: &Value, action: &str, args: &Value) -> Result<Value> 
             .as_str()
             .context("Missing administration token")?,
     );
-    let response = request.send().await?;
+    let response = request.send().await.with_context(|| {
+        format!(
+            "Could not reach Crow at {base}. Run crow start on the service machine, then crow doctor."
+        )
+    })?;
     let status = response.status();
     let body: Value = response.json().await.context("Invalid Crow response")?;
     if !status.is_success() {
@@ -235,6 +239,15 @@ fn alive(pid: i32) -> bool {
         libc::kill(pid, 0) == 0
             || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
+}
+
+/// A saved status file alone does not establish that its worker still runs.
+pub fn worker_running(root: &Path) -> Result<bool> {
+    let Some(pid) = process_id(&root.join("runtime.lock"))? else {
+        return Ok(false);
+    };
+    let status = util::read_json(&root.join("worker-status.json"))?.unwrap_or(Value::Null);
+    Ok(alive(pid) && status["pid"].as_i64() == Some(i64::from(pid)))
 }
 
 pub async fn wait_for_startup(root: &Path, expected_version: &str) -> Result<()> {
@@ -783,6 +796,30 @@ pub async fn doctor(config: &Value, root: &Path, runtime: bool) -> Result<Value>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_worker_status_must_match_a_live_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(!worker_running(root.path()).unwrap());
+        util::atomic(
+            &root.path().join("worker-status.json"),
+            &json!({"pid":std::process::id(),"state":"running"}),
+        )
+        .unwrap();
+        assert!(!worker_running(root.path()).unwrap());
+        util::atomic(
+            &root.path().join("runtime.lock"),
+            &json!({"pid":std::process::id()}),
+        )
+        .unwrap();
+        assert!(worker_running(root.path()).unwrap());
+        util::atomic(
+            &root.path().join("runtime.lock"),
+            &json!({"pid":std::process::id(),"start":"old-process"}),
+        )
+        .unwrap();
+        assert!(!worker_running(root.path()).unwrap());
+    }
     #[test]
     fn successful_service_diagnostics_summarize_history_and_preserve_errors() {
         let history = json!({

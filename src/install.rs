@@ -775,22 +775,31 @@ pub async fn install_command(root: &Path, no_setup: bool) -> Result<()> {
     );
     let executable = install_downloaded(root).await?;
     println!(
-        "Installed Crow {} at {}",
+        "\nCrow {} installed.\n  Command: {}",
         env!("CARGO_PKG_VERSION"),
-        executable.display()
+        bin_directory()?.join("crow").display()
     );
     let bin = bin_directory()?;
-    if !std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).any(|p| p == bin) {
+    let on_path =
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).any(|p| p == bin);
+    if !on_path {
         println!(
-            "To use crow in this shell, run: export PATH='{}':\"$PATH\"",
+            "\nTo use the crow command in this terminal, run:\n  export PATH='{}':\"$PATH\"",
             bin.to_string_lossy().replace('\'', "'\"'\"'")
         );
     }
     let quote = |p: &Path| format!("'{}'", p.to_string_lossy().replace('\'', "'\"'\"'"));
+    // PATH can contain the installation directory after an older Crow executable.
+    let command = quote(&bin.join("crow"));
+    let default_root = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?)
+        .join(".local/share/crow");
+    let prefix = if absolute(root)? == absolute(&default_root)? {
+        String::new()
+    } else {
+        format!("CROW_HOME={} ", quote(&absolute(root)?))
+    };
     let instruction = format!(
-        "Start or continue setup with: CROW_HOME={} {} setup",
-        quote(&absolute(root)?),
-        quote(&executable)
+        "\nNext, connect GitHub and choose your review settings:\n  {prefix}{command} setup"
     );
     if no_setup || !io::stdin().is_terminal() {
         println!("{instruction}");

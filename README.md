@@ -24,6 +24,8 @@ crow doctor --runtime
 crow logs
 ```
 
+Commands show summaries and next steps in plain text. Use `crow <command> --help` for explanations and examples, or `--format json` for structured results in scripts.
+
 See the [Linux quickstart](docs/user/quickstart.md), [HTTPS choices](docs/user/networking.md), [separate-machine setup](docs/user/split-machines.md), and [configuration and operations](docs/user/operations.md).
 
 ## Review behavior
