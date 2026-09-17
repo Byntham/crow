@@ -25,7 +25,7 @@ crow repo-config owner/repo --timeout-seconds 1800
 crow repo-config owner/repo --reset
 ```
 
-Author policy determines whose PRs Crow can review. Requester policy separately determines who can trigger `@crow review`, `@crow resume`, `@crow restart`, or `@crow pause` in a PR comment; it defaults to the operator. Granting someone request permission does not authorize their own PRs or give them configuration access. `--requesters` changes only requester permission, and the target PR must still pass author and draft checks.
+Author policy determines whose PRs Crow can review. Requester policy separately determines who can trigger `/crow review`, `/crow resume`, `/crow restart`, or `/crow pause` in a PR comment; it defaults to the operator. Granting someone request permission does not authorize their own PRs or give them configuration access. `--requesters` changes only requester permission, and the target PR must still pass author and draft checks.
 
 `crow config` hides credentials. Model names and reasoning levels come from `crow models`; Crow does not maintain a model list in its source. If retrieval fails, Crow marks the last successful catalog as cached and reports the error. Saved explicit selections do not change when provider defaults change.
 

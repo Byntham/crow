@@ -49,7 +49,7 @@ Completion requires crash/restart checks showing that accepted events and comple
 
 ## 3. Implement eligibility, revision tracking, and scheduling
 
-Handle qualifying PR events and explicit terminal or `@crow review` requests. Verify requester authorization independently of PR author policy. Include fork PRs targeting enrolled repositories, subject to the same policy. Skip drafts and supersede unfinished work when its comparison changes.
+Handle qualifying PR events and explicit terminal or `/crow review` requests. Verify requester authorization independently of PR author policy. Include fork PRs targeting enrolled repositories, subject to the same policy. Skip drafts and supersede unfinished work when its comparison changes.
 
 Identify comparisons by repository, PR, head SHA, target branch, and merge-base SHA. Use the PR's three-dot diff. Read applicable AGENTS.md and optional `.crow/review.md` from a pinned target revision and record the instruction fingerprint. Do not let PR instruction changes govern their own review.
 
