@@ -1,6 +1,0 @@
-$ crow models --help
-
-Usage: crow models
-
-Options:
-  -h, --help  Print help

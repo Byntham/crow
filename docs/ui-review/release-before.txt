@@ -1,5 +1,0 @@
-$ crow release
-
-{
-  "released": 3
-}

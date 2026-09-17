@@ -1,7 +1,0 @@
-Browser screenshot of the exact setup page template using sample values.
-
-Create your Crow GitHub App
-
-GitHub will ask you to confirm the App. Then return here to install it.
-
-Create GitHub App

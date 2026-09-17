@@ -1,7 +1,0 @@
-$ crow status
-
-Error: Could not reach Crow at http://127.0.0.1:9. Run crow start on the service machine, then crow doctor.
-  Cause: error sending request for url (http://127.0.0.1:9/admin/status)
-  Cause: client error (Connect)
-  Cause: tcp connect error
-  Cause: Connection refused (os error 111)

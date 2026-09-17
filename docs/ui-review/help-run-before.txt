@@ -1,8 +1,0 @@
-$ crow run --help
-
-Run configured services in the foreground
-
-Usage: crow run
-
-Options:
-  -h, --help  Print help

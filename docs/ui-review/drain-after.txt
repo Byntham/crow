@@ -1,4 +1,0 @@
-$ crow drain
-
-New reviews are on hold. Active reviews will finish.
-Run crow undrain to accept new reviews again.

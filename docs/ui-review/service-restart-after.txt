@@ -1,3 +1,0 @@
-$ crow service-restart
-
-Crow restarted with the saved configuration.

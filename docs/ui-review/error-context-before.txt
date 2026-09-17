@@ -1,3 +1,0 @@
-$ crow status
-
-Crow: Invalid JSON in /home/alice/.local/share/crow/config.json: EOF while parsing an object at line 1 column 1

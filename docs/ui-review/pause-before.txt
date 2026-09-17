@@ -1,5 +1,0 @@
-$ crow pause acme/website 42
-
-{
-  "paused": true
-}

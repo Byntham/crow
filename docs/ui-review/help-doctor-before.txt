@@ -1,7 +1,0 @@
-$ crow doctor --help
-
-Usage: crow doctor [OPTIONS]
-
-Options:
-      --runtime  
-  -h, --help     Print help

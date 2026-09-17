@@ -1,6 +1,0 @@
-$ crow pair --help
-
-Usage: crow pair
-
-Options:
-  -h, --help  Print help

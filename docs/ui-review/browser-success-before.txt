@@ -1,7 +1,0 @@
-Browser screenshot of the exact setup page template using sample values.
-
-App created
-
-Install Crow and select repositories
-
-, then return to your terminal.

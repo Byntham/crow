@@ -1,6 +1,0 @@
-$ crow policy acme/website --authors alice,bob
-
-Updated acme/website.
-  Reviews for         alice, bob
-  Can request reviews alice
-  Worker              review-worker

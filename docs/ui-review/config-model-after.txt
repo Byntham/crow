@@ -1,4 +1,0 @@
-$ crow config worker.model provider-default
-
-Saved worker.model.
-Run crow service-restart to apply it.

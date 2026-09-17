@@ -1,3 +1,0 @@
-Browser screenshot of the exact setup page template using sample values.
-
-Setup failed. See the Crow terminal for details.

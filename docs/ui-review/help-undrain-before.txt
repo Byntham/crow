@@ -1,6 +1,0 @@
-$ crow undrain --help
-
-Usage: crow undrain
-
-Options:
-  -h, --help  Print help

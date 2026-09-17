@@ -1,3 +1,0 @@
-$ crow run
-
-Crow service running. Press Ctrl-C to stop.

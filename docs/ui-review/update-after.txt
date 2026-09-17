@@ -1,5 +1,0 @@
-$ crow update
-
-Crow updated to 0.3.1 and restarted.
-
-Capture method: saved operation response; no update was performed.

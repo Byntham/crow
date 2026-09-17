@@ -1,9 +1,0 @@
-$ crow stats
-
-error: unrecognized subcommand 'stats'
-
-  tip: some similar subcommands exist: 'start', 'status'
-
-Usage: crow [OPTIONS] [COMMAND]
-
-For more information, try '--help'.

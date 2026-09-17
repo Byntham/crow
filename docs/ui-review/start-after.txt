@@ -1,3 +1,0 @@
-$ crow start
-
-Crow started. Run crow status to see repositories and reviews.

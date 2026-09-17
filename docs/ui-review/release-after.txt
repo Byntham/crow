@@ -1,3 +1,0 @@
-$ crow release
-
-Released 3 reviews into the review queue.

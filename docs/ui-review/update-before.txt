@@ -1,8 +1,0 @@
-$ crow update
-
-{
-  "updated": true,
-  "version": "0.3.1"
-}
-
-Capture method: saved operation response; no update was performed.

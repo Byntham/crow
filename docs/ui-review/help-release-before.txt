@@ -1,9 +1,0 @@
-$ crow release --help
-
-Usage: crow release [REPO]
-
-Arguments:
-  [REPO]  
-
-Options:
-  -h, --help  Print help

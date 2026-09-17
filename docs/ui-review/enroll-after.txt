@@ -1,9 +1,0 @@
-$ crow enroll acme/website
-
-Enrolled acme/website.
-  Reviews for         alice, bob
-  Can request reviews alice
-  Worker              review-worker
-
-2 already-open pull requests are excluded.
-To include them: crow catch-up acme/website --include-backlog

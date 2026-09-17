@@ -1,8 +1,0 @@
-$ crow version --help
-
-Print the executable version
-
-Usage: crow version
-
-Options:
-  -h, --help  Print help

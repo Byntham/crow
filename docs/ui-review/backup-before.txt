@@ -1,8 +1,0 @@
-$ crow backup /home/alice/.local/share/crow/crow.backup --passphrase-file /home/alice/.local/share/crow/passphrase
-
-{
-  "file": "/home/alice/.local/share/crow/crow.backup",
-  "files": [
-    "config.json"
-  ]
-}
