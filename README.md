@@ -6,7 +6,7 @@ Each operator runs an independent installation. There is no shared Crow backend,
 
 ## Start
 
-The hosted installer is prepared for `birdapp.dev` but has not been deployed yet. Once published, install with:
+The hosted installer is live at `birdapp.dev`. Install with:
 
 ```sh
 curl -fsSL https://birdapp.dev/install.sh | sh
@@ -14,7 +14,9 @@ curl -fsSL https://birdapp.dev/install.sh | sh
 
 The installer downloads and verifies the Linux binary, installs a permanent command, and offers to start setup. Downloads are public; access to Crow's private source repository is not required. The executable is compiled from Rust, so users do not need a language runtime or a checkout. See [installation](docs/user/install.md) for install-only mode and the source installation alternative.
 
-Setup installs the executable and defaults to running both the connection service and worker on this machine. It guides Tailscale Funnel, creation of your own GitHub App, repository selection, a separate Codex subscription login, and persistent systemd startup. Missing supported Linux dependencies can be installed with your confirmation. Browser steps print URLs you can open on a separate desktop. No browser is required on the host.
+Setup installs the executable and defaults to running both the connection service and worker on this machine. It guides Tailscale Funnel, creation or connection of your own GitHub App, repository selection, a separate Codex subscription login, and persistent systemd startup. Missing supported Linux dependencies can be installed with your confirmation. Browser steps print URLs you can open on a separate desktop. No browser is required on the host.
+
+One GitHub App connects to one Crow service. You can assign different repositories to different workers; each worker receives a read-only GitHub token for the repository it is reviewing. See [connecting an existing App](docs/user/networking.md#connect-an-existing-github-app).
 
 Setup does not run a test review. It checks connections, authentication, runtime capabilities, and startup configuration. Rerun `crow setup` to continue incomplete onboarding.
 

@@ -313,9 +313,11 @@ pub fn redact(config: &Value) -> Value {
     let mut redacted = config.clone();
     redacted["adminToken"] = json!("[hidden]");
     redacted["worker"]["token"] = json!("[hidden]");
-    if redacted["app"].is_object() {
-        redacted["app"]["pem"] = json!("[hidden]");
-        redacted["app"]["webhookSecret"] = json!("[hidden]");
+    for path in ["/app", "/pendingApp/app"] {
+        if let Some(app) = redacted.pointer_mut(path).filter(|app| app.is_object()) {
+            app["pem"] = json!("[hidden]");
+            app["webhookSecret"] = json!("[hidden]");
+        }
     }
     redacted
 }

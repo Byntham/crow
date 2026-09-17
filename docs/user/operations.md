@@ -85,7 +85,7 @@ crow cleanup
 
 The native user systemd service starts after reboot and continues after logout. `crow run` runs in the foreground for another service manager.
 
-`crow update` downloads the published stable release for the host architecture from `downloads.birdapp.dev` and verifies its SHA-256 checksum and reported version before stopping the service. It drains active work, switches the installed executable, and restarts Crow. It verifies that the new process finished initialization and restores the previous executable if startup fails. There is no source checkout or local build step. Only an explicitly published stable version is an update candidate. The hosted endpoint must be deployed before this update path is available.
+`crow update` downloads the published stable release for the host architecture from `downloads.birdapp.dev` and verifies its SHA-256 checksum and reported version before stopping the service. It drains active work, switches the installed executable, and restarts Crow. It verifies that the new process finished initialization and restores the previous executable if startup fails. There is no source checkout or local build step. Only an explicitly published stable version is an update candidate. The hosted update endpoint is live.
 
 Updates do not modify source checkouts or replace your Codex installation. If an update fails, inspect the reported error before running `crow start`.
 

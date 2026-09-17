@@ -72,6 +72,25 @@ pub fn defaults(root: &Path) -> Value {
         "catchUp":{"enabled":true,"threshold":10},"auditIntervalMs":3600000,"retentionDays":7,"ingress":{"type":"funnel"},"app":null
     })
 }
+fn validate_app(app: &Value) -> Result<()> {
+    if !app.is_null() {
+        object(app, "GitHub App")?;
+        if !app["id"].is_number() && !app["id"].is_string() {
+            bail!("Invalid GitHub App ID");
+        }
+        for key in ["pem", "webhookSecret", "slug"] {
+            string(&app[key], &format!("app.{key}"))?;
+        }
+        if app
+            .get("botId")
+            .is_some_and(|v| !v.is_null() && !v.is_number())
+        {
+            bail!("Invalid GitHub bot ID");
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_config(value: &Value) -> Result<()> {
     let c = object(value, "configuration")?;
     let worker = &value["worker"];
@@ -178,19 +197,25 @@ pub fn validate_config(value: &Value) -> Result<()> {
         bail!("Invalid ingress type");
     }
     let app = c.get("app").context("Invalid GitHub App")?;
-    if !app.is_null() {
-        object(app, "GitHub App")?;
-        if !app["id"].is_number() && !app["id"].is_string() {
-            bail!("Invalid GitHub App ID");
+    validate_app(app)?;
+    if let Some(pending) = c.get("pendingApp") {
+        object(pending, "pending App connection")?;
+        if !app.is_null() {
+            bail!("Cannot connect an App while another App is configured");
         }
-        for key in ["pem", "webhookSecret", "slug"] {
-            string(&app[key], &format!("app.{key}"))?;
+        if pending["app"].is_null() {
+            bail!("Missing pending App credentials");
         }
-        if app
-            .get("botId")
-            .is_some_and(|v| !v.is_null() && !v.is_number())
-        {
-            bail!("Invalid GitHub bot ID");
+        validate_app(&pending["app"])?;
+        let webhook = string(&pending["webhookUrl"], "pending App webhook URL")?;
+        let expected = format!(
+            "{}/webhooks/github",
+            string(&value["publicUrl"], "publicUrl")?
+        );
+        if webhook != expected {
+            bail!(
+                "The public HTTPS address changed during App connection. Restore the saved address before rerunning setup."
+            );
         }
     }
     if worker.get("detached").is_some_and(|v| !v.is_boolean()) {

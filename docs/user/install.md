@@ -1,8 +1,8 @@
 # Install Crow on Linux
 
-Crow's hosted installer downloads a native Linux executable compiled from Rust. Users do not need the source repository or a language runtime. The installer and binaries will be public even while the source repository is private.
+Crow's hosted installer downloads a native Linux executable compiled from Rust. Users do not need the source repository or a language runtime. The installer and binaries are public even while the source repository is private.
 
-**The hosted installer is prepared locally but has not been deployed.** The commands below become available after the first approved publication. Until then, use the source installation or build a binary with `bash scripts/build-release.sh`.
+The hosted installer is live at `https://birdapp.dev/install.sh`, with releases at `https://downloads.birdapp.dev`.
 
 ## Hosted installation
 
@@ -41,7 +41,7 @@ tar -xzf crow-vX.Y.Z-linux-x64.tar.gz
 ./crow install
 ```
 
-Stop if checksum verification fails. Use the actual downloaded filename and substitute `arm64` when appropriate. `--ignore-missing` permits the checksum file to include the other architecture. `./crow install --no-setup` installs without starting onboarding. You can transfer these files from your desktop to the host before verification. There is no published release to download until the first approved publication.
+Stop if checksum verification fails. Use the actual downloaded filename and substitute `arm64` when appropriate. `--ignore-missing` permits the checksum file to include the other architecture. `./crow install --no-setup` installs without starting onboarding. You can transfer these files from your desktop to the host before verification.
 
 See the [quickstart](quickstart.md) for setup prompts and [operations](operations.md#lifecycle-and-updates) for updates.
 
@@ -62,7 +62,7 @@ Set `CROW_HOME` for a custom installation and data directory and `CROW_BIN_DIR` 
 
 ## Migrating an existing installation
 
-The Rust release is version 0.3.0. Its configuration, SQLite records, encrypted backups, and worker protocol retain their existing formats. Save an encrypted backup before upgrading. A published 0.2.0 binary installation can use `crow update` once 0.3.0 is published.
+Native Rust releases start at version 0.3.0. Its configuration, SQLite records, encrypted backups, and worker protocol retain their existing formats. Save an encrypted backup before upgrading. Existing binary installations can use `crow update` to install the latest hosted release.
 
 Legacy source installations use a Node launcher and a different release layout. Stop the old service, back up its state, and preserve the old launcher and `current` link before installing the Rust executable. The native installer refuses to overwrite an unrelated or different existing launcher. Keep `config.json`, `service.sqlite`, review directories, and the installation's `codex` directory in place. Run the new executable's `install --no-setup` with the same `CROW_HOME`, then `crow setup` to regenerate the systemd unit and validate connections. Do not delete saved provider sessions or reuse the personal Codex home.
 
