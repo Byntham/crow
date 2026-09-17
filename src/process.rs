@@ -163,8 +163,20 @@ impl Drop for NonblockingIo<'_> {
     }
 }
 
-pub type LineCallback =
-    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
+type LineFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+pub type LineCallback = Arc<dyn Fn(String) -> LineFuture + Send + Sync>;
+
+async fn dispatch_line(
+    callback: &LineCallback,
+    line: String,
+    accepted: &mut Option<LineFuture>,
+) -> Result<()> {
+    *accepted = Some(callback(line));
+    let result = accepted.as_mut().expect("Accepted process callback").await;
+    // A completed future must never be polled again, including after an error.
+    *accepted = None;
+    result
+}
 pub struct RunOptions {
     pub cwd: Option<PathBuf>,
     pub env: Option<BTreeMap<String, String>>,
@@ -318,6 +330,9 @@ pub async fn run(program: &str, args: &[String], options: RunOptions) -> Result<
     let mut stderr = Vec::new();
     let mut pending = Vec::new();
     let mut total = 0;
+    // Keep the accepted callback outside the cancellable pump. A session save
+    // may have persisted a snapshot but still need to publish it in memory.
+    let mut accepted_callback = None;
     let pump = async {
         let mut status = None;
         loop {
@@ -355,9 +370,11 @@ pub async fn run(program: &str, args: &[String], options: RunOptions) -> Result<
                             bail!("Process output line limit exceeded");
                         }
                         let line: Vec<u8> = pending.drain(..=end).collect();
-                        callback(
+                        dispatch_line(
+                            callback,
                             String::from_utf8(line[..end].to_vec())
                                 .context("Invalid UTF-8 process event")?,
+                            &mut accepted_callback,
                         )
                         .await?;
                     }
@@ -370,7 +387,12 @@ pub async fn run(program: &str, args: &[String], options: RunOptions) -> Result<
         if !pending.is_empty()
             && let Some(callback) = &options.on_line
         {
-            callback(String::from_utf8(pending.clone())?).await?;
+            dispatch_line(
+                callback,
+                String::from_utf8(pending.clone())?,
+                &mut accepted_callback,
+            )
+            .await?;
         }
         let status = match status {
             Some(s) => s,
@@ -395,23 +417,36 @@ pub async fn run(program: &str, args: &[String], options: RunOptions) -> Result<
         _ = options.cancel.cancelled() => Err(anyhow::anyhow!("Interrupted")),
         _ = deadline => Err(anyhow::anyhow!("{program} timed out")),
     };
-    if result.is_err() {
-        group.signal(libc::SIGINT);
-        if tokio::time::timeout(Duration::from_secs(2), child.wait())
-            .await
-            .is_err()
-        {
-            group.signal(libc::SIGKILL);
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+    let cleanup = async {
+        if result.is_err() {
+            group.signal(libc::SIGINT);
+            if tokio::time::timeout(Duration::from_secs(2), child.wait())
+                .await
+                .is_err()
+            {
+                group.signal(libc::SIGKILL);
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+            }
         }
-    }
-    // Descendants can retain the pipes after the direct child exits.
-    drop(group);
-    for reader in readers {
-        reader.abort();
-        let _ = reader.await;
-    }
+        // Descendants can retain the pipes after the direct child exits.
+        drop(group);
+        for reader in readers {
+            reader.abort();
+            let _ = reader.await;
+        }
+    };
+    let drain_callback = async {
+        if let Some(callback) = accepted_callback {
+            callback.await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+    // Stop the provider promptly, independently of durable callback work. Only
+    // the already accepted callback drains; queued output cannot admit more.
+    // Its completion orders the caller's final save after the session save.
+    let (_, drained) = tokio::join!(cleanup, drain_callback);
+    drained.context("Accepted process event callback failed during shutdown")?;
     result?;
     Ok(Output {
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
@@ -510,6 +545,152 @@ mod tests {
         .unwrap();
         assert_eq!(output.stdout, "done");
     }
+    #[tokio::test]
+    async fn cancellation_and_timeout_finish_accepted_save_before_returning() {
+        use serde_json::{Value, json};
+        use std::sync::{
+            Mutex,
+            atomic::{AtomicU32, Ordering},
+        };
+        use tokio::sync::Notify;
+        for (timed_out, fail_callback) in [(false, false), (true, false), (false, true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("task.json");
+            let task = Arc::new(Mutex::new(json!({"state":"running"})));
+            let written = Arc::new(Notify::new());
+            let commit = Arc::new(Notify::new());
+            let pid = Arc::new(AtomicU32::new(0));
+            let on_line: LineCallback = {
+                let (path, task, written, commit, pid) = (
+                    path.clone(),
+                    task.clone(),
+                    written.clone(),
+                    commit.clone(),
+                    pid.clone(),
+                );
+                Arc::new(move |line| {
+                    let (path, task, written, commit, pid) = (
+                        path.clone(),
+                        task.clone(),
+                        written.clone(),
+                        commit.clone(),
+                        pid.clone(),
+                    );
+                    Box::pin(async move {
+                        let event: Value = serde_json::from_str(&line)?;
+                        pid.store(event["pid"].as_u64().unwrap() as u32, Ordering::SeqCst);
+                        let mut snapshot = task.lock().unwrap().clone();
+                        snapshot["session"] = event["thread_id"].clone();
+                        tokio::fs::write(path, serde_json::to_vec(&snapshot)?).await?;
+                        written.notify_one();
+                        // Simulate an atomic save waiting to publish its snapshot
+                        // in memory. Final pause persistence must not overtake it.
+                        commit.notified().await;
+                        *task.lock().unwrap() = snapshot;
+                        if fail_callback {
+                            bail!("Session callback rejected");
+                        }
+                        Ok(())
+                    })
+                })
+            };
+            let cancel = CancellationToken::new();
+            let operation = {
+                let (cancel, path, task) = (cancel.clone(), path.clone(), task.clone());
+                tokio::spawn(async move {
+                    let result = run("sh", &["-c".into(), r#"printf '{"type":"thread.started","thread_id":"saved-session","pid":%s}\n' "$$"; exec sleep 30"#.into()], RunOptions {
+                        cancel,
+                        timeout: timed_out.then_some(Duration::from_secs(1)),
+                        on_line: Some(on_line),
+                        ..Default::default()
+                    }).await;
+                    let mut final_snapshot = task.lock().unwrap().clone();
+                    final_snapshot["state"] = json!("paused");
+                    crate::util::atomic(&path, &final_snapshot).unwrap();
+                    result
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(3), written.notified())
+                .await
+                .unwrap();
+            if !timed_out {
+                cancel.cancel();
+            }
+            // The child must stop even though its accepted callback is blocked.
+            tokio::time::timeout(Duration::from_secs(4), async {
+                while unsafe { libc::kill(pid.load(Ordering::SeqCst) as i32, 0) } == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("Process cleanup waited for the callback");
+            assert!(
+                !operation.is_finished(),
+                "Process returned before its accepted callback committed"
+            );
+            commit.notify_one();
+            let error = tokio::time::timeout(Duration::from_secs(3), operation)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            if fail_callback {
+                assert!(format!("{error:#}").contains("Session callback rejected"));
+            } else {
+                assert!(error.to_string().contains(if timed_out {
+                    "timed out"
+                } else {
+                    "Interrupted"
+                }));
+            }
+            assert_eq!(
+                crate::util::read_json(&path).unwrap().unwrap(),
+                json!({"state":"paused","session":"saved-session"})
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_callbacks_keep_line_order_and_errors_are_not_polled_twice() {
+        use std::sync::Mutex;
+        for fail in [false, true] {
+            let lines = Arc::new(Mutex::new(Vec::new()));
+            let received = lines.clone();
+            let callback: LineCallback = Arc::new(move |line| {
+                let received = received.clone();
+                Box::pin(async move {
+                    received.lock().unwrap().push(line.clone());
+                    if fail && line == "second" {
+                        bail!("Rejected process event");
+                    }
+                    tokio::task::yield_now().await;
+                    Ok(())
+                })
+            });
+            let result = run(
+                "printf",
+                &["first\nsecond\ntrailing".into()],
+                RunOptions {
+                    on_line: Some(callback),
+                    ..Default::default()
+                },
+            )
+            .await;
+            if fail {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("Rejected process event")
+                );
+                assert_eq!(*lines.lock().unwrap(), ["first", "second"]);
+            } else {
+                result.unwrap();
+                assert_eq!(*lines.lock().unwrap(), ["first", "second", "trailing"]);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn timeout_stops_a_silent_process() {
         let start = std::time::Instant::now();

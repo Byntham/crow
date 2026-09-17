@@ -900,6 +900,141 @@ mod tests {
         );
     }
     #[tokio::test]
+    async fn cancelling_process_during_session_save_preserves_delegated_resume() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = context(tmp.path(), 1);
+        let provider_saved = Arc::new(tokio::sync::Notify::new());
+        let begin_callback = Arc::new(tokio::sync::Notify::new());
+        let callback_started = Arc::new(tokio::sync::Notify::new());
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runner: Runner = {
+            let provider_saved = provider_saved.clone();
+            let begin_callback = begin_callback.clone();
+            let callback_started = callback_started.clone();
+            let runs = runs.clone();
+            Arc::new(move |job, _, _, root, callbacks, cancel| {
+                let provider_saved = provider_saved.clone();
+                let begin_callback = begin_callback.clone();
+                let callback_started = callback_started.clone();
+                let attempt = runs.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    if attempt > 0 {
+                        assert_eq!(job["session"], "saved-session");
+                        return Ok(json!({"summary":"resumed","findings":[]}));
+                    }
+                    let runtime = root
+                        .join("reviews")
+                        .join(job["parentId"].as_str().unwrap())
+                        .join("tasks")
+                        .join(job["taskId"].as_str().unwrap())
+                        .join("runtime");
+                    let callback = callbacks.on_session.unwrap();
+                    let on_line: crate::process::LineCallback = Arc::new(move |_| {
+                        let runtime = runtime.clone();
+                        let callback = callback.clone();
+                        let provider_saved = provider_saved.clone();
+                        let begin_callback = begin_callback.clone();
+                        let callback_started = callback_started.clone();
+                        Box::pin(async move {
+                            // Match provider ordering: its sidecar is durable before delegation's callback.
+                            crate::util::atomic(
+                                &runtime.join("session.json"),
+                                &json!({"id":"saved-session"}),
+                            )?;
+                            provider_saved.notify_one();
+                            begin_callback.notified().await;
+                            callback_started.notify_one();
+                            callback(json!("saved-session")).await
+                        })
+                    });
+                    crate::process::run(
+                        "sh",
+                        &[
+                            "-c".into(),
+                            r#"printf '%s' "$$" > "$1"; printf 'thread.started\n'; exec sleep 30"#
+                                .into(),
+                            "crow-session-test".into(),
+                            root.join("child.pid").to_string_lossy().into_owned(),
+                        ],
+                        crate::process::RunOptions {
+                            on_line: Some(on_line),
+                            cancel,
+                            detached: false,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                    bail!("Expected process cancellation");
+                })
+            })
+        };
+        let d = Delegation::init_with_runner(ctx.clone(), runner.clone())
+            .await
+            .unwrap();
+        let started = d
+            .call("start_review_task", &json!({"task":"inspect"}))
+            .await
+            .unwrap();
+        let id = started["id"].as_str().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), provider_saved.notified())
+            .await
+            .unwrap();
+        let persistence = d.inner.persistence.lock().await;
+        begin_callback.notify_one();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            callback_started.notified(),
+        )
+        .await
+        .unwrap();
+        let pid: i32 = tokio::fs::read_to_string(tmp.path().join("child.pid"))
+            .await
+            .unwrap()
+            .parse()
+            .unwrap();
+        let closing = {
+            let d = d.clone();
+            tokio::spawn(async move { d.close().await })
+        };
+        // Wait for cancellation to kill and reap the process before unblocking the callback.
+        // This ensures the original cancellable pump has already dropped its callback future.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while unsafe { libc::kill(pid, 0) } == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!closing.is_finished());
+        drop(persistence);
+        tokio::time::timeout(std::time::Duration::from_secs(5), closing)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(d.view(id).unwrap()["state"], "paused");
+        assert_eq!(d.view(id).unwrap()["canResume"], true);
+        assert_eq!(d.task(id).unwrap()["session"], "saved-session");
+        let durable: Value = serde_json::from_slice(
+            &tokio::fs::read(d.inner.dir.join(format!("{id}.json")))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(durable["session"], "saved-session");
+        let reopened = Delegation::init_with_runner(ctx, runner).await.unwrap();
+        assert_eq!(reopened.view(id).unwrap()["canResume"], true);
+        reopened
+            .call("resume_review_task", &json!({"id":id}))
+            .await
+            .unwrap();
+        assert_eq!(
+            complete(&reopened, id).await["report"]["summary"],
+            "resumed"
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+    #[tokio::test]
     async fn concurrency_is_reserved_before_launch_and_close_saves_sessions() {
         let tmp = tempfile::tempdir().unwrap();
         let d = Delegation::init_with_runner(context(tmp.path(), 1), waiting_runner())

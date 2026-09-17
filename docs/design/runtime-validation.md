@@ -9,7 +9,7 @@ cargo clippy --locked --all-targets -- -D warnings
 
 The original TypeScript baseline passed 321 tests, with five skipped, before migration. The Rust tests exercise the new implementation; the historical baseline is not proof that the port preserves every behavior.
 
-The ordinary suite currently passes 211 tests. It checks durable receipts and jobs, separate worker/admin authentication, inspection permissions, merge-base comparisons, recovery, report validation, provider policy, setup callbacks, encrypted backups, installation, and retention. Linux subprocess tests exercise cancellation and cleanup. Setup prompt tests keep stdin open while sending SIGINT and SIGTERM after registration listeners have been dropped; both the prompt and its runtime must exit without waiting for EOF.
+The ordinary suite currently passes 214 tests. It checks durable receipts and jobs, separate worker/admin authentication, inspection permissions, merge-base comparisons, recovery, report validation, provider policy, setup callbacks, encrypted backups, installation, and retention. Linux subprocess tests exercise cancellation and cleanup. Setup prompt tests keep stdin open while sending SIGINT and SIGTERM after registration listeners have been dropped; both the prompt and its runtime must exit without waiting for EOF.
 
 Opt-in installed-Codex tests use temporary synthetic authentication and a loopback Responses API. They must not use an operator's live account or perform model inference:
 
@@ -49,3 +49,5 @@ PR review added regressions for bounded same-origin GitHub redirects without cro
 Release builds use static musl executables to preserve compatibility with older supported glibc distributions. Packaging rejects dynamic loaders and shared-library dependencies. CI runs each architecture in an empty chroot. MCP subprocess regressions keep stdin or unread stdout open while sending SIGINT and SIGTERM, and cover large responses, request-size boundaries, and redirected files. Set `CROW_TEST_BINARY` for the installed-Codex probes to exercise the packaged MCP executable.
 
 The final x64 static executable passed all 16 CLI, MCP, and service lifecycle tests, extracted-archive installation and checksum checks, and both installed-Codex probes in each synthetic authentication mode. Version and help also ran in an empty root under PRoot; the previous GNU executable failed the same check because its loader was absent. Native CI uses chroot for this check.
+
+Cancellation and timeout now finish an accepted process-event callback while stopping the provider independently. Deterministic tests block session persistence, confirm the process has stopped before releasing the write, and verify that the paused delegated task retains its session on disk, after reopening, and when resumed. Callback errors and line ordering are also covered.
