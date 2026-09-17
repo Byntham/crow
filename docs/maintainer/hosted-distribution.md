@@ -46,21 +46,25 @@ The Pages token needs no zone or DNS edit permissions. Cloudflare's Pages permis
 
 `.github/workflows/release.yml` builds and tests Linux x64 and ARM64 on native Ubuntu runners. It runs for pull requests, matching version tags, and manual dispatch, and uploads private GitHub Actions artifacts. PR builds validate the proposed merge; publication requires a separate tag or manual build of the reviewed source commit. It never creates a GitHub release or uploads to Cloudflare.
 
-The build artifacts are `crow-linux-x64` and `crow-linux-arm64`. Each contains its archive, `SHA256SUMS`, and `build-metadata.json` recording the source commit, archive hash, version, architecture, and the packaged executable's actual `--version` output. Artifacts expire after seven days. Publish within that window or build a new version. Rebuilding an existing version can change its archive bytes and must not overwrite an already published version.
+The build artifacts are `crow-linux-x64` and `crow-linux-arm64`. Each contains its archive, `SHA256SUMS`, and `build-metadata.json` recording the source commit, archive hash, version, architecture, Rust target, and the packaged executable's actual `--version` output. Artifacts expire after seven days. Publish within that window or build a new version. Rebuilding an existing version can change its archive bytes and must not overwrite an already published version.
 
 Workflows with `workflow_dispatch` normally need to exist on the repository's default branch before GitHub exposes manual dispatch in the UI or API. Preparing these files on a draft PR does not make them runnable there by itself. Once the workflows exist on the default branch, select the intended reviewed branch when dispatching. No commit, merge, tag, build, or publication is implied by these instructions.
 
 ## Publish a reviewed binary build
 
-1. Complete a build and record its run ID, exact 40-character commit SHA, and stable version from `package.json`.
-2. Review the source and the successful checks for both architectures. The first version can remain `0.2.0` because the premature GitHub release was removed and no hosted release has been published. Once a version has public hosted objects, its bytes are immutable.
+1. Complete a build and record its run ID, exact 40-character commit SHA, and stable version from `Cargo.toml`.
+2. Review the source and the successful checks for both architectures. The Rust port starts at `0.3.0`, so existing `0.2.0` installations can recognize it as an upgrade. Once a version has public hosted objects, its bytes are immutable.
 3. Manually run **Publish hosted Crow binaries**, selecting the reviewed workflow revision. Supply the run ID, source commit, version without `v`, and confirmation `publish VERSION`, for example `publish 0.2.0`.
 4. Approve the `public-release` environment deployment if environment reviewers are configured.
 5. Inspect the completed workflow summary and the public download URLs.
 
 The publishing job verifies that the selected run belongs to this repository, used `.github/workflows/release.yml`, completed successfully, and built the exact supplied source commit. It downloads artifacts from that run only. It checks both checksums, metadata, safe archive entries, and ELF CPU architecture without executing binaries in the credentialed job.
 
-The publisher uses the official AWS CLI v2 preinstalled on GitHub's `ubuntu-24.04` hosted runner, and fails with a clear error if it is missing or incompatible. It uses the R2 S3 endpoint over HTTPS with `region=auto`. The website workflow uses the explicit Wrangler version `4.72.0`; GitHub actions use commit pins. Review these tool versions during maintenance.
+The Rust `crow-maint` binary packages releases, verifies build provenance, publishes artifacts, prepares the Pages project, and stages the installation page. Build it with `cargo build --locked --release --bin crow-maint`. It never executes downloaded release artifacts.
+
+`scripts/build-release.sh` creates static musl ELF archives from Cargo builds on native x64 and ARM64 hosts. Install `musl-tools` and `binutils` before building. The shipped binary has no runtime glibc dependency, preserving support for Ubuntu 20.04 and Debian 11 even when the build runner uses a newer distribution. Packaging and publication reject ELF interpreters and shared-library dependencies. CI checks the ELF with `readelf` and runs help and version commands inside an empty chroot. Packaging includes dependency license texts, Rust standard-library notices, and musl's [upstream copyright notice](https://git.musl-libc.org/cgit/musl/tree/COPYRIGHT?h=v1.2.5), vendored in `licenses/MUSL-COPYRIGHT`; install the `rust-docs` component before packaging. Archive headers use fixed timestamps and ownership. `scripts/smoke-release.sh` tests the packaged executable with an empty executable search path and isolated installation directories.
+
+The publisher uses the official AWS CLI v2 preinstalled on GitHub's `ubuntu-24.04` hosted runner, and fails with a clear error if it is missing or incompatible. It uses the R2 S3 endpoint over HTTPS with `region=auto`. Node is absent from Crow and its release publisher. The website deployment alone uses Node to run Cloudflare's official Wrangler CLI; maintaining a replacement for its asset upload protocol would add unrelated code. The website workflow uses the explicit Wrangler version `4.72.0`; GitHub actions use commit pins. Review these tool versions during maintenance.
 
 For version `0.2.0`, the public objects are:
 
@@ -75,7 +79,7 @@ https://downloads.birdapp.dev/latest.txt
 
 Before writing anything, publication compares any existing versioned objects with the candidate bytes. It refuses different bytes under an existing version. Conditional writes prevent replacement if another writer creates an object meanwhile. After uploading missing objects, it downloads every file through the public domain and checks the bytes. It updates `latest.txt` last and verifies that public URL too. Publications are serialized and cannot cancel one another midway through a run.
 
-If an upload fails, the previous `latest.txt` remains until all release files verify. Rerun the same build to fill missing objects. If the public domain is not ready, fix the domain or caching problem and rerun; do not change the versioned objects. The script refuses to move `latest.txt` to an older version. To withdraw a bad release, prepare a corrected newer version or perform a separately reviewed rollback procedure. There is no automatic rollback publication command.
+If an upload fails, the previous `latest.txt` remains until all release files verify. Rerun the same build to fill missing objects. If the public domain is not ready, fix the domain or caching problem and rerun; do not change the versioned objects. The maintenance command refuses to move `latest.txt` to an older version. To withdraw a bad release, prepare a corrected newer version or perform a separately reviewed rollback procedure. There is no automatic rollback publication command.
 
 Checksums catch corruption and mixed artifacts. HTTPS and control of the distribution account establish authenticity; a checksum downloaded from the same host is not an independent signature. Signing releases can be added later without changing the installer URL.
 

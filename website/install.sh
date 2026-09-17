@@ -58,7 +58,7 @@ crow_main() {
   esac
   case "$(getconf GNU_LIBC_VERSION 2>/dev/null || true)" in
     'glibc '*) ;;
-    *) crow_fail 'Crow requires glibc Linux, such as Ubuntu or Debian. Alpine/musl is unsupported.' ;;
+    *) crow_fail 'Crow guided installation supports glibc distributions such as Ubuntu or Debian. Alpine/musl distributions are unsupported.' ;;
   esac
   if [ -n "$crow_version" ]; then
     crow_valid_version "$crow_version" || crow_fail 'Invalid version. Use a stable version such as 0.2.0.'

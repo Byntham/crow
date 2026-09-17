@@ -27,30 +27,12 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.21.0
+      - name: Build reviewed maintenance tool
+        run: cargo build --locked --release --bin crow-maint
       - name: Check confirmation and existing public release
         env:
           DEPLOY_CONFIRMATION: ${{ inputs.confirmation }}
-        run: |
-          node --input-type=module <<'JS'
-          import { access, readFile, writeFile } from "node:fs/promises";
-          if (process.env.DEPLOY_CONFIRMATION !== "deploy birdapp.dev") throw new Error("Explicit site deployment confirmation is required");
-          await access("website/install.sh");
-          const response = await fetch("https://downloads.birdapp.dev/latest.txt", { redirect: "error", signal: AbortSignal.timeout(30000) });
-          if (!response.ok) throw new Error("Publish and verify the first binary release before deploying the installation page");
-          const latest = await response.text();
-          if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)\n$/.test(latest)) throw new Error("Public latest.txt is malformed");
-          for (const arch of ["x64", "arm64"]) {
-            const version = latest.trim();
-            const url = `https://downloads.birdapp.dev/releases/v${version}/crow-v${version}-linux-${arch}.tar.gz`;
-            const archive = await fetch(url, { method: "HEAD", redirect: "error", signal: AbortSignal.timeout(30000) });
-            if (!archive.ok) throw new Error(`Public ${arch} binary is unavailable`);
-          }
-          const checksum = await fetch(`https://downloads.birdapp.dev/releases/v${latest.trim()}/SHA256SUMS`, { method: "HEAD", redirect: "error", signal: AbortSignal.timeout(30000) });
-          if (!checksum.ok) throw new Error("Public release checksum file is unavailable");
-          const html = await readFile("website/index.html", "utf8");
-          if (!html.includes("__CROW_VERSION__")) throw new Error("Installation page is missing its version placeholder");
-          await writeFile("website/index.html", html.replaceAll("__CROW_VERSION__", latest.trim()));
-          JS
+        run: target/release/crow-maint stage-site website
       - name: Deploy selected source to Cloudflare Pages
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

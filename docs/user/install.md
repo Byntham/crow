@@ -1,8 +1,8 @@
 # Install Crow on Linux
 
-Crow's hosted installer downloads a native Linux executable containing Node 24 LTS. Users do not need the source repository, Node, pnpm, or a TypeScript compiler. The installer and binaries will be public even while the source repository is private.
+Crow's hosted installer downloads a native Linux executable compiled from Rust. Users do not need the source repository or a language runtime. The installer and binaries will be public even while the source repository is private.
 
-**The hosted installer is prepared locally but has not been deployed.** The commands below become available after the first approved publication. Until then, use the source installation or build a binary with `pnpm build:binary`.
+**The hosted installer is prepared locally but has not been deployed.** The commands below become available after the first approved publication. Until then, use the source installation or build a binary with `bash scripts/build-release.sh`.
 
 ## Hosted installation
 
@@ -12,7 +12,7 @@ From an SSH terminal on the machine that will run Crow, use:
 curl -fsSL https://birdapp.dev/install.sh | sh
 ```
 
-Run this as your normal user, without sudo. The installer detects Linux x64 or ARM64, checks prerequisites, downloads a versioned archive from `downloads.birdapp.dev`, and verifies its checksum before extraction. It then installs the binary and offers to start setup. Ubuntu with systemd is the supported guided setup platform. These binaries require glibc and the system C++ runtime; Alpine and other musl distributions are unsupported.
+Run this as your normal user, without sudo. The installer detects Linux x64 or ARM64, checks prerequisites, downloads a versioned archive from `downloads.birdapp.dev`, and verifies its checksum before extraction. It then installs the binary and offers to start setup. Ubuntu with systemd is the supported guided setup platform. Release binaries are static and do not require a particular glibc version; Ubuntu 20.04 and Debian 11 remain supported. Guided installation still targets glibc distributions because Codex and other external tools have separate platform requirements. Alpine and other musl distributions are outside this supported installation path.
 
 The bootstrap needs common Linux tools including `curl`, `tar`, and `sha256sum`. It explains missing prerequisites before installation. Crow setup offers installation of missing supported dependencies such as Git, GitHub CLI, Codex, and the chosen ingress client. GitHub login happens during setup to connect your repositories, not to download Crow.
 
@@ -54,15 +54,19 @@ bash scripts/install.sh
 ~/.local/bin/crow setup
 ```
 
-The installer uses Node 24 or newer if it is already available. Otherwise, it downloads the latest official Node 24 release for Linux x64 or arm64 into `~/.local/share/crow/node`. It retrieves the archive and SHA-256 checksums over HTTPS from nodejs.org and verifies the archive before extraction. Automatic Node installation needs `curl`, `tar` with xz support, and `sha256sum`.
+Install the stable Rust toolchain, a C compiler, and Git before running the source installer. It runs `cargo build --locked --release --bin crow` and installs the resulting executable through the same installer used by downloaded binaries. SQLite is compiled into Crow; no Node or JavaScript build tools are needed.
 
-Crow builds the application from its TypeScript source into a fresh staging directory using Node's built-in type stripping. It checks the emitted JavaScript syntax and runs CLI help before activating a versioned directory under `~/.local/share/crow/releases`. It does not reuse a developer's existing `dist/` directory. The `current` link selects the installed release, and `~/.local/bin/crow` starts it with the selected Node executable. There are no runtime package dependencies to install. pnpm and the TypeScript compiler are development dependencies and are not required to install or run Crow. Strict type checking runs in the development checks before release; installation checks executable output. Keep the source checkout if you want to use `crow update`.
+The installer activates a versioned directory under `~/.local/share/crow/releases`. The `current` link selects the release, and `~/.local/bin/crow` is the stable command. It does not start services. Run `crow setup` to configure GitHub, HTTPS, subscription authentication, and persistent startup.
 
-Node may print an experimental warning for its `stripTypeScriptTypes` API during the build. The installed service runs ordinary JavaScript and does not call this API.
+Set `CROW_HOME` for a custom installation and data directory and `CROW_BIN_DIR` for the permanent command directory. Keep the same `CROW_HOME` for later commands. `crow update` installs published native releases for both source-built and downloaded installations. It does not modify your source checkout. To test local source changes, build and run the executable from the checkout with a separate `CROW_HOME`.
 
-The installer prints a PATH command if your shell cannot find `~/.local/bin`. It does not start Crow. Run `crow setup` to configure GitHub, HTTPS, subscription authentication, and persistent startup. On a headless machine, open the printed browser URLs on your desktop. Setup checks connections and configuration without running a PR review.
+## Migrating an existing installation
 
-For a custom software location, set `CROW_INSTALL_DIR` and `CROW_BIN_DIR` when running the installer. `CROW_HOME` independently controls Crow's configuration and runtime data directory. Its default is `~/.local/share/crow`. `CROW_NODE` can select an existing Node executable for installation.
+The Rust release is version 0.3.0. Its configuration, SQLite records, encrypted backups, and worker protocol retain their existing formats. Save an encrypted backup before upgrading. A published 0.2.0 binary installation can use `crow update` once 0.3.0 is published.
+
+Legacy source installations use a Node launcher and a different release layout. Stop the old service, back up its state, and preserve the old launcher and `current` link before installing the Rust executable. The native installer refuses to overwrite an unrelated or different existing launcher. Keep `config.json`, `service.sqlite`, review directories, and the installation's `codex` directory in place. Run the new executable's `install --no-setup` with the same `CROW_HOME`, then `crow setup` to regenerate the systemd unit and validate connections. Do not delete saved provider sessions or reuse the personal Codex home.
+
+Keep the previous executable and backup until the new service passes `crow doctor --runtime`. Local tests establish data-format compatibility; validate real account access on the enrolled installation before removing the old release.
 
 ## Local retention
 
