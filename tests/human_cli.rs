@@ -214,6 +214,34 @@ async fn config_accepts_plain_model_names_and_redacts_credentials() -> Result<()
 }
 
 #[tokio::test]
+async fn interrupted_app_connection_never_exposes_credentials_in_config_output() -> Result<()> {
+    let fixture = Fixture::new("service", empty_status()).await?;
+    let mut saved = config::load(fixture.root.path())?;
+    saved["publicUrl"] = json!("https://crow.example");
+    saved["pendingApp"] = json!({
+        "app":{"id":42,"slug":"existing-crow","pem":"private-pem-must-not-leak","webhookSecret":"webhook-secret-must-not-leak"},
+        "webhookUrl":"https://crow.example/webhooks/github"
+    });
+    config::save(fixture.root.path(), &saved)?;
+    for args in [vec!["config"], vec!["config", "--format", "json"]] {
+        let output = fixture.run(&args).await?;
+        let text = stdout(&output);
+        for secret in ["private-pem-must-not-leak", "webhook-secret-must-not-leak"] {
+            assert!(!text.contains(secret));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+        }
+        if args.len() > 1 {
+            let redacted: Value = serde_json::from_str(&text)?;
+            assert_eq!(redacted["pendingApp"]["app"]["pem"], "[hidden]");
+            assert_eq!(redacted["pendingApp"]["app"]["webhookSecret"], "[hidden]");
+            assert_eq!(redacted["pendingApp"]["app"]["id"], 42);
+        }
+    }
+    assert_eq!(config::load(fixture.root.path())?, saved);
+    Ok(())
+}
+
+#[tokio::test]
 async fn pair_and_combined_cleanup_each_emit_one_json_document() -> Result<()> {
     let fixture = Fixture::new("both", empty_status()).await?;
     let pairing = stdout(&fixture.run(&["pair", "--format", "json"]).await?);
