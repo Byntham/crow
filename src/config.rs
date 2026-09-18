@@ -95,6 +95,7 @@ pub fn validate_config(value: &Value) -> Result<()> {
     let c = object(value, "configuration")?;
     let worker = &value["worker"];
     object(worker, "worker configuration")?;
+    crate::execution::validate(&worker["execution"])?;
     let sub = &worker["subagents"];
     object(sub, "subagent settings")?;
     let retry = &worker["retry"];

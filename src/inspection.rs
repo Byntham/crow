@@ -224,6 +224,56 @@ fn strings(args: &[&str]) -> Vec<String> {
     args.iter().map(|s| (*s).to_owned()).collect()
 }
 
+/// Export pinned source without consulting repository export-ignore/export-subst
+/// attributes. The archive is passed to the container, never unpacked on the host.
+pub async fn execution_archive(
+    source: &Value,
+    revision_key: &str,
+    output: &Path,
+    cancel: CancellationToken,
+) -> Result<()> {
+    use std::io::Write;
+    let attributes = tempfile::tempdir()?;
+    let mut file = std::fs::File::create(output)?;
+    let mut total = 0usize;
+    git_stream(
+        source_dir(source)?,
+        &strings(&[
+            "-c",
+            "core.bare=false",
+            "archive",
+            "--worktree-attributes",
+            "--format=tar",
+            source_rev(source, revision_key)?,
+        ]),
+        &BTreeMap::from([
+            (
+                "GIT_WORK_TREE".into(),
+                attributes.path().to_string_lossy().into_owned(),
+            ),
+            (
+                "GIT_INDEX_FILE".into(),
+                attributes
+                    .path()
+                    .join("empty-index")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        ]),
+        cancel,
+        |chunk| {
+            total += chunk.len();
+            ensure!(
+                total <= 128 * 1024 * 1024,
+                "Execution source archive exceeds 128 MiB"
+            );
+            file.write_all(chunk)?;
+            Ok(())
+        },
+    )
+    .await
+}
+
 pub async fn checkout(
     root: &Path,
     job: &Value,
@@ -815,6 +865,19 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
     } else {
         None
     };
+    let execution = context
+        .as_ref()
+        .map(|context| {
+            crate::execution::Execution::from_context(
+                context,
+                &source_path
+                    .parent()
+                    .context("Missing review directory")?
+                    .join("experiments"),
+            )
+        })
+        .transpose()?
+        .flatten();
     let delegation = if let Some(context) = context.filter(|v| {
         v["job"]["settings"]["subagents"]["max"]
             .as_u64()
@@ -849,6 +912,9 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
             definitions.push(tool);
         }
     }
+    if execution.is_some() {
+        definitions.extend(crate::execution::tools());
+    }
     let mut stdin = BufReader::new(crate::process::NonblockingIo::stdin()?);
     let mut stdout = crate::process::NonblockingIo::stdout()?;
     #[cfg(unix)]
@@ -878,13 +944,17 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
                 Some("initialize")=>json!({"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"crow-inspection","version":"1.0.0"}}}),
                 Some("tools/list")=>json!({"result":{"tools":definitions}}), Some("ping")=>json!({"result":{}}),
                 Some("tools/call")=>{
+                    let cancel = CancellationToken::new();
                     let call=async {
                         let params=&request["params"]; let name=params["name"].as_str().ok_or_else(||anyhow!("Invalid tool request"))?;
                         let empty=json!({}); let args=params.get("arguments").filter(|v|!v.is_null()).unwrap_or(&empty);
                         if let Some(delegate)=&delegation&& crate::delegation::tools().as_array().is_some_and(|ts|ts.iter().any(|t|t["name"]==name)){return delegate.call(name,args).await;}
+                        if let Some(execution) = &execution && ["run_experiment", "list_experiments"].contains(&name) { return execution.call(name, args, cancel.clone()).await; }
                         inspection_tool(&source,name,args).await
                     };
-                    let output=tokio::select!{_=&mut stop=>break,result=call=>result};
+                    let experiment = execution.is_some() && request["params"]["name"].as_str().is_some_and(|name| ["run_experiment", "list_experiments"].contains(&name));
+                    tokio::pin!(call);
+                    let output=tokio::select!{_=&mut stop=>{ cancel.cancel(); if experiment { let _ = call.await; } break; },result=&mut call=>result};
                     match output {Ok(value)=>json!({"result":{"content":[{"type":"text","text":value.as_str().map(str::to_owned).unwrap_or_else(||value.to_string())}]}}),Err(e)=>json!({"result":{"isError":true,"content":[{"type":"text","text":e.to_string()}]}})}
                 }
                 _=>json!({"error":{"code":-32601,"message":"Unsupported method"}}),

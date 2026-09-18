@@ -43,6 +43,8 @@ Each `repo-config` call replaces that repository's overrides; omitted settings u
 
 Optional `.crow/review.md` holds review-specific guidance. It is not generated during setup. Normal coding agents are not instructed to read it. Crow also reads applicable `AGENTS.md` files. Both come from the pinned target branch so a PR cannot replace its own review instructions. Rule changes apply to the next review; they do not trigger a backlog automatically.
 
+For opt-in execution of tests and reproductions, see [runtime experiments](runtime-experiments.md). The `worker.execution` setting stays local to the worker and is not a repository override on the service.
+
 ## Work and recovery
 
 ```sh

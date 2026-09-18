@@ -33,6 +33,17 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test native implementation
         run: cargo test --locked --all-targets
+      - name: Test real rootless runtime experiments
+        if: matrix.arch == 'x64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes podman uidmap
+          sudo loginctl enable-linger "$USER"
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+          podman pull docker.io/library/alpine:3.22
+          export CROW_TEST_IMAGE=$(podman image inspect --format '{{.Id}}' docker.io/library/alpine:3.22)
+          systemd-run --user --scope -p Delegate=yes -- cargo test --locked --test execution_mcp -- --ignored --nocapture
       - name: Install native musl compiler
         run: sudo apt-get update && sudo apt-get install --yes musl-tools binutils
       - name: Build and package portable native executable

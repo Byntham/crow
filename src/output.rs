@@ -565,6 +565,20 @@ fn configuration(v: &Value) -> String {
         field(&mut out, "Worker ID", scalar(&v["worker"]["id"]));
         field(&mut out, "Service URL", scalar(&v["serviceUrl"]));
         settings(&mut out, &v["worker"]);
+        let repositories = v["worker"]["execution"]["repositories"].as_object();
+        field(
+            &mut out,
+            "Runtime experiments",
+            repositories.filter(|r| !r.is_empty()).map_or_else(
+                || "Disabled".to_owned(),
+                |r| {
+                    format!(
+                        "Enabled for {}",
+                        r.keys().cloned().collect::<Vec<_>>().join(", ")
+                    )
+                },
+            ),
+        );
     }
     if v["role"] != "worker" {
         section(&mut out, "Scheduling and history");

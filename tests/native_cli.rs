@@ -230,3 +230,38 @@ fn private_mcp_entry_uses_the_same_executable() -> Result<()> {
     assert!(child.0.wait()?.success());
     Ok(())
 }
+
+#[test]
+fn execution_configuration_roundtrips_through_public_cli() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    config::save(root.path(), &config::defaults(root.path()))?;
+    let settings =
+        json!({"repositories":{"owner/repo":{"image":format!("sha256:{}", "a".repeat(64))}}});
+    let output = Command::new(binary())
+        .args(["config", "worker.execution", &settings.to_string()])
+        .env("CROW_HOME", root.path())
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    ensure!(
+        config::load(root.path())?["worker"]["execution"] == settings,
+        "Execution settings did not persist"
+    );
+    let output = Command::new(binary())
+        .args([
+            "config",
+            "worker.execution",
+            "{\"repositories\":{\"owner/repo\":{\"image\":\"alpine:latest\"}}}",
+        ])
+        .env("CROW_HOME", root.path())
+        .output()?;
+    ensure!(!output.status.success(), "Mutable image tag was accepted");
+    ensure!(
+        config::load(root.path())?["worker"]["execution"] == settings,
+        "Invalid configuration replaced saved settings"
+    );
+    Ok(())
+}

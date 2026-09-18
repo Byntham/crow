@@ -36,11 +36,11 @@ See the [Linux quickstart](docs/user/quickstart.md), [HTTPS choices](docs/user/n
 - Repository policies initially allow only your PRs. You can add authors or allow everyone. Authorized fork PRs targeting an enrolled repository are included.
 - Drafts and the initial open backlog are skipped. Startup/recovery catch-up repairs missed work, with large batches held for release.
 - Each worker allows three simultaneous reviews. Each review can use up to eight subagents. Both limits are configurable.
-- Reviews inspect files and diffs through dedicated read-only tools. They cannot run repository tests, scripts, or dependency installation.
+- Reviews inspect files and diffs through dedicated read-only tools. Workers can optionally run tests and reproductions in disposable rootless containers, comparing the PR head with its base. See [runtime experiments](docs/user/runtime-experiments.md).
 - Findings are advisory. Crow does not approve, request changes, or block merging.
 - Retries resume saved work where possible. The default is ten retries separated by at least five seconds. Reports publish only after completion and validation.
 
-Optional review instructions belong in `.crow/review.md`. Crow also reads applicable `AGENTS.md` files from the pinned target branch. These instructions cannot alter author authorization or permit execution of repository code.
+Optional review instructions belong in `.crow/review.md`. Crow also reads applicable `AGENTS.md` files from the pinned target branch. These instructions cannot alter author authorization or enable execution. Runtime experiments require the worker operator's local configuration.
 
 ## Development
 

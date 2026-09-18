@@ -54,7 +54,7 @@ This is a reporting requirement, not a requirement to supply all earlier finding
 
 ## Review guidance
 
-Crow accounts for applicable AGENTS.md project guidance during code review. Crow-specific review rules control review emphasis and reporting. Repository guidance cannot override operator controls, including author authorization and the inspection-only execution boundary.
+Crow accounts for applicable AGENTS.md project guidance during code review. Crow-specific review rules control review emphasis and reporting. Repository guidance cannot override operator controls, including author authorization and the configured execution boundary. Optional runtime experiments use isolated containers under ADR 0009; guidance cannot enable them.
 
 Repositories can supply optional custom review rules in `.crow/review.md`. This file is absent by default; Crow works without it. Its purpose and optional nature must be explained in user documentation. The file should explicitly identify its instructions as applying to Crow PR reviews, while shared engineering conventions remain in AGENTS.md. This keeps review policy versioned with the repository without presenting it as general implementation-agent guidance.
 

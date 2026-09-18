@@ -494,6 +494,11 @@ async fn execute(shared: Arc<Shared>, work: Value, cancel: CancellationToken) {
     if let Some(extra) = job["settings"].as_object() {
         settings.extend(extra.clone());
     }
+    // Execution authority is local to this worker, never supplied by a job.
+    settings.insert(
+        "execution".into(),
+        shared.config["worker"]["execution"].clone(),
+    );
     job["settings"] = Value::Object(settings);
     job["prContext"] = json!({"title":work["pr"]["title"].as_str().unwrap_or("").chars().take(1000).collect::<String>(),"body":work["pr"]["body"].as_str().unwrap_or("").chars().take(16000).collect::<String>()});
     let session_value = Arc::new(Mutex::new(job["session"].clone()));
@@ -1002,6 +1007,10 @@ mod tests {
             self.reviews.fetch_add(1, Ordering::SeqCst);
             assert!(job["settings"].get("codexHome").is_some());
             assert!(job["settings"].get("token").is_none());
+            assert!(
+                job["settings"]["execution"].is_null(),
+                "Job-supplied execution settings must not grant authority"
+            );
             if let Some(callback) = callbacks.on_session {
                 callback(json!(SESSION)).await?;
             }
@@ -1036,6 +1045,17 @@ mod tests {
             .await
             .unwrap()
     }
+    #[tokio::test]
+    async fn service_job_cannot_enable_execution_on_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = Arc::new(Fake::new());
+        f.queue.lock().await[0]["job"]["settings"] = json!({"execution":{"repositories":{"owner/project":{"image":format!("sha256:{}", "a".repeat(64))}}}});
+        let worker = start(dir.path(), f.clone()).await;
+        f.until("report", 1).await;
+        worker.close().await.unwrap();
+        assert_eq!(f.reviews.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn lost_publication_response_reuses_durable_report() {
         let dir = tempfile::tempdir().unwrap();

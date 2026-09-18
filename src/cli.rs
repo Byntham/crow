@@ -198,7 +198,7 @@ Continue later with crow resume owner/repo 42.")]
 
 Editable settings:
   worker.model, worker.effort, worker.concurrency, worker.timeoutMs
-  worker.subagents, worker.retry (JSON objects)
+  worker.subagents, worker.retry, worker.execution (JSON objects)
   catchUp.enabled, catchUp.threshold, auditIntervalMs, retentionDays
 
 Choose the model and reasoning level from crow models.
@@ -552,6 +552,7 @@ async fn configured_command(format: OutputFormat, command: Command, root: &Path)
                 "worker.effort",
                 "worker.subagents",
                 "worker.retry",
+                "worker.execution",
                 "worker.timeoutMs",
                 "catchUp.enabled",
                 "catchUp.threshold",

@@ -41,6 +41,7 @@ enum Mode {
     Inventory,
     Interrupt,
     Resume,
+    Execution,
 }
 struct Capture {
     phase: Mode,
@@ -210,6 +211,12 @@ async fn handle(
         (phase, state.main_calls, state.child_calls)
     };
     match phase {
+        Mode::Execution => {
+            if main_calls == 1 {
+                return Ok(tool("const run=ALL_TOOLS.find(t=>t.name.endsWith('__run_experiment')); text(await tools[run.name]({revision:'base',command:'sh check.sh'})); text(await tools[run.name]({revision:'head',command:'sh check.sh'}));".into(), "experiments"));
+            }
+            return Ok(complete());
+        }
         Mode::Inventory => {
             if child && child_calls == 1 {
                 return Ok(tool(INVENTORY.into(), "child"));
@@ -662,5 +669,77 @@ async fn interruption_stops_processes_and_resumes_parent_and_child() -> Result<(
             "Missing output schema on initial or resumed request"
         );
     }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires installed Codex, rootless Podman and CROW_TEST_IMAGE; synthetic responses only"]
+async fn runtime_executes_real_containers_and_publishes_receipts() -> Result<()> {
+    let mut fixture = Fixture::new(Mode::Execution).await?;
+    let repo = fixture.directory.path().join("source");
+    fs::create_dir(&repo)?;
+    let git = |args: &[&str]| -> Result<String> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .envs(crow::util::clean_env())
+            .env("GIT_AUTHOR_NAME", "Fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "Git: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    };
+    git(&["init", "-b", "main"])?;
+    fs::write(repo.join("check.sh"), "test 5 = 5\n")?;
+    git(&["add", "."])?;
+    git(&["commit", "-m", "base"])?;
+    let base = git(&["rev-parse", "HEAD"])?;
+    fs::write(repo.join("check.sh"), "test 4 = 5\n")?;
+    git(&["add", "."])?;
+    git(&["commit", "-m", "regression"])?;
+    let head = git(&["rev-parse", "HEAD"])?;
+    fixture.source = json!({"dir":repo,"head":head,"base":base,"target":"main"});
+    fixture.job["comparison"] = fixture.source.clone();
+    fixture.job["settings"]["execution"] = json!({"podman":std::env::var("CROW_TEST_PODMAN").unwrap_or("podman".into()),"repositories":{"fixture/repository":{"image":std::env::var("CROW_TEST_IMAGE").context("Set CROW_TEST_IMAGE")?,"timeoutSeconds":5,"memoryMiB":128,"workspaceMiB":32,"cpus":1,"pids":32}}});
+    fixture.job["settings"]["subagents"]["max"] = json!(0);
+    let report = fixture.run(&fixture.job, fixture.cancel.clone()).await?;
+    fixture.check_errors()?;
+    let summary = report["summary"].as_str().context("Missing report")?;
+    ensure!(
+        summary.contains("passed") && summary.contains("failed"),
+        "{summary}"
+    );
+    let receipts = fixture.directory.path().join("reviews/probe/experiments");
+    let results: Vec<Value> = fs::read_dir(receipts)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|e| e == "json"))
+        .map(|e| serde_json::from_slice(&fs::read(e.path()).unwrap()).unwrap())
+        .collect();
+    ensure!(
+        results.len() == 2,
+        "Expected two real experiment receipts: {results:?}"
+    );
+    ensure!(
+        results
+            .iter()
+            .any(|r| r["commit"] == base && r["status"] == "passed"),
+        "Base did not pass"
+    );
+    ensure!(
+        results
+            .iter()
+            .any(|r| r["commit"] == head && r["status"] == "failed"),
+        "Head did not fail"
+    );
+    println!(
+        "Installed Codex -> Crow MCP -> rootless containers -> persisted report passed.\n{summary}"
+    );
     Ok(())
 }
