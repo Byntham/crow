@@ -949,13 +949,13 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
                         let params=&request["params"]; let name=params["name"].as_str().ok_or_else(||anyhow!("Invalid tool request"))?;
                         let empty=json!({}); let args=params.get("arguments").filter(|v|!v.is_null()).unwrap_or(&empty);
                         if let Some(delegate)=&delegation&& crate::delegation::tools().as_array().is_some_and(|ts|ts.iter().any(|t|t["name"]==name)){return delegate.call(name,args).await;}
-                        if let Some(execution) = &execution && ["run_experiment", "list_experiments"].contains(&name) { return execution.call(name, args, cancel.clone()).await; }
+                        if let Some(execution) = &execution && crate::execution::TOOL_NAMES.contains(&name) { return execution.call(name, args, cancel.clone()).await; }
                         inspection_tool(&source,name,args).await
                     };
-                    let experiment = execution.is_some() && request["params"]["name"].as_str().is_some_and(|name| ["run_experiment", "list_experiments"].contains(&name));
+                    let experiment = execution.is_some() && request["params"]["name"].as_str().is_some_and(|name| crate::execution::TOOL_NAMES.contains(&name));
                     tokio::pin!(call);
                     let output=tokio::select!{_=&mut stop=>{ cancel.cancel(); if experiment { let _ = call.await; } break; },result=&mut call=>result};
-                    match output {Ok(value)=>json!({"result":{"content":[{"type":"text","text":value.as_str().map(str::to_owned).unwrap_or_else(||value.to_string())}]}}),Err(e)=>json!({"result":{"isError":true,"content":[{"type":"text","text":e.to_string()}]}})}
+                    match output {Ok(value) if experiment && request["params"]["name"] == "read_artifact" => json!({"result":value}),Ok(value)=>json!({"result":{"content":[{"type":"text","text":value.as_str().map(str::to_owned).unwrap_or_else(||value.to_string())}]}}),Err(e)=>json!({"result":{"isError":true,"content":[{"type":"text","text":e.to_string()}]}})}
                 }
                 _=>json!({"error":{"code":-32601,"message":"Unsupported method"}}),
             };

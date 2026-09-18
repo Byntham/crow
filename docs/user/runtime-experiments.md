@@ -1,71 +1,61 @@
-# Run tests during reviews
+# Run applications during reviews
 
-Crow can run tests, reproduce a suspected bug, or start an application and probe it inside a disposable Linux container. Each experiment uses the exact PR head or comparison-base commit. The reviewer can run the same command against both revisions and use the results in its findings.
+Crow can discover how a project runs, prepare its dependencies, run tests and browser experiments, and inspect screenshots. Developers do not need to supply testing instructions on each PR. Crow reads existing manifests, CI configuration and documentation, chooses an investigation, and retries setup when the logs reveal a fixable problem.
 
-Execution is optional. Existing installations remain inspection-only until the worker operator enables a repository. Podman is required only on workers that run experiments.
+## Enable automatic environments
 
-## Prepare an environment
+The worker needs local rootless Podman with user namespaces, seccomp and delegated cgroup v2 controllers. This is a one-time worker prerequisite, not a task for each repository's developers. Existing installations remain inspection-only until the worker operator enables execution.
 
-Install rootless Podman with an OCI runtime, user namespace mappings, seccomp, and delegated cgroup v2 CPU, memory and process controllers. On supported Ubuntu hosts, start with `sudo apt install podman uidmap`. Run Podman as the same unprivileged user that runs Crow. Check `podman info` and verify a resource-limited container runs under that user's systemd session. Crow rejects rootful and remote Podman.
-
-Build or load a trusted image containing your project's toolchain and dependencies. It must provide `/bin/sh` and `tar`. Do this outside a review, using dependencies and build instructions you trust. Crow does not execute a PR's Dockerfile on the host or download packages during experiments.
-
-For example, this image supports Python standard-library tests:
+Enable automatic environments for all repositories assigned to the worker:
 
 ```sh
-podman pull docker.io/library/python:3.13-slim
-podman image inspect --format '{{.Id}}' docker.io/library/python:3.13-slim
-```
-
-Use the full `sha256:` image ID printed by the second command. A mutable image tag is not accepted. Private images work once loaded into that user's local image store. Do not bake credentials into an image. Crow preserves the image's environment so compiler paths and runtime settings work, but sets `HOME=/tmp` and `CI=true`.
-
-For projects with dependencies, prepare an image from a trusted checkout. Examples include a Python virtual environment under `/opt/venv`, a Rust toolchain with a populated Cargo cache, or Node packages under `/opt/dependencies`. Keep these directories outside `/workspace` and `/tmp`, which Crow replaces with empty writable filesystems. Put offline setup instructions in `.crow/review.md`, such as copying cached Node dependencies into `/workspace/node_modules` or running Cargo with `--offline`. Images are read-only during experiments, so dependencies that need a writable cache must copy it into the workspace first.
-
-An image can also include a database or headless browser. The experiment command can start services in the background, wait for readiness, and test them through loopback. All processes belong to the same isolated container and stop when the experiment ends. This version does not export screenshots or other binary artifacts; test commands return text output.
-
-## Enable selected repositories
-
-On the worker, replace the example image ID below with the ID from your local image store:
-
-```sh
-crow config worker.execution '{"repositories":{"owner/repo":{"image":"sha256:REPLACE_WITH_64_HEX_DIGITS","timeoutSeconds":120,"memoryMiB":1024,"workspaceMiB":512,"cpus":2,"pids":128,"maxRuns":12}}}'
+crow config worker.execution '{"automatic":true}'
 crow doctor --runtime
 crow service-restart
 ```
 
-`worker.execution` is a local worker setting. It is not a service-side `repo-config` override. On split installations, configure the worker that owns the repository. Repository names must match the enrolled `owner/repo` name. To enable several repositories, add entries to `repositories`. Updating this object replaces the whole mapping.
+No image IDs, test commands, or new budget settings are required. Crow provisions a shared toolchain image itself. It currently contains Node/npm, Python/pip, Rust/Cargo, Go, C/C++ build tools, Chromium/Playwright, SQLite and PostgreSQL tools. These are stock Linux toolchains; projects requiring other versions or platforms may still need a custom image. Repository Dockerfiles are evidence for setup, never instructions to execute on the host.
 
-Only `image` is required for each repository. The example shows all defaults. `timeoutSeconds` must be between 1 and 1800; `maxRuns` must be between 1 and 50. Every attempted experiment consumes one run, including environment failures. Running a comparison on both base and head consumes two runs. The budget survives review resumes; an explicit review restart starts a new budget.
-
-The main reviewer runs at most one experiment at a time per review. Subagents continue to inspect code and can suggest experiments to the main reviewer. Worker review concurrency still applies, so size memory limits for all simultaneous reviews.
-
-To disable all runtime experiments:
+Alternatively, enable selected repositories with automatic images:
 
 ```sh
-crow config worker.execution '{"repositories":{}}'
-crow service-restart
+crow config worker.execution '{"repositories":{"owner/repo":{}}}'
 ```
 
-The optional `podman` field selects an executable path, for example `{"podman":"/usr/bin/podman","repositories":{...}}`. It does not accept shell arguments. Crow leaves runtime installation and image preparation under operator control.
+An entry without `image` uses `"image":"auto"`. Existing entries specifying a local immutable `sha256:` image ID still work. Those images must include the tools the project needs; dependency preparation through the package gateway requires Python 3, GNU tar, and `/opt/crow/proxy.py` from Crow's runtime image. `podman` can select a local executable path. These are local worker settings; a PR or connection-service job cannot grant execution authority.
 
-## What runs
+## What Crow does
 
-The `run_experiment` tool accepts a shell command and either `head` or `base`. Crow supplies an archive of that pinned commit, without checking out source on the host. Repository export attributes do not hide or rewrite files. Executable permissions and symlinks are preserved. Extraction and all repository code run inside the container.
+The reviewer discovers manifests and relevant CI/documentation, then selects setup commands. Discovery offers candidates for Node, Python, Rust and Go projects, including nested projects. These candidates are not promises that a particular command is correct. The reviewer inspects the project and adapts them.
 
-The command starts in `/workspace`. It can create a reproduction test, modify its disposable files, compile software, run existing tests, or launch an application. Every subsequent experiment starts fresh. Temporary tests must be included in the command to run them against both revisions.
+`prepare_environment` runs installation in a fresh sandbox at a pinned revision. It saves the resulting workspace only after successful preparation. Dependencies and caches must stay under `/workspace`; `HOME` is `/workspace/.crow-home`. Environment variables exported in one setup shell do not persist into later test shells, so test commands must activate a virtual environment or use explicit tool paths when needed.
 
-Containers have no network route to the internet, host or other containers. Loopback services within the experiment work. They receive no host mounts, Docker socket, GitHub token or provider credentials. All Linux capabilities are dropped, privilege escalation is disabled, and the root filesystem is read-only. CPU, memory, process count, writable filesystem size and wall time are bounded. Crow verifies the container's actual cgroup limits before extracting source. Output is limited to 32 KiB per stream while Crow continues draining excess bytes. Container logs are disabled to avoid an unbounded copy on disk.
+Preparation can download packages through a restricted HTTPS gateway. The container still has no external network interface. A private Unix socket connects its loopback proxy to Crow's gateway, which accepts only selected public package hosts on port 443. It rejects private and special IP addresses after DNS resolution and connects to the validated address. It does not forward worker credentials. Arbitrary URLs, private registries and production services are unavailable.
 
-Rootless containers share the host kernel. Operators who accept hostile code from arbitrary authors should run the Crow worker on a dedicated disposable machine or VM as an additional boundary.
+The package hosts currently cover npm/Yarn, PyPI, crates.io, the Go module proxy and checksum service, Maven Central and RubyGems. Inclusion of a package host does not mean every language toolchain is installed. Requests, concurrent connections and connection lifetimes are bounded. The gateway carries HTTPS tunnels; it is not a package vulnerability scanner or a guarantee against uploads to an allowed service.
 
-## Results and limitations
+`run_experiment` restores the selected prepared workspace into a fresh, offline container. It verifies that the environment belongs to the exact requested commit and current image, then restores tracked source from that commit over the dependency snapshot. Setup hooks cannot silently replace the tracked source under test. The download socket is absent. Crow can run existing tests, write temporary reproductions, start services and exercise them through loopback. It compares equivalent experiments on base and head before attributing failures to the change.
 
-GitHub reports include outcome counts for every experiment and a table of up to twelve experiments with the commit, outcome, exit code and command excerpt. The worker retains the complete command, image ID, configured limits, elapsed time and bounded stdout/stderr in `reviews/JOB_ID/experiments/*.json` under `CROW_HOME`. The reviewer can retrieve these receipts with `list_experiments` after resuming. Normal review retention also removes these files.
+Successful preparations are reused when the repository location, exact commit, image and setup command match. A new commit always invalidates that snapshot. This also permits reuse across reviews when one PR's head becomes a later comparison base. Shared snapshots are pruned by age and an approximately 4 GiB size cap; each snapshot is limited to 512 MiB. Cache entries are archived with owner-write permission so unprivileged restoration can populate read-only module directories. Original tracked-file permissions are restored from Git before testing. Crow never extracts archives on the host. The cache is an optimization, not evidence that an application passed tests.
 
-Crow distinguishes successful and failed commands, environment errors, timeouts, and interruptions. A failed command alone is not evidence that the PR introduced a bug. The reviewer must consider the base result, source evidence and environment limitations. Exit codes 125–127 are treated as environment errors; a test suite using those codes may need interpretation. OOM kills and other signals can also reflect resource limits.
+## Visual investigations
 
-A pause or cancellation stops and removes the container. Podman's own deadline also stops it if Crow is killed abruptly. A resumed tool session removes an unfinished run before starting another experiment. Interrupted runs consume budget and never appear as successful results. An enabled review that runs no experiments says so in its report.
+The managed image supplies Playwright at `/opt/browser/node_modules/playwright-core/index.mjs` and Chromium at `/usr/bin/chromium`. Launch Chromium with `--no-sandbox --disable-dev-shm-usage` inside Crow's constrained outer container. The reviewer can navigate the running application, interact with it and capture screenshots using ordinary Playwright commands.
 
-The initial backend supports Linux workloads that can run offline in one container. Native macOS/Windows apps, GPU or device access, external services and live credentials are outside its scope. Git metadata, submodule contents and Git LFS objects are not materialized; LFS pointer files remain pointer files. Source archives are limited to 128 MiB. Projects that require these features need a prepared fixture or a future backend.
+An experiment can request up to three PNG artifacts by absolute container path. Crow exports and validates each image before removing the container. Each image must be under 4 MiB and no larger than 4096 pixels in either dimension. `read_artifact` returns actual MCP image content, with the generating command and commit, so a vision-capable reviewer can inspect it. DOM and accessibility checks alone do not establish visual correctness.
 
-`crow doctor --runtime` checks the runtime and configured images. It does not prove your application's dependency setup works. If a review reports a missing dependency, correct the image, update the configured image ID and restart the worker before requesting a fresh review.
+Artifacts and receipts remain in the worker's review directory and follow normal review retention. They are not automatically uploaded to GitHub. A missing or invalid artifact is reported explicitly without converting a successful test command into a claim of visual verification.
+
+## Limits and failures
+
+Existing experiment limits still apply. Defaults are 120 seconds per setup/test command, 1 GiB of RAM, 512 MiB for each writable filesystem, two CPUs, 128 PIDs, and 12 attempts per review. Existing overrides still work; no new budget configuration is needed. First-time toolchain provisioning has a separate internal 30-minute ceiling and remains subject to review cancellation and the existing review timeout. It is recorded separately as `provisionMs` so a cold image build does not consume the command's runtime deadline.
+
+Every attempted setup or experiment counts toward the existing attempt limit, including cache hits and failures. Discovery and reading saved evidence do not. The main reviewer executes serially; delegated reviewers remain inspection-only. Resumes retain receipts and successful preparations.
+
+Reports distinguish setup from test commands. Passing dependency installation does not mean tests passed. An environment failure, timeout, pre-existing test failure or missing screenshot must not be reported as proof of a PR regression. If Crow cannot repair the setup, it continues inspection and explains the concrete gap in runtime coverage.
+
+Source and dependency code run only in rootless containers with no host workspace mounts, host credentials, Linux capabilities or privilege escalation. The root filesystem is read-only. During setup, the sole host mount contains the restricted download socket; tests have no host mounts. Memory, CPU, process count, scratch space, output and time are bounded. Crow verifies resource limits before extracting source. Cancellation stops the container; interrupted work is recovered on resume. Rootless containers share the host kernel, so workers reviewing hostile code should run on dedicated machines or VMs.
+
+Linux workloads are the first backend. Native macOS/Windows applications, GPUs, devices, private dependencies and authenticated external services can block runtime investigation. Source archives do not materialize Git metadata, submodules or LFS objects, and are limited to 128 MiB. Crow reports those limits rather than treating untested behavior as verified.
+
+To disable execution, replace the worker setting with `{"automatic":false,"repositories":{}}` and restart the service.

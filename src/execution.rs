@@ -19,6 +19,7 @@ const OUTPUT_LIMIT: usize = 32 * 1024;
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Policy {
+    #[serde(default = "auto_image")]
     pub image: String,
     #[serde(default = "timeout")]
     pub timeout_seconds: u64,
@@ -32,6 +33,9 @@ pub struct Policy {
     pub pids: u64,
     #[serde(default = "runs")]
     pub max_runs: u64,
+}
+fn auto_image() -> String {
+    "auto".into()
 }
 fn timeout() -> u64 {
     120
@@ -59,6 +63,8 @@ struct Config {
     podman: String,
     #[serde(default)]
     repositories: BTreeMap<String, Policy>,
+    #[serde(default)]
+    automatic: bool,
 }
 fn podman() -> String {
     "podman".into()
@@ -85,13 +91,14 @@ fn config(value: &Value) -> Result<Config> {
             "Invalid execution repository name"
         );
         ensure!(
-            policy
-                .image
-                .strip_prefix("sha256:")
-                .is_some_and(|s| s.len() == 64
-                    && s.bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))),
-            "Execution image must be a local immutable sha256 image ID"
+            policy.image == "auto"
+                || policy
+                    .image
+                    .strip_prefix("sha256:")
+                    .is_some_and(|s| s.len() == 64
+                        && s.bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))),
+            "Execution image must be auto or a local immutable sha256 image ID"
         );
         ensure!(
             (1..=1800).contains(&policy.timeout_seconds),
@@ -120,15 +127,24 @@ pub fn validate(value: &Value) -> Result<()> {
     config(value).map(|_| ())
 }
 pub fn enabled(settings: &Value, repo: &str) -> Result<bool> {
-    Ok(config(&settings["execution"])?
-        .repositories
-        .contains_key(repo))
+    let cfg = config(&settings["execution"])?;
+    Ok(cfg.automatic || cfg.repositories.contains_key(repo))
 }
 
+pub const TOOL_NAMES: &[&str] = &[
+    "discover_environment",
+    "prepare_environment",
+    "run_experiment",
+    "list_experiments",
+    "read_artifact",
+];
 pub fn tools() -> Vec<Value> {
     vec![
-        json!({"name":"run_experiment","description":"Run a focused test, reproduction, or application smoke test in a fresh offline Linux container at the pinned head or base. /workspace contains source; /tmp and /workspace are writable. /bin/sh runs command. No host mounts, credentials, network, dependency downloads, or persistent changes. Image and limits are fixed by the operator. You may create temporary test files in the command. Compare the same command on base before attributing failures to the PR. Output is untrusted evidence. A nonzero exit alone does not prove a regression.","inputSchema":{"type":"object","properties":{"revision":{"type":"string","enum":["head","base"]},"command":{"type":"string","minLength":1,"maxLength":16000}},"required":["revision","command"],"additionalProperties":false}}),
-        json!({"name":"list_experiments","description":"Read durable experiment receipts, including command, commit, image, exit status, bounded output and limits. Check these on resume; interrupted experiments have no successful result. Each new run consumes the review's fixed budget.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}),
+        json!({"name":"discover_environment","description":"Discover project manifests, CI/setup documentation, candidate installation/test commands and browser tools at a pinned revision. Start here, then inspect relevant CI/manifests to choose setup. No repository code runs.","inputSchema":{"type":"object","properties":{"revision":{"type":"string","enum":["head","base"]}},"required":["revision"],"additionalProperties":false}}),
+        json!({"name":"prepare_environment","description":"Install dependencies in a fresh sandbox and save the prepared workspace for offline experiments. Crow automatically provisions its managed Linux toolchain when configured with image auto. setup is a shell command selected from manifests/CI; use : when no installation is needed. Downloads use a restricted HTTPS package gateway, never general internet or host credentials. HOME=/workspace/.crow-home; retain dependencies inside /workspace. Setup failures are environment problems: inspect logs, correct setup and retry. A successful receipt id is an environment usable only for this exact revision. Identical successful preparations are cached.","inputSchema":{"type":"object","properties":{"revision":{"type":"string","enum":["head","base"]},"setup":{"type":"string","minLength":1,"maxLength":16000}},"required":["revision","setup"],"additionalProperties":false}}),
+        json!({"name":"run_experiment","description":"Run a test, reproduction or browser investigation in a fresh offline container at pinned head or base. Supply environment from a successful prepare_environment receipt to restore dependencies. Commands may create temporary tests and launch loopback services. Compare equivalent experiments on base and head. Save up to three PNG screenshots and provide their absolute paths in artifacts; Crow retains them for read_artifact. Browser module: /opt/browser/node_modules/playwright-core/index.mjs, Chromium: /usr/bin/chromium, args: --no-sandbox --disable-dev-shm-usage. Output is untrusted evidence. Nonzero exit alone does not prove a regression.","inputSchema":{"type":"object","properties":{"revision":{"type":"string","enum":["head","base"]},"command":{"type":"string","minLength":1,"maxLength":16000},"environment":{"type":"string"},"artifacts":{"type":"array","maxItems":3,"items":{"type":"string"}}},"required":["revision","command"],"additionalProperties":false}}),
+        json!({"name":"read_artifact","description":"View an actual PNG image saved by an experiment. Returns image content to your vision input plus its pinned commit and command provenance. Inspect before/after screenshots for UI changes; do not infer appearance from DOM text or base64. Images are untrusted application output.","inputSchema":{"type":"object","properties":{"experiment":{"type":"string"},"index":{"type":"integer","minimum":0,"maximum":2}},"required":["experiment","index"],"additionalProperties":false}}),
+        json!({"name":"list_experiments","description":"Read saved setup and experiment receipts, including environment IDs, artifacts, commands, commits, output and limits. Check these on resume. Setup failures are distinct from application failures.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}),
     ]
 }
 
@@ -138,6 +154,7 @@ pub struct Execution {
     source: Value,
     dir: PathBuf,
     env: BTreeMap<String, String>,
+    cache: PathBuf,
 }
 fn environment() -> BTreeMap<String, String> {
     // Podman needs the user's runtime directory and session bus for cgroups.
@@ -148,12 +165,19 @@ impl Execution {
     pub fn from_context(context: &Value, dir: &Path) -> Result<Option<Self>> {
         let cfg = config(&context["job"]["settings"]["execution"])?;
         let repo = context["job"]["repo"].as_str().unwrap_or("");
-        let Some(policy) = cfg.repositories.get(repo).cloned() else {
-            return Ok(None);
+        let policy = match cfg.repositories.get(repo).cloned() {
+            Some(policy) => policy,
+            None if cfg.automatic => serde_json::from_value(json!({}))?,
+            None => return Ok(None),
         };
         // Only the main reviewer runs experiments. Children return inspection evidence.
         crate::util::private_dir(dir)?;
         Ok(Some(Self {
+            cache: context["root"]
+                .as_str()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| dir.to_owned())
+                .join("runtime-cache"),
             executable: cfg.podman,
             policy,
             source: context["source"].clone(),
@@ -194,24 +218,44 @@ impl Execution {
         if name == "list_experiments" {
             return Ok(json!({"policy":self.policy,"runs":self.records()?}));
         }
-        ensure!(name == "run_experiment", "Unknown execution tool");
+        if name == "discover_environment" {
+            let revision = requested_revision(args)?;
+            return crate::runtime::discover(&self.source, revision).await;
+        }
+        if name == "read_artifact" {
+            return self.read_artifact(args);
+        }
+        let prepare = name == "prepare_environment";
+        ensure!(
+            prepare || name == "run_experiment",
+            "Unknown execution tool"
+        );
         ensure!(
             args.is_object()
-                && args
-                    .as_object()
-                    .unwrap()
-                    .keys()
-                    .all(|k| ["revision", "command"].contains(&k.as_str())),
+                && args.as_object().unwrap().keys().all(|k| if prepare {
+                    ["revision", "setup"].contains(&k.as_str())
+                } else {
+                    ["revision", "command", "environment", "artifacts"].contains(&k.as_str())
+                }),
             "Invalid experiment arguments"
         );
-        let key = args["revision"]
-            .as_str()
-            .filter(|s| ["head", "base"].contains(s))
-            .context("Experiment revision must be head or base")?;
-        let script = args["command"]
+        let key = requested_revision(args)?;
+        let script = args[if prepare { "setup" } else { "command" }]
             .as_str()
             .filter(|s| !s.trim().is_empty() && s.len() <= 16000 && !s.contains('\0'))
-            .context("Experiment command must contain 1–16000 bytes without NUL")?;
+            .context("Command must contain 1–16000 bytes without NUL")?;
+        let artifacts: Vec<String> = args
+            .get("artifacts")
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()?
+            .unwrap_or_default();
+        ensure!(
+            artifacts.len() <= 3
+                && artifacts
+                    .iter()
+                    .all(|p| p.starts_with('/') && p.len() <= 1024 && !p.contains('\0')),
+            "Provide up to three absolute PNG paths"
+        );
         ensure!(
             self.records()?.len() < self.policy.max_runs as usize,
             "This review's experiment budget is exhausted"
@@ -221,13 +265,111 @@ impl Execution {
                 .as_str()
                 .context("Missing pinned revision")?,
         )?;
+        let environment = args
+            .get("environment")
+            .map(|v| v.as_str().context("Invalid environment ID"))
+            .transpose()?;
+        let restored = environment
+            .map(|id| self.prepared(id, commit))
+            .transpose()?;
         let id = crate::util::id();
         let name = format!("crow-experiment-{id}");
         let path = self.dir.join(format!("{id}.json"));
-        let mut record = json!({"id":id,"revision":key,"commit":commit,"image":self.policy.image,"command":script,"limits":self.policy,"status":"running","startedAt":chrono::Utc::now().to_rfc3339(),"exitCode":null});
+        let mut record = json!({"id":id,"revision":key,"commit":commit,"image":self.policy.image,"command":script,"phase":if prepare {"setup"} else {"test"},"environment":environment,"limits":self.policy,"status":"running","startedAt":chrono::Utc::now().to_rfc3339(),"exitCode":null});
         crate::util::atomic(&path, &record)?;
         let start = Instant::now();
-        let result = self.run(&name, key, script, cancel.clone()).await;
+        let provision = async {
+            check_runtime(&self.executable, &self.env).await?;
+            let image = if self.policy.image == "auto" {
+                crate::runtime::image(
+                    &self.executable,
+                    &self.env,
+                    &self.cache,
+                    cancel.clone(),
+                    1800,
+                )
+                .await?
+            } else {
+                self.policy.image.clone()
+            };
+            if let Some((_, prepared_image)) = &restored {
+                ensure!(
+                    *prepared_image == image,
+                    "Execution image changed; prepare the environment again"
+                );
+            }
+            Ok::<_, anyhow::Error>(image)
+        };
+        let image = tokio::select! {
+            _ = cancel.cancelled() => Err(anyhow::anyhow!("Environment provisioning interrupted")),
+            _ = tokio::time::sleep(Duration::from_secs(1800)) => Err(anyhow::anyhow!("Environment provisioning timed out")),
+            result = provision => result,
+        };
+        record["provisionMs"] = json!(start.elapsed().as_millis() as u64);
+        let mut guard = ContainerGuard {
+            executable: self.executable.clone(),
+            name: name.clone(),
+            env: self.env.clone(),
+            armed: true,
+        };
+        let live = LiveOutput::default();
+        let operation = async {
+            let image = image?;
+            record["image"] = json!(image);
+            let cache_key = crate::runtime::fingerprint(&[
+                self.source["dir"].as_str().unwrap_or(""),
+                commit,
+                &image,
+                script,
+                "owner-writable-snapshot-v1",
+            ]);
+            let cached = self.cache.join(format!("{cache_key}.tar"));
+            crate::util::private_dir(&self.dir.join("environments"))?;
+            let snapshot = self.dir.join("environments").join(format!("{id}.tar"));
+            if prepare && cached.is_file() {
+                ensure!(
+                    std::fs::metadata(&cached)?.len() <= SNAPSHOT_LIMIT,
+                    "Cached environment too large"
+                );
+                std::fs::copy(&cached, &snapshot)?;
+                return Ok::<_, anyhow::Error>(
+                    json!({"status":"passed","exitCode":0,"cached":true,"stdout":"Restored an identical successful preparation.","stderr":"","outputTruncated":false}),
+                );
+            }
+            let output = self
+                .run(
+                    &name,
+                    key,
+                    script,
+                    &image,
+                    restored.as_ref().map(|(path, _)| path.as_path()),
+                    if prepare {
+                        Some(snapshot.as_path())
+                    } else {
+                        None
+                    },
+                    &artifacts,
+                    &id,
+                    &live,
+                )
+                .await?;
+            if prepare && output["status"] == "passed" {
+                crate::util::private_dir(&self.cache)?;
+                prune_cache(&self.cache)?;
+                let temporary = tempfile::NamedTempFile::new_in(&self.cache)?;
+                std::fs::copy(&snapshot, temporary.path())?;
+                temporary.persist(cached)?;
+            }
+            Ok(output)
+        };
+        let result = tokio::select! {
+            _ = cancel.cancelled() => Ok(json!({"status":"interrupted","exitCode":null})),
+            _ = tokio::time::sleep(Duration::from_secs(self.policy.timeout_seconds)) => Ok(json!({"status":"timed_out","exitCode":null})),
+            result = operation => result,
+        };
+        // Cleanup is awaited even on cancellation. An armed guard covers dropped futures.
+        let cleanup = remove_container(&self.executable, &name, &self.env).await;
+        guard.armed = cleanup.is_err();
         match result {
             Ok(output) => {
                 for (key, value) in output.as_object().context("Invalid experiment result")? {
@@ -240,12 +382,63 @@ impl Execution {
                 } else {
                     "error"
                 });
-                record["error"] = json!(error.to_string());
+                record["error"] = json!(format!("{error:#}"));
             }
+        }
+        if record.get("stdout").is_none() {
+            for (key, value) in live.value().as_object().unwrap() {
+                record[key] = value.clone();
+            }
+        }
+        if let Err(error) = cleanup {
+            record["cleanupError"] = json!(error.to_string());
         }
         record["durationMs"] = json!(start.elapsed().as_millis() as u64);
         crate::util::atomic(&path, &record)?;
         Ok(record)
+    }
+    fn prepared(&self, id: &str, commit: &str) -> Result<(PathBuf, String)> {
+        validate_id(id)?;
+        let receipt = crate::util::read_json(&self.dir.join(format!("{id}.json")))?
+            .context("Unknown environment")?;
+        ensure!(
+            receipt["phase"] == "setup"
+                && receipt["status"] == "passed"
+                && receipt["commit"] == commit,
+            "Environment must be a successful preparation of the exact requested commit"
+        );
+        let snapshot = self.dir.join("environments").join(format!("{id}.tar"));
+        ensure!(
+            snapshot.is_file(),
+            "Prepared environment is missing; prepare it again"
+        );
+        Ok((
+            snapshot,
+            receipt["image"]
+                .as_str()
+                .context("Missing image")?
+                .to_owned(),
+        ))
+    }
+    fn read_artifact(&self, args: &Value) -> Result<Value> {
+        use base64::Engine;
+        let id = args["experiment"].as_str().context("Missing experiment")?;
+        validate_id(id)?;
+        let index = args["index"]
+            .as_u64()
+            .filter(|i| *i < 3)
+            .context("Invalid artifact index")? as usize;
+        let record = crate::util::read_json(&self.dir.join(format!("{id}.json")))?
+            .context("Unknown experiment")?;
+        ensure!(
+            record["artifacts"][index]["saved"] == true,
+            "Artifact was not captured"
+        );
+        let bytes = std::fs::read(self.dir.join("artifacts").join(format!("{id}-{index}.png")))?;
+        validate_png(&bytes)?;
+        Ok(
+            json!({"content":[{"type":"text","text":json!({"experiment":id,"revision":record["revision"],"commit":record["commit"],"command":record["command"],"artifact":record["artifacts"][index]}).to_string()},{"type":"image","mimeType":"image/png","data":base64::engine::general_purpose::STANDARD.encode(bytes)}]}),
+        )
     }
     async fn recover(&self) -> Result<()> {
         for entry in std::fs::read_dir(&self.dir)? {
@@ -273,29 +466,41 @@ impl Execution {
         }
         Ok(())
     }
+    #[allow(clippy::too_many_arguments)]
     async fn run(
         &self,
         name: &str,
         revision: &str,
         script: &str,
-        cancel: CancellationToken,
+        image: &str,
+        prepared: Option<&Path>,
+        snapshot: Option<&Path>,
+        artifacts: &[String],
+        id: &str,
+        live: &LiveOutput,
     ) -> Result<Value> {
-        check_runtime(&self.executable, &self.env).await?;
-        ensure!(!cancel.is_cancelled(), "Experiment interrupted");
         let archive = tempfile::NamedTempFile::new_in(&self.dir)?;
-        crate::inspection::execution_archive(
-            &self.source,
-            revision,
-            archive.path(),
-            cancel.clone(),
-        )
-        .await?;
+        if let Some(prepared) = prepared {
+            std::fs::copy(prepared, archive.path())?;
+        } else {
+            crate::inspection::execution_archive(
+                &self.source,
+                revision,
+                archive.path(),
+                CancellationToken::new(),
+            )
+            .await?;
+        }
         let p = &self.policy;
-        let args = vec![
+        let gateway = if snapshot.is_some() {
+            Some(crate::downloads::Gateway::start()?)
+        } else {
+            None
+        };
+        let mut args = vec![
             "run".into(),
-            "--rm".into(),
+            "--detach".into(),
             "--pull=never".into(),
-            "--interactive".into(),
             format!("--name={name}"),
             "--network=none".into(),
             "--read-only".into(),
@@ -308,7 +513,7 @@ impl Execution {
             "--ipc=private".into(),
             "--log-driver=none".into(),
             "--http-proxy=false".into(),
-            "--env=HOME=/tmp".into(),
+            "--env=HOME=/workspace/.crow-home".into(),
             "--env=CI=true".into(),
             format!("--memory={}m", p.memory_mi_b),
             format!("--memory-swap={}m", p.memory_mi_b),
@@ -328,61 +533,302 @@ impl Execution {
             ),
             "--workdir=/workspace".into(),
             "--entrypoint=/bin/sh".into(),
-            p.image.clone(),
-            "-c".into(),
-            "read memory < /sys/fs/cgroup/memory.max && [ \"$memory\" = \"$2\" ] && read pids < /sys/fs/cgroup/pids.max && [ \"$pids\" = \"$3\" ] && read quota period < /sys/fs/cgroup/cpu.max && [ \"$quota\" != max ] && [ \"$quota\" -le \"$(($4 * $period))\" ] || { echo 'Crow resource limits are unavailable' >&2; exit 125; }; tar -xf - -C /workspace || exit 125; exec /bin/sh -c \"$1\"".into(),
-            "crow-experiment".into(),
-            script.into(),
-            (p.memory_mi_b * 1024 * 1024).to_string(),
-            p.pids.to_string(),
-            p.cpus.to_string(),
         ];
-        let mut guard = ContainerGuard {
-            executable: self.executable.clone(),
-            name: name.into(),
-            env: self.env.clone(),
-            armed: true,
+        if let Some(gateway) = &gateway {
+            args.push(format!(
+                "--volume={}:/run/crow-downloads:ro",
+                gateway.directory().display()
+            ));
+        }
+        args.extend([
+            image.into(),
+            "-c".into(),
+            format!("exec sleep {}", p.timeout_seconds + 5),
+        ]);
+        crate::process::run(
+            &self.executable,
+            &args,
+            crate::process::RunOptions {
+                env: Some(self.env.clone()),
+                timeout: Some(Duration::from_secs(20)),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let restore = if prepared.is_some() {
+            "tar --delay-directory-restore -xf - -C /workspace"
+        } else {
+            "tar -xf - -C /workspace"
         };
+        let limits = format!(
+            "read memory < /sys/fs/cgroup/memory.max && [ \"$memory\" = {} ] && read pids < /sys/fs/cgroup/pids.max && [ \"$pids\" = {} ] && read quota period < /sys/fs/cgroup/cpu.max && [ \"$quota\" != max ] && [ \"$quota\" -le \"$(({} * $period))\" ] || exit 125; {restore}",
+            p.memory_mi_b * 1024 * 1024,
+            p.pids,
+            p.cpus
+        );
+        let extracted = self
+            .command(
+                &["exec", "--interactive", name, "/bin/sh", "-c", &limits],
+                Some(archive.path()),
+                None,
+            )
+            .await?;
+        ensure!(
+            extracted["status"] == "passed",
+            "Cannot enforce limits or restore workspace: {extracted}"
+        );
+        // Installation hooks may edit tracked files. Always restore pinned source
+        // over a dependency snapshot before testing; never silently test those edits.
+        if prepared.is_some() {
+            let source_archive = tempfile::NamedTempFile::new_in(&self.dir)?;
+            crate::inspection::execution_archive(
+                &self.source,
+                revision,
+                source_archive.path(),
+                CancellationToken::new(),
+            )
+            .await?;
+            let restored = self
+                .command(
+                    &[
+                        "exec",
+                        "--interactive",
+                        name,
+                        "python3",
+                        "-c",
+                        include_str!("runtime/restore.py"),
+                    ],
+                    Some(source_archive.path()),
+                    None,
+                )
+                .await?;
+            ensure!(
+                restored["status"] == "passed",
+                "Cannot restore pinned source over prepared dependencies: {restored}"
+            );
+        }
+        let command = if gateway.is_some() {
+            format!(
+                "python3 /opt/crow/proxy.py >/tmp/crow-proxy.log 2>&1 &\nproxy=$!\ntrap 'kill $proxy 2>/dev/null || true' EXIT\nexport HTTPS_PROXY=http://127.0.0.1:3128 HTTP_PROXY=http://127.0.0.1:3128 https_proxy=http://127.0.0.1:3128 http_proxy=http://127.0.0.1:3128 NO_PROXY=127.0.0.1,localhost\nexport PIP_INDEX_URL=https://pypi.org/simple\nmkdir -p \"$HOME\"\npython3 -c 'import socket,time
+for attempt in range(100):
+ try:
+  socket.create_connection((\"127.0.0.1\",3128),timeout=.1).close(); break
+ except OSError: time.sleep(.05)
+else: raise SystemExit(\"Crow dependency proxy did not start\")' || {{ cat /tmp/crow-proxy.log >&2; exit 125; }}\n/bin/sh -c {}",
+                shell_quote(script)
+            )
+        } else {
+            script.to_owned()
+        };
+        let mut output = self
+            .command(&["exec", name, "/bin/sh", "-c", &command], None, Some(live))
+            .await?;
+        if let Some(gateway) = gateway {
+            gateway.close().await;
+        }
+        if let Some(snapshot) = snapshot
+            && output["status"] == "passed"
+        {
+            // UID 0 has no DAC override capability here. Archive owner-writable
+            // cache entries so tar can populate Go's read-only module directories.
+            // Pinned tracked-file permissions are restored before each experiment.
+            self.export(
+                &[
+                    "exec",
+                    name,
+                    "tar",
+                    "--mode=u+rwX",
+                    "-cf",
+                    "-",
+                    "-C",
+                    "/workspace",
+                    ".",
+                ],
+                snapshot,
+                SNAPSHOT_LIMIT,
+            )
+            .await?;
+        }
+        let mut saved = Vec::new();
+        for (index, path) in artifacts.iter().enumerate() {
+            crate::util::private_dir(&self.dir.join("artifacts"))?;
+            let target = self.dir.join("artifacts").join(format!("{id}-{index}.png"));
+            let result = async {
+                self.export(
+                    &["exec", name, "cat", "--", path],
+                    &target,
+                    ARTIFACT_LIMIT as u64,
+                )
+                .await?;
+                let bytes = std::fs::read(&target)?;
+                validate_png(&bytes)?;
+                Ok::<_, anyhow::Error>(bytes.len())
+            }
+            .await;
+            match result {
+                Ok(size) => saved
+                    .push(json!({"path":path,"saved":true,"bytes":size,"mimeType":"image/png"})),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&target);
+                    saved.push(json!({"path":path,"saved":false,"error":e.to_string()}));
+                }
+            }
+        }
+        output["artifacts"] = json!(saved);
+        Ok(output)
+    }
+    async fn command(
+        &self,
+        args: &[&str],
+        input: Option<&Path>,
+        live: Option<&LiveOutput>,
+    ) -> Result<Value> {
         let mut child = Command::new(&self.executable)
-            .args(&args)
+            .args(args)
             .env_clear()
             .envs(&self.env)
-            .stdin(std::fs::File::open(archive.path())?)
+            .stdin(match input {
+                Some(p) => Stdio::from(std::fs::File::open(p)?),
+                None => Stdio::null(),
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
-            .spawn()
-            .context("Cannot start rootless Podman")?;
+            .spawn()?;
         let out = child.stdout.take().unwrap();
         let err = child.stderr.take().unwrap();
-        let mut stdout = Captured::default();
-        let mut stderr = Captured::default();
-        let io = async {
-            let (_, _, status) = tokio::try_join!(
-                capture(out, &mut stdout),
-                capture(err, &mut stderr),
-                child.wait()
-            )?;
-            Ok::<_, anyhow::Error>(status)
+        let live = live.cloned().unwrap_or_default();
+        let (_, _, status) = tokio::try_join!(
+            capture_shared(out, &live.stdout),
+            capture_shared(err, &live.stderr),
+            child.wait()
+        )?;
+        let code = status.code();
+        let outcome = if status.success() {
+            "passed"
+        } else if matches!(code, Some(125..=127)) {
+            "error"
+        } else {
+            "failed"
         };
-        let mut result = tokio::select! {
-            _ = cancel.cancelled() => json!({"status":"interrupted","exitCode":null}),
-            _ = tokio::time::sleep(Duration::from_secs(p.timeout_seconds)) => json!({"status":"timed_out","exitCode":null}),
-            output = io => {
-                let status = output?;
-                let code = status.code();
-                json!({"status":if status.success() {"passed"} else if matches!(code, Some(125..=127)) {"error"} else {"failed"},"exitCode":code})
-            }
-        };
-        result["stdout"] = json!(String::from_utf8_lossy(&stdout.bytes));
-        result["stderr"] = json!(String::from_utf8_lossy(&stderr.bytes));
-        result["outputTruncated"] = json!(stdout.truncated || stderr.truncated);
-        // Podman is a client. Killing it alone does not stop the container.
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-        remove_container(&self.executable, name, &self.env).await?;
-        guard.armed = false;
+        let mut result = live.value();
+        result["status"] = json!(outcome);
+        result["exitCode"] = json!(code);
         Ok(result)
+    }
+    async fn export(&self, args: &[&str], target: &Path, limit: u64) -> Result<()> {
+        let temporary =
+            tempfile::NamedTempFile::new_in(target.parent().context("Missing export directory")?)?;
+        let mut child = Command::new(&self.executable)
+            .args(args)
+            .env_clear()
+            .envs(&self.env)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()?;
+        let mut output = child.stdout.take().unwrap().take(limit + 1);
+        let mut file = tokio::fs::File::create(temporary.path()).await?;
+        let size = tokio::io::copy(&mut output, &mut file).await?;
+        ensure!(size <= limit, "Export exceeds {limit} bytes");
+        ensure!(
+            child.wait().await?.success(),
+            "Could not export container file"
+        );
+        drop(file);
+        temporary.persist(target)?;
+        Ok(())
+    }
+}
+const SNAPSHOT_LIMIT: u64 = 512 * 1024 * 1024;
+const ARTIFACT_LIMIT: usize = 4 * 1024 * 1024;
+fn requested_revision(args: &Value) -> Result<&str> {
+    args["revision"]
+        .as_str()
+        .filter(|s| ["head", "base"].contains(s))
+        .context("Revision must be head or base")
+}
+fn validate_id(id: &str) -> Result<()> {
+    ensure!(
+        id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()),
+        "Invalid experiment ID"
+    );
+    Ok(())
+}
+fn validate_png(bytes: &[u8]) -> Result<()> {
+    ensure!(
+        bytes.len() >= 33
+            && bytes.len() <= ARTIFACT_LIMIT
+            && bytes[..8] == *b"\x89PNG\r\n\x1a\n"
+            && bytes[12..16] == *b"IHDR",
+        "Artifact must be a PNG under 4 MiB"
+    );
+    let width = u32::from_be_bytes(bytes[16..20].try_into()?);
+    let height = u32::from_be_bytes(bytes[20..24].try_into()?);
+    ensure!(
+        (1..=4096).contains(&width) && (1..=4096).contains(&height),
+        "PNG dimensions exceed 4096 pixels"
+    );
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_limits(png::Limits {
+        bytes: 64 * 1024 * 1024,
+    });
+    let mut reader = decoder.read_info().context("Invalid PNG")?;
+    let mut decoded = vec![0; reader.output_buffer_size().context("PNG is too large")?];
+    reader
+        .next_frame(&mut decoded)
+        .context("Invalid PNG image data")?;
+    Ok(())
+}
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\"'\"'"))
+}
+fn prune_cache(dir: &Path) -> Result<()> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.path().extension().is_some_and(|e| e == "tar") {
+            let meta = entry.metadata()?;
+            files.push((meta.modified()?, meta.len(), entry.path()));
+        }
+    }
+    files.sort_by_key(|(time, _, _)| *time);
+    let mut bytes: u64 = files.iter().map(|(_, len, _)| len).sum();
+    for (time, len, path) in files {
+        if (bytes > 4 * 1024 * 1024 * 1024 - SNAPSHOT_LIMIT
+            || time.elapsed().unwrap_or_default() > Duration::from_secs(7 * 86400))
+            && std::fs::remove_file(path).is_ok()
+        {
+            bytes -= len;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Default)]
+struct LiveOutput {
+    stdout: std::sync::Arc<std::sync::Mutex<Captured>>,
+    stderr: std::sync::Arc<std::sync::Mutex<Captured>>,
+}
+impl LiveOutput {
+    fn value(&self) -> Value {
+        let stdout = self.stdout.lock().unwrap();
+        let stderr = self.stderr.lock().unwrap();
+        json!({"stdout":String::from_utf8_lossy(&stdout.bytes),"stderr":String::from_utf8_lossy(&stderr.bytes),"outputTruncated":stdout.truncated||stderr.truncated})
+    }
+}
+async fn capture_shared(
+    mut read: impl AsyncRead + Unpin,
+    output: &std::sync::Mutex<Captured>,
+) -> std::io::Result<()> {
+    let mut chunk = [0; 8192];
+    loop {
+        let count = read.read(&mut chunk).await?;
+        if count == 0 {
+            return Ok(());
+        };
+        output.lock().unwrap().append(&chunk[..count]);
     }
 }
 #[derive(Default)]
@@ -390,6 +836,16 @@ struct Captured {
     bytes: Vec<u8>,
     truncated: bool,
 }
+impl Captured {
+    fn append(&mut self, bytes: &[u8]) {
+        let keep = bytes
+            .len()
+            .min(OUTPUT_LIMIT.saturating_sub(self.bytes.len()));
+        self.bytes.extend_from_slice(&bytes[..keep]);
+        self.truncated |= keep < bytes.len();
+    }
+}
+#[cfg(test)]
 async fn capture(mut read: impl AsyncRead + Unpin, output: &mut Captured) -> std::io::Result<()> {
     let mut chunk = [0; 8192];
     loop {
@@ -397,9 +853,7 @@ async fn capture(mut read: impl AsyncRead + Unpin, output: &mut Captured) -> std
         if count == 0 {
             break;
         }
-        let keep = count.min(OUTPUT_LIMIT.saturating_sub(output.bytes.len()));
-        output.bytes.extend_from_slice(&chunk[..keep]);
-        output.truncated |= keep < count;
+        output.append(&chunk[..count]);
     }
     Ok(())
 }
@@ -513,13 +967,14 @@ pub fn append_summary(report: &mut Value, dir: &Path) -> Result<()> {
             .replace('|', "&#124;")
             .replace('`', "&#96;");
         rows.push(format!(
-            "| `{}` | {} | {} | <code>{}</code> |",
+            "| `{}` | {} {} | {} | <code>{}</code> |",
             record["commit"]
                 .as_str()
                 .unwrap_or("")
                 .chars()
                 .take(12)
                 .collect::<String>(),
+            record["phase"].as_str().unwrap_or("test"),
             status,
             record["exitCode"]
                 .as_i64()
@@ -543,7 +998,7 @@ pub fn append_summary(report: &mut Value, dir: &Path) -> Result<()> {
         .collect::<Vec<_>>()
         .join(", ");
     report["summary"] = json!(format!(
-        "{}\n\n### Runtime experiments\n\nFresh offline containers. {counts}. Showing {} of {total} experiments. Results describe these commands only; failures may reflect environment limits. Full receipts are retained on the worker.\n\n| Commit | Result | Exit | Command excerpt |\n| --- | --- | --- | --- |\n{}",
+        "{}\n\n### Runtime experiments\n\nIsolated setup and offline tests. {counts}. Showing {} of {total} experiments. Outcomes include setup attempts; passing setup does not verify application behavior. Results describe these commands only; failures may reflect environment limits. Full receipts are retained on the worker.\n\n| Commit | Result | Exit | Command excerpt |\n| --- | --- | --- | --- |\n{}",
         report["summary"].as_str().unwrap_or(""),
         rows.len(),
         rows.join("\n")
@@ -553,14 +1008,14 @@ pub fn append_summary(report: &mut Value, dir: &Path) -> Result<()> {
 
 pub async fn diagnostics(settings: &Value) -> Result<Value> {
     let config = config(&settings["execution"])?;
-    if config.repositories.is_empty() {
+    if !config.automatic && config.repositories.is_empty() {
         return Ok(
             json!({"enabled":false,"detail":"Runtime experiments are disabled. Configure worker.execution to enable selected repositories."}),
         );
     }
     let env = environment();
     check_runtime(&config.podman, &env).await?;
-    for policy in config.repositories.values() {
+    for policy in config.repositories.values().filter(|p| p.image != "auto") {
         podman_output(&config.podman, &["image", "inspect", &policy.image], &env)
             .await
             .context(
@@ -568,7 +1023,7 @@ pub async fn diagnostics(settings: &Value) -> Result<Value> {
             )?;
     }
     Ok(
-        json!({"enabled":true,"repositories":config.repositories.keys().collect::<Vec<_>>(),"detail":"Local rootless Podman, cgroup v2, seccomp and configured images are available. Each experiment also verifies its actual resource limits before running source."}),
+        json!({"enabled":true,"automatic":config.automatic,"repositories":config.repositories.keys().collect::<Vec<_>>(),"detail":"Local rootless Podman, cgroup v2, seccomp and explicit images are available. Automatic toolchain images are provisioned on first use. Each experiment verifies actual resource limits before running source."}),
     )
 }
 
@@ -602,6 +1057,39 @@ mod tests {
             cfg["repositories"]["owner/repo"][key] = value;
             assert!(validate(&cfg).is_err(), "{key}");
         }
+    }
+    #[test]
+    fn automatic_mode_needs_no_repository_images_or_new_limits() {
+        let settings = json!({"execution":{"automatic":true}});
+        assert!(enabled(&settings, "any/repository").unwrap());
+        let root = tempfile::tempdir().unwrap();
+        let context = json!({"job":{"repo":"any/repository","settings":settings},"source":{}});
+        let execution = Execution::from_context(&context, root.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.policy.image, "auto");
+        assert_eq!(execution.policy.timeout_seconds, timeout());
+        assert_eq!(execution.policy.max_runs, runs());
+        assert!(!enabled(&json!({"execution":{"automatic":false}}), "any/repository").unwrap());
+        assert!(validate(&json!({"repositories":{"owner/repo":{}}})).is_ok());
+    }
+    #[test]
+    fn invalid_or_oversized_pngs_are_not_sent_to_the_model() {
+        assert!(validate_png(b"not an image").is_err());
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 1, 1);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&[1, 2, 3])
+                .unwrap();
+        }
+        assert!(validate_png(&bytes).is_ok());
+        assert!(validate_png(&bytes[..33]).is_err());
+        bytes[16..20].copy_from_slice(&10000u32.to_be_bytes());
+        assert!(validate_png(&bytes).is_err());
     }
     #[tokio::test]
     async fn budget_and_argument_checks_do_not_start_a_runtime() {

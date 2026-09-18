@@ -1,5 +1,7 @@
 # Runtime experiments
 
+Automatic preparation and screenshot tools extend this design. See [autonomous runtime investigation](autonomous-runtime.md) and ADR 0010. The operator-supplied image path described below remains supported.
+
 ```mermaid
 flowchart LR
     Operator["Worker operator<br/>repository, image ID, limits"] --> Tools["Crow experiment tools"]

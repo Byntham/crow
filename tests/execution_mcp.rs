@@ -144,7 +144,9 @@ async fn real_mcp_regression_isolation_deadline_recovery_and_publication() {
     let context = dir.path().join("context.json");
     let source_value = json!({"dir":bare,"head":head,"base":base,"target":"main","targetSha":base});
     std::fs::write(&source, source_value.to_string()).unwrap();
-    let config = json!({"podman":podman,"repositories":{"owner/repo":{"image":image,"timeoutSeconds":3,"memoryMiB":128,"workspaceMiB":32,"pids":32,"cpus":1,"maxRuns":10}}});
+    // Container start, archive restore and exec are separate bounded operations.
+    // Leave startup allowance while still forcing the 60-second command to time out.
+    let config = json!({"podman":podman,"repositories":{"owner/repo":{"image":image,"timeoutSeconds":8,"memoryMiB":128,"workspaceMiB":32,"pids":32,"cpus":1,"maxRuns":10}}});
     std::fs::write(
         &context,
         json!({"source":source_value,"job":{"repo":"owner/repo","settings":{"execution":config}}})
