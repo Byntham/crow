@@ -109,12 +109,21 @@ impl Gateway {
             let slots = Arc::new(Semaphore::new(16));
             let mut tasks = tokio::task::JoinSet::new();
             loop {
+                // Leave excess connections in the bounded socket backlog until a
+                // tunnel finishes. Accepting and dropping them makes concurrent
+                // package managers see connection resets and retry whole batches.
+                let permit = tokio::select! {
+                    _ = cancelled.cancelled() => break,
+                    permit = slots.clone().acquire_owned() => {
+                        let Ok(permit) = permit else {break};
+                        permit
+                    }
+                };
                 tokio::select! {
                     _ = cancelled.cancelled() => break,
                     Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
                     incoming = listener.accept() => {
                         let Ok((mut stream,_)) = incoming else {break};
-                        let Ok(permit) = slots.clone().try_acquire_owned() else {continue};
                         tasks.spawn(async move {
                             let _permit = permit;
                             if let Ok(Err(error)) = tokio::time::timeout(Duration::from_secs(120), tunnel(&mut stream)).await {
@@ -155,6 +164,44 @@ impl Drop for Gateway {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn concurrent_downloads_wait_for_capacity_without_connection_resets() {
+        let gateway = Gateway::start().unwrap();
+        let socket = gateway.directory().join("socket");
+        let mut clients = Vec::new();
+        // Partial headers occupy all active tunnels without using the network.
+        for _ in 0..16 {
+            let mut client = UnixStream::connect(&socket).await.unwrap();
+            client.write_all(b"CONNECT ").await.unwrap();
+            clients.push(client);
+        }
+        let mut waiting = UnixStream::connect(&socket).await.unwrap();
+        waiting
+            .write_all(b"CONNECT forbidden.invalid:443 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                waiting.read_to_end(&mut response)
+            )
+            .await
+            .is_err()
+        );
+        drop(clients.pop());
+        tokio::time::timeout(Duration::from_secs(2), waiting.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            String::from_utf8(response)
+                .unwrap()
+                .contains("Package host is not allowed")
+        );
+        gateway.close().await;
+    }
+
     #[test]
     fn destinations_and_addresses_are_restricted() {
         assert_eq!(

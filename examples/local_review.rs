@@ -31,8 +31,11 @@ async fn main() -> Result<()> {
     settings.as_object_mut().unwrap().remove("id");
     settings["subagents"] = json!({"mode":"inherit","max":0});
     settings["timeoutMs"] = json!(600000);
-    settings["execution"] = json!({"podman":args[4],"repositories":{"fixture/checkout":{"image":args[3],"timeoutSeconds":120,"memoryMiB":1536,"workspaceMiB":512,"cpus":2,"pids":256,"maxRuns":12}}});
-    let job = json!({"id":"visual-checkout-review","repo":"fixture/checkout","number":1,"comparison":source,"settings":settings,"prContext":source.get("prContext").cloned().unwrap_or_else(||json!({"title":"Refresh the checkout button finish asset","body":"Refresh the checkout button artwork. The checkout flow and displayed price should remain unchanged."}))});
+    let repo = source["repo"].as_str().unwrap_or("fixture/checkout");
+    let job_id = source["jobId"].as_str().unwrap_or("visual-checkout-review");
+    let number = source["number"].as_u64().unwrap_or(1);
+    settings["execution"] = json!({"podman":args[4],"repositories":{repo:{"image":args[3],"timeoutSeconds":120,"memoryMiB":1536,"workspaceMiB":512,"cpus":2,"pids":256,"maxRuns":12}}});
+    let job = json!({"id":job_id,"repo":repo,"number":number,"comparison":source,"settings":settings,"prContext":source.get("prContext").cloned().unwrap_or_else(||json!({"title":"Refresh the checkout button finish asset","body":"Refresh the checkout button artwork. The checkout flow and displayed price should remain unchanged."}))});
     let guidance = crow::inspection::guidance(&source).await?;
     let result = crow::provider::run_review(
         &job,

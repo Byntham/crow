@@ -39,6 +39,49 @@ async fn call(exec: &Execution, name: &str, args: Value) -> Value {
     );
     result
 }
+
+#[tokio::test]
+#[ignore = "requires rootless Podman and public npm registry access"]
+async fn managed_gateway_handles_concurrent_package_downloads() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(".crow-data/autonomous-runtime-test");
+    std::fs::create_dir_all(&root).unwrap();
+    let temp = tempfile::tempdir_in(&root).unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-b", "main"]);
+    std::fs::write(repo.join("package.json"), "{\"private\":true}").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "download probe"]);
+    let commit = git(&repo, &["rev-parse", "HEAD"]);
+    let context = json!({"root":root,"source":{"dir":repo,"base":commit,"head":commit},"job":{"repo":"fixture/downloads","settings":{"execution":{"automatic":true,"podman":std::env::var("CROW_TEST_PODMAN").unwrap_or("podman".into())}}}});
+    let exec = Execution::from_context(&context, &temp.path().join("experiments"))
+        .unwrap()
+        .unwrap();
+    let setup = r#"set -e
+seq 1 24 | xargs -P24 -I{} sh -c 'curl --fail --silent --show-error --max-time 30 https://registry.npmjs.org/is-number/7.0.0 > /tmp/package-{}.json'
+python3 - <<'PY'
+import json
+from pathlib import Path
+files = list(Path('/tmp').glob('package-*.json'))
+assert len(files) == 24
+assert all(json.loads(p.read_text())['version'] == '7.0.0' for p in files)
+print('24 concurrent package downloads verified')
+PY"#;
+    let result = call(
+        &exec,
+        "prepare_environment",
+        json!({"revision":"head","setup":setup}),
+    )
+    .await;
+    assert_eq!(result["status"], "passed", "{result}");
+    assert!(
+        result["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("24 concurrent package downloads verified")
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires rootless Podman; prepares a managed image and downloads public test dependencies"]
 async fn managed_setup_downloads_recovery_cache_and_screenshots() {

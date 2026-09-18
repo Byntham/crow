@@ -230,12 +230,13 @@ pub async fn execution_archive(
     source: &Value,
     revision_key: &str,
     output: &Path,
+    max_bytes: u64,
     cancel: CancellationToken,
 ) -> Result<()> {
     use std::io::Write;
     let attributes = tempfile::tempdir()?;
     let mut file = std::fs::File::create(output)?;
-    let mut total = 0usize;
+    let mut total = 0u64;
     git_stream(
         source_dir(source)?,
         &strings(&[
@@ -262,10 +263,10 @@ pub async fn execution_archive(
         ]),
         cancel,
         |chunk| {
-            total += chunk.len();
+            total += chunk.len() as u64;
             ensure!(
-                total <= 128 * 1024 * 1024,
-                "Execution source archive exceeds 128 MiB"
+                total <= max_bytes,
+                "Execution source archive exceeds {max_bytes} bytes"
             );
             file.write_all(chunk)?;
             Ok(())
@@ -1056,6 +1057,27 @@ mod tests {
             dir,
             json!({"dir":bare,"base":base,"head":head,"targetSha":base,"target":"main"}),
         )
+    }
+
+    #[tokio::test]
+    async fn execution_archive_obeys_storage_budget() {
+        let (dir, source) = fixture(false).await;
+        let output = dir.path().join("source.tar");
+        let error = execution_archive(&source, "head", &output, 1024, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds 1024 bytes"));
+        assert!(std::fs::metadata(&output).unwrap().len() <= 1024);
+        execution_archive(
+            &source,
+            "head",
+            &output,
+            1024 * 1024,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(std::fs::metadata(&output).unwrap().len() > 1024);
     }
 
     #[test]

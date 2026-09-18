@@ -56,6 +56,6 @@ Reports distinguish setup from test commands. Passing dependency installation do
 
 Source and dependency code run only in rootless containers with no host workspace mounts, host credentials, Linux capabilities or privilege escalation. The root filesystem is read-only. During setup, the sole host mount contains the restricted download socket; tests have no host mounts. Memory, CPU, process count, scratch space, output and time are bounded. Crow verifies resource limits before extracting source. Cancellation stops the container; interrupted work is recovered on resume. Rootless containers share the host kernel, so workers reviewing hostile code should run on dedicated machines or VMs.
 
-Linux workloads are the first backend. Native macOS/Windows applications, GPUs, devices, private dependencies and authenticated external services can block runtime investigation. Source archives do not materialize Git metadata, submodules or LFS objects, and are limited to 128 MiB. Crow reports those limits rather than treating untested behavior as verified.
+Linux workloads are the first backend. Native macOS/Windows applications, GPUs, devices, private dependencies and authenticated external services can block runtime investigation. Source archives do not materialize Git metadata, submodules or LFS objects, and are limited to the configured workspace size, capped at 512 MiB. Crow reports those limits rather than treating untested behavior as verified.
 
 To disable execution, replace the worker setting with `{"automatic":false,"repositories":{}}` and restart the service.

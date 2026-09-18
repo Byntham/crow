@@ -1,0 +1,27 @@
+{
+  "id": "85510b65fd7037cda98718084e31e3ef",
+  "revision": "head",
+  "commit": "9ab17d4a0ea68ba95dd1e19a4fefc9c8c686cdfa",
+  "image": "sha256:8438a8eaa6758d9f2d32a7b3501ee80134644de3bd1d3127df2f96f65ff8b01d",
+  "command": "set -e\nseq 1 24 | xargs -P24 -I{} sh -c 'curl --fail --silent --show-error --max-time 30 https://registry.npmjs.org/is-number/7.0.0 > /tmp/package-{}.json'\npython3 - <<'PY'\nimport json\nfrom pathlib import Path\nfiles = list(Path('/tmp').glob('package-*.json'))\nassert len(files) == 24\nassert all(json.loads(p.read_text())['version'] == '7.0.0' for p in files)\nprint('24 concurrent package downloads verified')\nPY",
+  "phase": "setup",
+  "environment": null,
+  "limits": {
+    "image": "auto",
+    "timeoutSeconds": 120,
+    "memoryMiB": 1024,
+    "workspaceMiB": 512,
+    "cpus": 2,
+    "pids": 128,
+    "maxRuns": 12
+  },
+  "status": "passed",
+  "startedAt": "2026-09-18T23:22:30.961183454+00:00",
+  "exitCode": 0,
+  "provisionMs": 269,
+  "stdout": "24 concurrent package downloads verified\n",
+  "stderr": "",
+  "outputTruncated": false,
+  "artifacts": [],
+  "durationMs": 4759
+}

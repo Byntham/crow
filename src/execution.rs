@@ -487,6 +487,7 @@ impl Execution {
                 &self.source,
                 revision,
                 archive.path(),
+                (self.policy.workspace_mi_b * 1024 * 1024).min(SNAPSHOT_LIMIT),
                 CancellationToken::new(),
             )
             .await?;
@@ -585,6 +586,7 @@ impl Execution {
                 &self.source,
                 revision,
                 source_archive.path(),
+                (self.policy.workspace_mi_b * 1024 * 1024).min(SNAPSHOT_LIMIT),
                 CancellationToken::new(),
             )
             .await?;
