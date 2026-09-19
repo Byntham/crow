@@ -1,4 +1,4 @@
-> Superseded for explicitly authorized repositories by [ADR 0009](0009-run-opt-in-isolated-experiments.md). Inspection-only remains the default.
+> Superseded by [ADR 0009](0009-run-opt-in-isolated-experiments.md). Runtime testing is available by default and remains under local worker control.
 
 # Limit initial reviews to code inspection
 

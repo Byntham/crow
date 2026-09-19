@@ -1,6 +1,6 @@
 # Autonomous runtime investigation
 
-The initial runtime implementation required operators to build dependency images and give reviewers setup instructions. The next implementation moves discovery, image provisioning and dependency installation into Crow's review workflow. Existing worker authorization and execution limits remain in force.
+The initial runtime implementation required operators to build dependency images and give reviewers setup instructions. The next implementation moves discovery, image provisioning and dependency installation into Crow's review workflow. Runtime testing is enabled by default in local worker configuration and can be disabled or restricted. Guided setup offers the Podman prerequisites; execution limits remain in force. Missing authority in delegated reviewer contexts still disables execution.
 
 `runtime.rs` discovers manifests from pinned Git objects and provides candidate setup/test commands. The reviewer reads CI and project documentation to refine these candidates. Discovery does not run code or assume that a generated command has succeeded. Crow builds only its embedded Containerfile and proxy helper, never a repository Dockerfile, and records the resulting immutable image ID.
 

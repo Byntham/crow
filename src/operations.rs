@@ -84,7 +84,7 @@ pub fn unit_text(root: &Path, executable: &Path, path: &str) -> String {
         false,
     );
     format!(
-        "[Unit]\nDescription=Crow PR review service\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={command} run\nEnvironment={home}\nEnvironment={env_path}\nRestart=on-failure\nRestartSec=5\nKillMode=mixed\nTimeoutStopSec=45\nUMask=0077\n\n[Install]\nWantedBy=default.target\n"
+        "[Unit]\nDescription=Crow PR review service\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={command} run\nEnvironment={home}\nEnvironment={env_path}\nRestart=on-failure\nRestartSec=5\nDelegate=yes\nKillMode=mixed\nTimeoutStopSec=45\nUMask=0077\n\n[Install]\nWantedBy=default.target\n"
     )
 }
 
@@ -676,6 +676,31 @@ fn service_summary(status: Value) -> Value {
     json!({"repositories":count("repos"),"workers":count("workers"),"jobs":count("jobs"),"activeJobs":active,"draining":status["draining"] == true})
 }
 
+pub async fn check_worker_pairing(config: &Value) -> Result<Value> {
+    let url = url::Url::parse(
+        config["serviceUrl"]
+            .as_str()
+            .context("Missing service URL")?,
+    )?
+    .join("/worker/ping")?;
+    let response = client()?
+        .post(url)
+        .bearer_auth(
+            config["worker"]["token"]
+                .as_str()
+                .context("Missing worker token")?,
+        )
+        .json(&json!({}))
+        .send()
+        .await?
+        .error_for_status()?;
+    let body: Value = response.json().await?;
+    if body["id"] != config["worker"]["id"] {
+        bail!("Pairing belongs to another worker");
+    }
+    Ok(body["id"].clone())
+}
+
 pub async fn doctor(config: &Value, root: &Path, runtime: bool) -> Result<Value> {
     let mut checks = Vec::new();
     if config["role"] != "worker" {
@@ -722,31 +747,7 @@ pub async fn doctor(config: &Value, root: &Path, runtime: bool) -> Result<Value>
         );
     }
     if config["role"] != "service" {
-        let pairing = async {
-            let url = url::Url::parse(
-                config["serviceUrl"]
-                    .as_str()
-                    .context("Missing service URL")?,
-            )?
-            .join("/worker/ping")?;
-            let response = client()?
-                .post(url)
-                .bearer_auth(
-                    config["worker"]["token"]
-                        .as_str()
-                        .context("Missing worker token")?,
-                )
-                .json(&json!({}))
-                .send()
-                .await?
-                .error_for_status()?;
-            let body: Value = response.json().await?;
-            if body["id"] != config["worker"]["id"] {
-                bail!("Pairing belongs to another worker");
-            }
-            Ok(body["id"].clone())
-        }
-        .await;
+        let pairing = check_worker_pairing(config).await;
         check_result(&mut checks, "worker pairing", pairing);
         let auth = async {
             let auth = crate::provider::auth_status(&config["worker"], root).await?;
@@ -800,6 +801,51 @@ pub async fn doctor(config: &Value, root: &Path, runtime: bool) -> Result<Value>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn saved_worker_pairing_probe_accepts_current_token_and_rejects_stale_identity() {
+        use axum::{
+            Json, Router,
+            http::{HeaderMap, StatusCode},
+            routing::post,
+        };
+        let app = Router::new().route(
+            "/worker/ping",
+            post(|headers: HeaderMap| async move {
+                if headers
+                    .get("authorization")
+                    .is_some_and(|value| value == "Bearer current-token")
+                {
+                    (StatusCode::OK, Json(json!({"id":"worker-one"})))
+                } else {
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({"error":"Unauthorized worker"})),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut config = json!({"serviceUrl":format!("http://{address}"),"worker":{"id":"worker-one","token":"current-token"}});
+        assert_eq!(check_worker_pairing(&config).await.unwrap(), "worker-one");
+        config["worker"]["token"] = json!("revoked-token");
+        let error = check_worker_pairing(&config).await.unwrap_err().to_string();
+        assert!(error.contains("401"));
+        assert!(!error.contains("revoked-token"));
+        config["worker"]["token"] = json!("current-token");
+        config["worker"]["id"] = json!("worker-two");
+        assert!(
+            check_worker_pairing(&config)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("another worker")
+        );
+        server.abort();
+    }
 
     #[test]
     fn saved_worker_status_must_match_a_live_runtime() {
@@ -861,6 +907,7 @@ mod tests {
         assert!(text.contains("ExecStart=\"/tmp/a %%b$$\\\"c/current/crow\" run\n"));
         assert!(text.contains("Environment=\"CROW_HOME=/tmp/a %%b$\\\"c\"\n"));
         assert!(text.contains("KillMode=mixed\n"));
+        assert!(text.contains("Delegate=yes\n"));
         assert!(text.contains("UMask=0077\n"));
         assert!(!text.contains("node"));
         assert_eq!(

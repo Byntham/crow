@@ -954,9 +954,9 @@ mod tests {
     #[test]
     fn configuration_reports_runtime_authority() {
         let mut config = crate::config::defaults(std::path::Path::new("/tmp/crow"));
-        assert!(render("config", &config).contains("Disabled"));
-        config["worker"]["execution"] = json!({"automatic":true});
         assert!(render("config", &config).contains("Enabled for all repositories"));
+        config["worker"]["execution"] = json!({"automatic":false});
+        assert!(render("config", &config).contains("Disabled"));
         config["worker"]["execution"] = json!({"repositories":{"owner/repo":{}}});
         assert!(render("config", &config).contains("Enabled for owner/repo"));
     }

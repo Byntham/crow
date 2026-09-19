@@ -2,24 +2,29 @@
 
 Crow can discover how a project runs, prepare its dependencies, run tests and browser experiments, and inspect screenshots. Developers do not need to supply testing instructions on each PR. Crow reads existing manifests, CI configuration and documentation, chooses an investigation, and retries setup when the logs reveal a fixable problem.
 
-## Enable automatic environments
+## Normal setup and disabling tests
 
-The worker needs local rootless Podman with user namespaces, seccomp and delegated cgroup v2 controllers. This is a one-time worker prerequisite, not a task for each repository's developers. Existing installations remain inspection-only until the worker operator enables execution.
+Runtime testing is enabled by default. The reviewer decides which changes benefit from running tests or browser checks; developers do not need to add a runtime setting or test recipe.
 
-Enable automatic environments for all repositories assigned to the worker:
+`crow setup` checks local rootless Podman and offers to install missing packages on Ubuntu/Debian as part of normal onboarding. System package installation uses sudo with the operator's consent. Crow configures cgroup delegation in its own systemd service and checks runtime prerequisites before completing setup. It builds its testing image automatically on first use.
+
+Hosts still need user namespaces, seccomp and cgroup v2. Crow cannot provide missing kernel capabilities inside a restricted hosting environment. Setup shows the actual failure and lets the operator fix the host or continue with runtime testing disabled. It does not silently change kernel security settings or allocate subordinate user IDs. On other distributions, setup explains which packages or equivalent tools are needed. Crow itself always runs as the normal user, not root.
+
+Existing installations without a runtime setting also receive the default when upgraded. Explicit disable settings and repository allowlists are preserved. Rerun `crow setup` after upgrading to install missing dependencies and regenerate the service configuration. To disable runtime testing:
 
 ```sh
-crow config worker.execution '{"automatic":true}'
-crow doctor --runtime
+crow config worker.execution '{"automatic":false}'
 crow service-restart
 ```
 
+To re-enable it, set `worker.execution` to `{"automatic":true}` and rerun `crow setup`. `crow doctor --runtime` checks the runtime independently.
+
 No image IDs, test commands, or new budget settings are required. Crow provisions a shared toolchain image itself. It currently contains Node/npm, Python/pip, Rust/Cargo, Go, C/C++ build tools, Chromium/Playwright, SQLite and PostgreSQL tools. The image is based on Alpine 3.23, whose stock packages provide Rust 1.91 and Node 24 while retaining Python 3.12. Package patch versions can change when the image is rebuilt. Projects requiring other versions or platforms may still need a custom image. Repository Dockerfiles are evidence for setup, never instructions to execute on the host.
 
-Alternatively, enable selected repositories with automatic images:
+To restrict runtime testing to selected repositories with automatic images:
 
 ```sh
-crow config worker.execution '{"repositories":{"owner/repo":{}}}'
+crow config worker.execution '{"automatic":false,"repositories":{"owner/repo":{}}}'
 ```
 
 An entry without `image` uses `"image":"auto"`. Existing entries specifying a local immutable `sha256:` image ID still work. Those images must include the tools the project needs; dependency preparation through the package gateway requires Python 3, GNU tar, and `/opt/crow/proxy.py` from Crow's runtime image. `podman` can select a local executable path. These are local worker settings; a PR or connection-service job cannot grant execution authority.
@@ -64,7 +69,7 @@ When cleanup fails, Crow retains the ownership receipts needed to retry instead 
 
 ## Status in the main comment
 
-Runtime tests are selective. The worker operator must enable execution, and the reviewer chooses useful checks based on the diff, project manifests, CI and available dependencies. Crow instructs the reviewer to investigate changed behavior autonomously, but does not require a test command on every review. Documentation-only changes can need no runtime check; unsupported platforms or private dependencies can prevent one.
+Runtime tests are selective. Execution is available by default unless the worker operator disables or restricts it. The reviewer chooses useful checks based on the diff, project manifests, CI and available dependencies. Crow instructs the reviewer to investigate changed behavior autonomously, but does not require a test command on every review. Documentation-only changes can need no runtime check; unsupported platforms or private dependencies can prevent one.
 
 The main Crow status comment shows runtime testing separately from review progress. It reports disabled execution, a pending testing decision, environment setup, running tests, and final command counts. Setup attempts have their own counts. If the reviewer finishes without running a test command, the comment says so. If setup fails before any tests run, it reports that testing was blocked. Interrupted jobs never leave a command labelled as still running. MCP cancellation targets the active request, stops its runtime command and waits for cleanup; disconnecting the client also cancels active setup or tests.
 

@@ -24,6 +24,10 @@ fn main() {
         return;
     }
     if args.iter().any(|a| a == "--help") {
+        if behavior["legacyCli"] == true {
+            println!("--json");
+            return;
+        }
         println!(
             "--json --output-schema --output-last-message --ignore-user-config --ignore-rules"
         );

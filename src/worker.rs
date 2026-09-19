@@ -1116,7 +1116,7 @@ mod tests {
                 fail_heartbeat: false,
                 fail_maintenance: false,
                 maintenance_gate: None,
-                execution_enabled: false,
+                execution_enabled: true,
                 retry: false,
                 wait_cancel: false,
                 cancel_session: false,
@@ -1237,8 +1237,9 @@ mod tests {
             self.reviews.fetch_add(1, Ordering::SeqCst);
             assert!(job["settings"].get("codexHome").is_some());
             assert!(job["settings"].get("token").is_none());
-            assert!(
-                job["settings"]["execution"].is_null() != self.execution_enabled,
+            assert_eq!(
+                crate::execution::enabled(&job["settings"], "owner/project").unwrap(),
+                self.execution_enabled,
                 "Job-supplied execution settings must not grant authority"
             );
             if let Some(callback) = callbacks.on_session {
@@ -1510,9 +1511,16 @@ esac
     #[tokio::test]
     async fn service_job_cannot_enable_execution_on_worker() {
         let dir = tempfile::tempdir().unwrap();
-        let f = Arc::new(Fake::new());
-        f.queue.lock().await[0]["job"]["settings"] = json!({"execution":{"repositories":{"owner/project":{"image":format!("sha256:{}", "a".repeat(64))}}}});
-        let worker = start(dir.path(), f.clone()).await;
+        let f = Arc::new(Fake {
+            execution_enabled: false,
+            ..Fake::new()
+        });
+        f.queue.lock().await[0]["job"]["settings"] = json!({"execution":{"automatic":true}});
+        let mut config = crate::config::defaults(dir.path());
+        config["worker"]["execution"] = json!({"automatic":false});
+        let worker = start_worker_with(config, dir.path().to_owned(), f.clone(), options())
+            .await
+            .unwrap();
         f.until("report", 1).await;
         worker.close().await.unwrap();
         assert_eq!(f.reviews.load(Ordering::SeqCst), 1);

@@ -796,6 +796,11 @@ pub async fn diagnostics(settings: &Value, root: &Path, runtime: bool) -> Result
                     warnings.push(warning.to_owned());
                 }
                 checks.push(json!({"name":"Authenticated provider metadata","ok":true,"detail":format!("{} models available",catalog["models"].as_array().map(Vec::len).unwrap_or(0))}));
+                let result = validate_configured_models(&catalog, settings);
+                checks.push(match result {
+                    Ok(()) => json!({"name":"Configured review models","ok":true,"detail":"The selected review and subagent models support their configured reasoning levels."}),
+                    Err(error) => json!({"name":"Configured review models","ok":false,"detail":format!("{error}. Run crow setup to choose a review model, or crow models and crow config worker.subagents to update configured helper models.")}),
+                });
             }
             Err(e) => checks.push(
                 json!({"name":"Authenticated provider metadata","ok":false,"detail":e.to_string()}),
@@ -805,6 +810,42 @@ pub async fn diagnostics(settings: &Value, root: &Path, runtime: bool) -> Result
     Ok(
         json!({"ok":checks.iter().all(|c|c["ok"]==true),"version":version,"checks":checks,"warnings":warnings}),
     )
+}
+
+pub(crate) fn validate_configured_models(catalog: &Value, settings: &Value) -> Result<()> {
+    let models = catalog["models"]
+        .as_array()
+        .context("The provider returned no model catalog")?;
+    for (label, selected) in [("Review", settings), ("Subagent", &settings["subagents"])] {
+        if label == "Subagent" && selected["mode"] != "configured" {
+            continue;
+        }
+        validate_model_selection(models, selected, label)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_model_selection(
+    models: &[Value],
+    selected: &Value,
+    label: &str,
+) -> Result<()> {
+    let model_name = text(selected, "model");
+    let model = models
+        .iter()
+        .find(|m| !model_name.is_empty() && m["model"] == model_name)
+        .with_context(|| {
+            format!("{label} model is not available from the provider: {model_name}")
+        })?;
+    let effort = text(selected, "effort");
+    if effort.is_empty()
+        || !model["supportedReasoningEfforts"]
+            .as_array()
+            .is_some_and(|efforts| efforts.iter().any(|e| e["reasoningEffort"] == effort))
+    {
+        bail!("{label} reasoning level {effort} is unsupported for {model_name}");
+    }
+    Ok(())
 }
 
 pub struct PreparedReview {
@@ -1687,7 +1728,7 @@ mod tests {
             .unwrap();
         assert_eq!(result["ok"], true);
         assert_eq!(result["version"], "codex-cli 0.154.0");
-        assert_eq!(result["checks"].as_array().unwrap().len(), 4);
+        assert_eq!(result["checks"].as_array().unwrap().len(), 5);
         let output = result.to_string();
         assert!(!output.contains("--output-schema"));
         assert!(!output.contains("stable true"));
@@ -1720,6 +1761,73 @@ mod tests {
         );
     }
     #[tokio::test]
+    async fn local_capability_probe_detects_old_cli_without_requesting_provider_metadata() {
+        let f = Fixture::new(json!({"offline":true}));
+        let current = diagnostics(&f.job["settings"], f.root.path(), false)
+            .await
+            .unwrap();
+        assert_eq!(current["ok"], true);
+        assert_eq!(current["checks"].as_array().unwrap().len(), 3);
+        f.set(json!({"offline":true,"legacyCli":true}));
+        let outdated = diagnostics(&f.job["settings"], f.root.path(), false)
+            .await
+            .unwrap();
+        assert_eq!(outdated["ok"], false);
+        assert_eq!(
+            outdated["checks"][0]["ok"], true,
+            "The old CLI still answers --version"
+        );
+        assert!(
+            outdated["checks"][1]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("--output-schema")
+        );
+        assert!(
+            !outdated
+                .to_string()
+                .contains("Authenticated provider metadata")
+        );
+    }
+    #[tokio::test]
+    async fn diagnostics_reject_unavailable_review_and_subagent_model_choices() {
+        let f = Fixture::new(json!({}));
+        for (label, patch) in [
+            ("Review model", json!({"model":null,"effort":null})),
+            ("Review model", json!({"model":"removed-model"})),
+            ("Review reasoning level", json!({"effort":"unsupported"})),
+            (
+                "Subagent model",
+                json!({"subagents":{"mode":"configured","model":"removed-model","effort":"medium","max":8}}),
+            ),
+            (
+                "Subagent reasoning level",
+                json!({"subagents":{"mode":"configured","model":"provider-default","effort":"unsupported","max":8}}),
+            ),
+        ] {
+            let mut settings = f.job["settings"].clone();
+            for (key, value) in patch.as_object().unwrap() {
+                settings[key] = value.clone();
+            }
+            let result = diagnostics(&settings, f.root.path(), true).await.unwrap();
+            assert_eq!(result["ok"], false, "{result}");
+            let check = result["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|check| check["name"] == "Configured review models")
+                .unwrap();
+            assert_eq!(check["ok"], false);
+            let message = check["detail"].as_str().unwrap();
+            assert!(message.contains(label), "{message}");
+            assert!(message.contains("crow setup"));
+            assert_eq!(
+                result["checks"][3]["ok"], true,
+                "Metadata discovery should still pass"
+            );
+        }
+    }
+    #[tokio::test]
     async fn discovery_paginates_and_falls_back_without_inventing_models() {
         let f = Fixture::new(json!({}));
         let catalog = discover(&f.job["settings"], f.root.path()).await.unwrap();
@@ -1739,10 +1847,10 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn execution_tools_are_local_opt_in_and_receipts_survive_publication() {
+    async fn default_worker_exposes_execution_but_disabled_and_child_reviews_do_not() {
         let mut f = Fixture::new(json!({}));
         f.job["settings"]["execution"] =
-            json!({"repositories":{"owner/repo":{"image":format!("sha256:{}", "a".repeat(64))}}});
+            crate::config::defaults(f.root.path())["worker"]["execution"].clone();
         let layout = prepare_review(&f.job, &f.source, &json!({}), f.root.path()).unwrap();
         assert!(
             layout.config["mcp_servers.crow_inspection.enabled_tools"]
@@ -1782,6 +1890,28 @@ mod tests {
         );
         let context = util::read_json(&child.context_path).unwrap().unwrap();
         assert!(context["job"]["settings"]["execution"].is_null());
+        assert!(
+            crate::execution::Execution::from_context(&context, &child.dir.join("experiments"))
+                .unwrap()
+                .is_none()
+        );
+
+        f.job.as_object_mut().unwrap().remove("parentId");
+        f.job.as_object_mut().unwrap().remove("taskId");
+        f.job["settings"]["execution"] = json!({"automatic":false});
+        let disabled = prepare_review(&f.job, &f.source, &json!({}), f.root.path()).unwrap();
+        assert!(
+            !disabled.config["mcp_servers.crow_inspection.enabled_tools"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("run_experiment"))
+        );
+        let context = util::read_json(&disabled.context_path).unwrap().unwrap();
+        assert!(
+            crate::execution::Execution::from_context(&context, &disabled.dir.join("experiments"))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

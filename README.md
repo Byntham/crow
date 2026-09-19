@@ -36,11 +36,11 @@ See the [Linux quickstart](docs/user/quickstart.md), [HTTPS choices](docs/user/n
 - Repository policies initially allow only your PRs. You can add authors or allow everyone. Authorized fork PRs targeting an enrolled repository are included.
 - Drafts and the initial open backlog are skipped. Startup/recovery catch-up repairs missed work, with large batches held for release.
 - Each worker allows three simultaneous reviews. Each review can use up to eight subagents. Both limits are configurable.
-- Reviews inspect files and diffs through dedicated read-only tools. Workers can optionally discover project setup, install dependencies, run tests and browser investigations, and inspect screenshots in disposable rootless containers, comparing the PR head with its base. See [runtime experiments](docs/user/runtime-experiments.md).
+- Reviews inspect files and diffs through dedicated read-only tools. By default, workers can discover project setup, install dependencies, run tests and browser investigations, and inspect screenshots in disposable rootless containers, comparing the PR head with its base. See [runtime experiments](docs/user/runtime-experiments.md).
 - Findings are advisory. Crow does not approve, request changes, or block merging.
 - Retries resume saved work where possible. The default is ten retries separated by at least five seconds. Reports publish only after completion and validation.
 
-Optional review instructions belong in `.crow/review.md`. Crow also reads applicable `AGENTS.md` files from the pinned target branch. These instructions cannot alter author authorization or enable execution. Runtime experiments require the worker operator's local configuration.
+Optional review instructions belong in `.crow/review.md`. Crow also reads applicable `AGENTS.md` files from the pinned target branch. These instructions cannot alter author authorization or enable execution. Runtime testing is available by default and can be disabled or restricted in the worker's local configuration. Normal setup guides Podman installation and checks host support.
 
 ## Development
 

@@ -68,7 +68,7 @@ pub fn defaults(root: &Path) -> Value {
         "version":1,"role":"both","operator":null,"publicUrl":null,"port":8787,"bind":"127.0.0.1",
         "adminToken":format!("{}{}",id(),id()),"serviceUrl":"http://127.0.0.1:8787",
         "worker":{"id":id(),"token":format!("{}{}",id(),id()),"concurrency":3,"codex":"codex","codexHome":root.join("codex"),
-            "model":null,"effort":null,"subagents":{"mode":"inherit","max":8},"retry":{"mode":"fixed","count":10,"delayMs":5000},"timeoutMs":0},
+            "execution":{"automatic":true},"model":null,"effort":null,"subagents":{"mode":"inherit","max":8},"retry":{"mode":"fixed","count":10,"delayMs":5000},"timeoutMs":0},
         "catchUp":{"enabled":true,"threshold":10},"auditIntervalMs":3600000,"retentionDays":7,"ingress":{"type":"funnel"},"app":null
     })
 }
@@ -258,6 +258,12 @@ pub fn load(root: &Path) -> Result<Value> {
         .context("Crow is not configured. Run crow setup.")?;
     normalize_numbers(&mut value);
     validate_config(&value)?;
+    // Resolve defaults only from the local installation. Missing execution in
+    // an internal review/MCP context must still mean no execution authority.
+    // Keep existing explicit disable settings and repository allowlists intact.
+    if value["worker"]["execution"].is_null() {
+        value["worker"]["execution"] = json!({"automatic":true});
+    }
     Ok(value)
 }
 pub fn save(root: &Path, value: &Value) -> Result<()> {
@@ -362,6 +368,36 @@ mod tests {
         save(dir.path(), &value).unwrap();
         assert_eq!(load(dir.path()).unwrap(), value);
     }
+    #[test]
+    fn runtime_defaults_are_local_and_preserve_operator_choices() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut value = defaults(dir.path());
+        assert!(crate::execution::enabled(&value["worker"], "owner/repo").unwrap());
+        value["worker"].as_object_mut().unwrap().remove("execution");
+        save(dir.path(), &value).unwrap();
+        let loaded = load(dir.path()).unwrap();
+        assert!(crate::execution::enabled(&loaded["worker"], "owner/repo").unwrap());
+        // Loading never rewrites the operator's file.
+        assert!(
+            read_json(&dir.path().join("config.json")).unwrap().unwrap()["worker"]
+                .get("execution")
+                .is_none()
+        );
+        for execution in [
+            json!({"automatic":false}),
+            json!({}),
+            json!({"repositories":{"owner/repo":{}}}),
+        ] {
+            value["worker"]["execution"] = execution.clone();
+            save(dir.path(), &value).unwrap();
+            let loaded = load(dir.path()).unwrap();
+            assert_eq!(loaded["worker"]["execution"], execution);
+            assert!(!crate::execution::enabled(&loaded["worker"], "owner/other").unwrap());
+        }
+        // Defaults must not turn absent authority in a delegated context on.
+        assert!(!crate::execution::enabled(&json!({}), "owner/repo").unwrap());
+    }
+
     #[test]
     fn reject_unsafe_service_and_invalid_shapes() {
         let mut c = defaults(Path::new("/tmp/crow"));

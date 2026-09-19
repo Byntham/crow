@@ -1076,15 +1076,18 @@ async fn podman_output(
     .stdout)
 }
 async fn check_runtime(executable: &str, env: &BTreeMap<String, String>) -> Result<()> {
-    let info: Value =
-        serde_json::from_str(&podman_output(executable, &["info", "--format=json"], env).await?)?;
+    let info: Value = serde_json::from_str(
+        &podman_output(executable, &["info", "--format=json"], env)
+            .await
+            .context("Crow could not start local rootless Podman. Run crow setup for guided runtime installation and host checks, or disable runtime testing with crow config worker.execution '{\"automatic\":false}' and restart Crow")?,
+    )?;
     ensure!(
         info["host"]["security"]["rootless"] == true && info["host"]["serviceIsRemote"] == false,
-        "Execution requires local rootless Podman"
+        "Execution requires local rootless Podman. Run Crow as your normal user with a local Podman installation; remote Podman services are unsupported"
     );
     ensure!(
         info["host"]["cgroupVersion"] == "v2" && info["host"]["security"]["seccompEnabled"] == true,
-        "Execution requires cgroup v2 and seccomp"
+        "Execution requires cgroup v2 and seccomp. Use a Linux host with these enabled; Crow does not change kernel security settings. Run crow setup for runtime guidance"
     );
     Ok(())
 }
@@ -1323,6 +1326,11 @@ fn append_report_suffix(report: &mut Value, suffix: &str) -> bool {
     }
     report["summary"] = candidate["summary"].take();
     true
+}
+
+pub(crate) async fn check_prerequisites(settings: &Value) -> Result<()> {
+    let config = config(&settings["execution"])?;
+    check_runtime(&config.podman, &environment()).await
 }
 
 pub async fn diagnostics(settings: &Value) -> Result<Value> {

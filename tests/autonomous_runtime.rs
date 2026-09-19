@@ -53,7 +53,13 @@ async fn managed_gateway_handles_concurrent_package_downloads() {
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-m", "download probe"]);
     let commit = git(&repo, &["rev-parse", "HEAD"]);
-    let context = json!({"root":root,"source":{"dir":repo,"base":commit,"head":commit},"job":{"repo":"fixture/downloads","settings":{"execution":{"automatic":true,"podman":std::env::var("CROW_TEST_PODMAN").unwrap_or("podman".into())}}}});
+    // Exercise the ordinary installation defaults, without opting into runtime.
+    let mut config = crow::config::defaults(temp.path());
+    config["worker"]["execution"]["podman"] =
+        json!(std::env::var("CROW_TEST_PODMAN").unwrap_or("podman".into()));
+    crow::config::save(temp.path(), &config).unwrap();
+    let config = crow::config::load(temp.path()).unwrap();
+    let context = json!({"root":root,"source":{"dir":repo,"base":commit,"head":commit},"job":{"repo":"fixture/downloads","settings":config["worker"]}});
     let exec = Execution::from_context(&context, &temp.path().join("experiments"))
         .unwrap()
         .unwrap();
@@ -80,6 +86,8 @@ PY"#;
             .unwrap()
             .contains("24 concurrent package downloads verified")
     );
+    let tested = call(&exec, "run_experiment", json!({"revision":"head","environment":result["id"],"command":r#"node -e "if (!require('./package.json').private) process.exit(1)""#})).await;
+    assert_eq!(tested["status"], "passed", "{tested}");
 }
 
 #[tokio::test]
