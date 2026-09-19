@@ -1822,7 +1822,9 @@ mod tests {
         config["role"] = json!("worker");
         preflight_listener(&config).await.unwrap();
         config["role"] = json!("service");
-        drop(listener);
+        // Let the OS select the free port within the bind itself. Reusing a
+        // released ephemeral port races other tests and subprocesses.
+        config["port"] = json!(0);
         preflight_listener(&config).await.unwrap();
     }
 
