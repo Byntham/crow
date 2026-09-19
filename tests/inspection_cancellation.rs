@@ -30,6 +30,8 @@ enum Scenario {
     QueuedEof,
     ProviderKill,
     QueueOverflow,
+    Backpressure,
+    BackpressureEof,
 }
 
 async fn scenario(scenario: Scenario) {
@@ -106,6 +108,100 @@ async fn scenario(scenario: Scenario) {
     })
     .await
     .expect("runtime command never started");
+    if matches!(scenario, Scenario::Backpressure | Scenario::BackpressureEof) {
+        let queued_ids: Vec<Value> = (100..116).map(|id| json!(id)).collect();
+        let excess_ids: Vec<Value> = (0..4)
+            .map(|id| json!(format!("busy-{id}-{}", "x".repeat(256 * 1024))))
+            .collect();
+        // Each busy response exceeds normal pipe capacity. Do not read stdout
+        // until cancellation and container cleanup have completed.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for id in queued_ids.iter().chain(&excess_ids) {
+                input.write_all(format!("{}\n", json!({"id":id,"method":"ping"})).as_bytes()).await.unwrap();
+            }
+            input.write_all(b"{\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":\"not-active\"}}\n").await.unwrap();
+        }).await.expect("Backpressure stopped stdin processing");
+        let eof = matches!(scenario, Scenario::BackpressureEof);
+        let mut input = Some(input);
+        if eof {
+            drop(input.take());
+        } else {
+            input
+                .as_mut()
+                .unwrap()
+                .write_all(
+                    b"{\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":7}}\n",
+                )
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if root.path().join("removed").exists() {
+                    let lock = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(root.path().join("experiments/execution.lock"))
+                        .unwrap();
+                    if fs2::FileExt::try_lock_exclusive(&lock).is_ok() {
+                        fs2::FileExt::unlock(&lock).unwrap();
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Blocked stdout prevented runtime cancellation/cleanup");
+        if !eof {
+            // Partial writes must resume at their saved offsets. Every line
+            // must remain valid JSON, with exactly the original request ID.
+            for id in &excess_ids {
+                let response: Value = serde_json::from_str(
+                    &tokio::time::timeout(Duration::from_secs(3), output.next_line())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(&response["id"], id);
+                assert_eq!(response["error"]["code"], -32000);
+            }
+            let cancelled: Value =
+                serde_json::from_str(&output.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(cancelled["id"], 7);
+            let receipt: Value =
+                serde_json::from_str(cancelled["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(receipt["status"], "interrupted");
+            for id in &queued_ids {
+                let response: Value =
+                    serde_json::from_str(&output.next_line().await.unwrap().unwrap()).unwrap();
+                assert_eq!(&response["id"], id);
+                assert_eq!(response["result"], json!({}));
+            }
+            input.as_mut().unwrap().write_all(b"{\"id\":200,\"method\":\"tools/call\",\"params\":{\"name\":\"list_experiments\",\"arguments\":{}}}\n").await.unwrap();
+            let reused: Value = serde_json::from_str(
+                &tokio::time::timeout(Duration::from_secs(3), output.next_line())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(reused["id"], 200);
+            assert_ne!(reused["result"]["isError"], true, "{reused}");
+        }
+        drop(input);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        return;
+    }
     if matches!(scenario, Scenario::QueueOverflow) {
         let ids: Vec<Value> = (100..120)
             .map(|id| {
@@ -481,4 +577,14 @@ async fn discovery_cancellation_stops_git_and_releases_execution_lock() {
 #[tokio::test]
 async fn full_mcp_queue_rejects_only_excess_requests_and_preserves_cancellation() {
     scenario(Scenario::QueueOverflow).await;
+}
+
+#[tokio::test]
+async fn blocked_mcp_stdout_preserves_cancellation_cleanup_json_and_connection_reuse() {
+    scenario(Scenario::Backpressure).await;
+}
+
+#[tokio::test]
+async fn blocked_mcp_stdout_still_observes_stdin_eof_and_cleans_up() {
+    scenario(Scenario::BackpressureEof).await;
 }

@@ -46,10 +46,15 @@ fn public(ip: IpAddr) -> bool {
                 || (a == 198 && (b == 18 || b == 19))
                 || (a == 192 && b == 0))
         }
-        // Restrict IPv6 to global unicast. Exclude translation, documentation and special ranges.
+        // Restrict IPv6 to global unicast, excluding the IETF special-purpose
+        // /23, documentation prefixes and 6to4. Ordinary 2001:: allocations
+        // such as Google's 2001:4860::/32 must remain usable.
         IpAddr::V6(ip) => {
             let s = ip.segments();
-            (s[0] & 0xe000) == 0x2000 && s[0] != 0x2001 && s[0] != 0x2002 && s[0] != 0x3fff
+            (s[0] & 0xe000) == 0x2000
+                && !(s[0] == 0x2001 && (s[1] < 0x0200 || s[1] == 0x0db8))
+                && s[0] != 0x2002
+                && !(s[0] == 0x3fff && s[1] < 0x1000)
         }
     }
 }
@@ -610,10 +615,22 @@ mod tests {
             "::1",
             "::ffff:127.0.0.1",
             "fc00::1",
+            "2001::1",
+            "2001:1ff:ffff::1",
             "2001:db8::1",
             "2002:7f00:1::",
+            "3fff::1",
+            "3fff:fff:ffff::1",
+            "64:ff9b::7f00:1",
         ] {
             assert!(!public(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in [
+            "2001:4860:4860::8888",
+            "2001:200::1",
+            "2606:4700:4700::1111",
+        ] {
+            assert!(public(ip.parse().unwrap()), "{ip}");
         }
         assert!(public("1.1.1.1".parse().unwrap()));
     }

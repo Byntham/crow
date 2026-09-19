@@ -256,6 +256,11 @@ fn node_workspace_owner(
     files: &[&str],
     packages: &BTreeMap<String, Value>,
 ) -> std::result::Result<Option<String>, String> {
+    if project_file(files, directory, "pnpm-workspace.yaml") {
+        return Err(format!(
+            "Inspect {directory}/pnpm-workspace.yaml and its root package.json before choosing setup or test commands. Workspace membership has not been resolved, so no npm fallback is suggested."
+        ));
+    }
     if directory == "." {
         return Ok(None);
     }
@@ -599,6 +604,30 @@ fn image_id(output: &str) -> Result<String> {
 #[cfg(test)]
 mod discovery_tests {
     use super::*;
+
+    #[test]
+    fn own_pnpm_workspace_requires_inspection_before_root_pin_or_lock_shortcuts() {
+        for directory in [".", "tools/project"] {
+            let path = if directory == "." {
+                "pnpm-workspace.yaml".to_owned()
+            } else {
+                format!("{directory}/pnpm-workspace.yaml")
+            };
+            let lock = if directory == "." {
+                "pnpm-lock.yaml".to_owned()
+            } else {
+                format!("{directory}/pnpm-lock.yaml")
+            };
+            for package in [json!({}), json!({"packageManager":"pnpm@9.15.4"})] {
+                for files in [vec![path.as_str()], vec![path.as_str(), lock.as_str()]] {
+                    let warning =
+                        node_workspace_owner(directory, &package, &files, &BTreeMap::new())
+                            .unwrap_err();
+                    assert!(warning.contains("pnpm-workspace.yaml"), "{warning}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn workspace_members_inherit_only_their_owner_and_respect_boundaries() {

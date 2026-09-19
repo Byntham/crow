@@ -31,6 +31,57 @@ async fn call(exec: &Execution, name: &str, args: Value) -> Value {
 }
 
 #[tokio::test]
+async fn pnpm_workspace_roots_withhold_guessed_commands() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-b", "main"]);
+    for directory in [".", "tools/project"] {
+        let path = repo.join(directory);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(
+            path.join("package.json"),
+            r#"{"private":true,"scripts":{"test":"node test.js","dev":"node server.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            path.join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/*\n",
+        )
+        .unwrap();
+    }
+    git(&repo, &["add", "."]);
+    git(
+        &repo,
+        &[
+            "commit",
+            "-m",
+            "pnpm workspace roots without other manager hints",
+        ],
+    );
+    let commit = git(&repo, &["rev-parse", "HEAD"]);
+    let context = json!({"root":temp.path(),"job":{"repo":"fixture/pnpm-workspace","settings":{"execution":{"automatic":true}}},"source":{"dir":repo,"head":commit,"base":commit}});
+    let exec = Execution::from_context(&context, &temp.path().join("experiments"))
+        .unwrap()
+        .unwrap();
+    let found = call(&exec, "discover_environment", json!({"revision":"head"})).await;
+    let projects = found["projects"].as_array().unwrap();
+    assert_eq!(projects.len(), 2, "{found}");
+    for project in projects {
+        assert!(
+            project["warning"]
+                .as_str()
+                .unwrap()
+                .contains("pnpm-workspace.yaml"),
+            "{project}"
+        );
+        for command in ["setup", "test", "start"] {
+            assert_eq!(project[command], "", "{project}");
+        }
+    }
+}
+
+#[tokio::test]
 #[ignore = "requires rootless Podman, the managed toolchain and public npm registry access"]
 async fn discovered_pinned_managers_and_nested_commands_run_offline() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(".crow-data/autonomous-runtime-test");

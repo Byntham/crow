@@ -920,6 +920,43 @@ pub(crate) async fn cancelled_tool(
     }
 }
 
+// Retain partial writes across select! cancellation. Backpressure may delay
+// delivery, but must not stop tool deadlines or input cancellation processing.
+#[derive(Default)]
+struct McpOutbox {
+    messages: VecDeque<Vec<u8>>,
+    offset: usize,
+    bytes: usize,
+}
+impl McpOutbox {
+    fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+    fn push(&mut self, response: &Value) -> Result<()> {
+        let mut bytes = serde_json::to_vec(response)?;
+        bytes.push(b'\n');
+        ensure!(
+            self.messages.len() < 64 && self.bytes + bytes.len() <= 16 * 1024 * 1024,
+            "MCP output backlog exceeded; client is not consuming responses"
+        );
+        self.bytes += bytes.len();
+        self.messages.push_back(bytes);
+        Ok(())
+    }
+    async fn write_next<W: tokio::io::AsyncWrite + Unpin>(&mut self, stdout: &mut W) -> Result<()> {
+        let bytes = self.messages.front().context("Empty MCP output queue")?;
+        let count = stdout.write(&bytes[self.offset..]).await?;
+        ensure!(count > 0, "MCP output closed");
+        self.offset += count;
+        if self.offset == bytes.len() {
+            self.bytes -= bytes.len();
+            self.messages.pop_front();
+            self.offset = 0;
+        }
+        Ok(())
+    }
+}
+
 // The buffer survives cancellation of this future when an active tool finishes.
 // fill_buf and consume keep partial JSON lines intact across select! iterations.
 async fn mcp_request<R: tokio::io::AsyncBufRead + Unpin>(
@@ -1031,17 +1068,19 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
         let mut line = Vec::new();
         let mut pending = VecDeque::new();
         let mut input_closed = false;
+        let mut outbox = McpOutbox::default();
         'requests: loop {
-            let request = match pending.pop_front() {
-                Some(request) => request,
-                None if input_closed => break,
-                None => tokio::select! {
-                    _ = &mut stop => break,
-                    request = mcp_request(&mut stdin, &mut line) => match request? {
-                        Some(request) => request,
-                        None => break,
+            let request = loop {
+                if let Some(request) = pending.pop_front() { break request; }
+                if input_closed && outbox.is_empty() { break 'requests; }
+                tokio::select! {
+                    _ = &mut stop => break 'requests,
+                    written = outbox.write_next(&mut stdout), if !outbox.is_empty() => written?,
+                    request = mcp_request(&mut stdin, &mut line), if !input_closed => match request? {
+                        Some(request) => break request,
+                        None => input_closed = true,
                     }
-                },
+                }
             };
             if request.get("id").is_none(){continue;}
             let id=request["id"].clone();
@@ -1062,7 +1101,7 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
                     let mutating = tool_starts_work(name);
                     // A preceding read-only call may have drained stdin to EOF
                     // while this state-changing request was waiting in the queue.
-                    if input_closed && mutating { break 'requests; }
+                    if input_closed && mutating { continue 'requests; }
                     tokio::pin!(call);
                     let output = loop {
                         tokio::select! {
@@ -1072,6 +1111,13 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
                                 break 'requests;
                             },
                             result = &mut call => break result,
+                            written = outbox.write_next(&mut stdout), if !outbox.is_empty() => {
+                                if let Err(error) = written {
+                                    cancel.cancel();
+                                    let _ = cancelled_tool(name, &mut call).await;
+                                    return Err(error);
+                                }
+                            },
                             incoming = mcp_request(&mut stdin, &mut line), if !input_closed => {
                                 let incoming = match incoming {
                                     Ok(Some(incoming)) => incoming,
@@ -1101,22 +1147,10 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
                                     // Limit queued requests as well as each input line.
                                     if pending.len() == 16 {
                                         let busy = json!({"jsonrpc":"2.0","id":incoming["id"],"error":{"code":-32000,"message":"MCP request queue is full; retry after pending requests complete"}});
-                                        let write = async {
-                                            stdout.write_all(busy.to_string().as_bytes()).await?;
-                                            stdout.write_all(b"\n").await?;
-                                            stdout.flush().await
-                                        };
-                                        tokio::select! {
-                                            _ = &mut stop => {
-                                                cancel.cancel();
-                                                let _ = cancelled_tool(name, &mut call).await;
-                                                break 'requests;
-                                            },
-                                            result = write => if let Err(error) = result {
-                                                cancel.cancel();
-                                                let _ = cancelled_tool(name, &mut call).await;
-                                                return Err(error.into());
-                                            }
+                                        if let Err(error) = outbox.push(&busy) {
+                                            cancel.cancel();
+                                            let _ = cancelled_tool(name, &mut call).await;
+                                            return Err(error);
                                         }
                                     } else {
                                         pending.push_back(incoming);
@@ -1130,12 +1164,7 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
                 _=>json!({"error":{"code":-32601,"message":"Unsupported method"}}),
             };
             let mut response=response; response["jsonrpc"]="2.0".into(); response["id"]=id;
-            let write = async {
-                stdout.write_all(response.to_string().as_bytes()).await?;
-                stdout.write_all(b"\n").await?;
-                stdout.flush().await
-            };
-            tokio::select! { _ = &mut stop => break, result = write => result? }
+            outbox.push(&response)?;
 
         } Ok::<_,anyhow::Error>(())
     }.await;
@@ -1149,6 +1178,19 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn mcp_output_backlog_bounds_count_and_bytes() {
+        let mut outbox = McpOutbox::default();
+        for _ in 0..64 {
+            outbox.push(&json!({"id":1,"result":{}})).unwrap();
+        }
+        assert!(outbox.push(&json!({"id":2,"result":{}})).is_err());
+        let mut outbox = McpOutbox::default();
+        let large = json!({"id":"x".repeat(8 * 1024 * 1024)});
+        outbox.push(&large).unwrap();
+        assert!(outbox.push(&large).is_err());
+    }
 
     #[test]
     fn cancellation_policy_covers_every_advertised_tool() {
