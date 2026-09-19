@@ -8,3 +8,5 @@ dist-release/
 secrets/
 
 /target/
+__pycache__/
+*.pyc

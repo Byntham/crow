@@ -16,13 +16,18 @@ for spec in json.loads(Path(__file__).with_name('cases.json').read_text()):
     case = dict(spec, url=f'https://github.com/{spec["repo"]}/pull/{spec["number"]}',
                 base=source['base'], head=source['head'], attempts=[])
     for state in sorted(directory.iterdir()):
-        events = state / 'reviews' / spec['id'] / 'events.jsonl'
-        if not events.exists():
+        if not state.is_dir():
             continue
+        events = state / 'reviews' / spec['id'] / 'events.jsonl'
         report = state / 'result.json'
+        replay = state / 'replay.json'
+        error = state / 'error.txt'
+        experiments = events.parent / 'experiments'
+        if not any(path.exists() for path in [events, report, replay, error]) and not experiments.is_dir():
+            continue
         calls = {}
         viewed = []
-        for line in events.read_text().splitlines():
+        for line in events.read_text().splitlines() if events.exists() else []:
             event = json.loads(line)
             item = event.get('item', {})
             if event['type'] != 'item.completed' or item.get('type') != 'mcp_tool_call':
@@ -33,12 +38,12 @@ for spec in json.loads(Path(__file__).with_name('cases.json').read_text()):
                 result = item.get('result') or {}
                 viewed.append(dict(arguments=item['arguments'], status=item['status'],
                                    imageReturned=any(c['type'] == 'image' for c in result.get('content', []))))
-        receipts = [json.loads(p.read_text()) for p in sorted(events.parent.joinpath('experiments').glob('*.json'))]
+        receipts = [json.loads(p.read_text()) for p in sorted(experiments.glob('*.json'))]
         receipts.sort(key=lambda r: r.get('startedAt', ''))
         case['attempts'].append(dict(name=state.name,
-            replay=json.loads((state / 'replay.json').read_text()) if (state / 'replay.json').exists() else None,
+            replay=json.loads(replay.read_text()) if replay.exists() else None,
             report=json.loads(report.read_text()) if report.exists() else None,
-            error=(state / 'error.txt').read_text() if (state / 'error.txt').exists() else None,
+            error=error.read_text() if error.exists() else None,
             toolCalls=calls, viewedArtifacts=viewed, receipts=receipts))
     case['independentChecks'] = [json.loads(p.read_text()) for p in sorted(directory.joinpath('verification/experiments').glob('*.json'))]
     cases.append(case)

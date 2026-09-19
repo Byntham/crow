@@ -33,6 +33,8 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test native implementation
         run: cargo test --locked --all-targets
+      - name: Test historical replay utilities
+        run: python3 -m unittest discover -s examples/historical_reviews -p 'test_*.py'
       - name: Test real rootless runtime experiments
         if: matrix.arch == 'x64'
         run: |
