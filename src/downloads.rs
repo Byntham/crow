@@ -7,9 +7,9 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpStream, UnixListener, UnixStream},
-    sync::Semaphore,
+    sync::{Semaphore, watch},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -81,6 +81,13 @@ fn destination(header: &str) -> Result<&str> {
 const HELLO_LIMIT: usize = 64 * 1024;
 const HELLO_RECORD_LIMIT: usize = 16;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+// Keep a completed HTTP keep-alive from consuming every tunnel indefinitely
+// when another package request is waiting. This deadline applies only while
+// another accepted connection is waiting for admission. A quiet connection with
+// no demand keeps the existing 120-second whole-connection limit. Because TLS
+// remains encrypted, a slow first response under pressure is indistinguishable
+// from keep-alive and may require the package manager to retry.
+const PRESSURE_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn take_field<'a>(bytes: &mut &'a [u8], count: usize) -> Result<&'a [u8]> {
     ensure!(bytes.len() >= count, "Truncated TLS ClientHello");
@@ -174,7 +181,77 @@ async fn client_hello(client: &mut UnixStream, host: &str) -> Result<Vec<u8>> {
         .context("Timed out waiting for TLS ClientHello")?
 }
 
-async fn tunnel(client: &mut UnixStream, established: &mut bool) -> Result<()> {
+async fn copy_direction<R, W>(
+    reader: R,
+    writer: W,
+    activity: watch::Sender<tokio::time::Instant>,
+    limit: u64,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut reader = reader.take(limit);
+    let mut writer = writer;
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        let size = reader.read(&mut buffer).await?;
+        if size == 0 {
+            return Ok(());
+        }
+        activity.send_replace(tokio::time::Instant::now());
+        let mut remaining = &buffer[..size];
+        while !remaining.is_empty() {
+            let written = writer.write(remaining).await?;
+            if written == 0 {
+                return Err(std::io::ErrorKind::WriteZero.into());
+            }
+            activity.send_replace(tokio::time::Instant::now());
+            remaining = &remaining[written..];
+        }
+    }
+}
+
+async fn relay<C, R>(
+    client: &mut C,
+    remote: &mut R,
+    mut pressure: watch::Receiver<bool>,
+    idle_timeout: Duration,
+    upload_limit: u64,
+    download_limit: u64,
+) -> Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    R: AsyncRead + AsyncWrite + Unpin,
+{
+    let (client_read, client_write) = tokio::io::split(client);
+    let (remote_read, remote_write) = tokio::io::split(remote);
+    let (activity, mut last_activity) = watch::channel(tokio::time::Instant::now());
+    let upload = copy_direction(client_read, remote_write, activity.clone(), upload_limit);
+    let download = copy_direction(remote_read, client_write, activity, download_limit);
+    tokio::pin!(upload, download);
+    loop {
+        let deadline = *last_activity.borrow_and_update() + idle_timeout;
+        let pressured = *pressure.borrow_and_update();
+        tokio::select! {
+            // Consume newly observed traffic before deciding a timer has expired.
+            biased;
+            result = &mut upload => { result?; return Ok(()); }
+            result = &mut download => { result?; return Ok(()); }
+            changed = last_activity.changed() => { changed.context("Package gateway traffic monitor closed")?; }
+            changed = pressure.changed() => { changed.context("Package gateway admission monitor closed")?; }
+            _ = tokio::time::sleep_until(deadline), if pressured => {
+                anyhow::bail!("Package gateway idle timeout after {} seconds while another connection was waiting", idle_timeout.as_secs());
+            }
+        }
+    }
+}
+
+async fn tunnel(
+    client: &mut UnixStream,
+    established: &mut bool,
+    pressure: watch::Receiver<bool>,
+) -> Result<()> {
     let mut header = Vec::new();
     while !header.ends_with(b"\r\n\r\n") {
         ensure!(header.len() < 8192, "Proxy header too large");
@@ -203,15 +280,16 @@ async fn tunnel(client: &mut UnixStream, established: &mut bool) -> Result<()> {
     // Connect to the validated address, never resolve the hostname again.
     let mut remote = TcpStream::connect(addresses.as_slice()).await?;
     remote.write_all(&hello).await?;
-    let (cr, cw) = client.split();
-    let (rr, rw) = remote.split();
     // Bound bytes in each direction as well as lifetime and concurrency.
-    let mut upload = cr.take(16 * 1024 * 1024 - hello.len() as u64);
-    let mut download = rr.take(256 * 1024 * 1024);
-    let mut rw = rw;
-    let mut cw = cw;
-    tokio::select! {result=tokio::io::copy(&mut upload, &mut rw)=>{result?;}, result=tokio::io::copy(&mut download, &mut cw)=>{result?;}}
-    Ok(())
+    relay(
+        client,
+        &mut remote,
+        pressure,
+        PRESSURE_IDLE_TIMEOUT,
+        16 * 1024 * 1024 - hello.len() as u64,
+        256 * 1024 * 1024,
+    )
+    .await
 }
 
 const ERROR_LIMIT: usize = 16;
@@ -255,29 +333,39 @@ impl Gateway {
         let errors = Arc::new(Mutex::new(Vec::new()));
         let task_errors = errors.clone();
         let task = tokio::spawn(async move {
+            let (pressure, pressured) = watch::channel(false);
             let slots = Arc::new(Semaphore::new(16));
             let mut tasks = tokio::task::JoinSet::new();
             loop {
-                // Leave excess connections in the bounded socket backlog until a
-                // tunnel finishes. Accepting and dropping them makes concurrent
-                // package managers see connection resets and retry whole batches.
-                let permit = tokio::select! {
-                    _ = cancelled.cancelled() => break,
-                    permit = slots.clone().acquire_owned() => {
-                        let Ok(permit) = permit else {break};
-                        permit
-                    }
-                };
                 tokio::select! {
                     _ = cancelled.cancelled() => break,
                     Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
                     incoming = listener.accept() => {
                         let Ok((mut stream,_)) = incoming else {break};
+                        // At most one accepted stream waits for capacity. The
+                        // remaining requests stay in the bounded socket backlog.
+                        // Only real waiting demand enables idle reclamation.
+                        let permit = match slots.clone().try_acquire_owned() {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                pressure.send_replace(true);
+                                let permit = tokio::select! {
+                                    _ = cancelled.cancelled() => break,
+                                    permit = slots.clone().acquire_owned() => {
+                                        let Ok(permit) = permit else { break };
+                                        permit
+                                    }
+                                };
+                                pressure.send_replace(false);
+                                permit
+                            }
+                        };
+                        let pressured = pressured.clone();
                         let errors = task_errors.clone();
                         tasks.spawn(async move {
                             let _permit = permit;
                             let mut established = false;
-                            let error = match tokio::time::timeout(Duration::from_secs(120), tunnel(&mut stream, &mut established)).await {
+                            let error = match tokio::time::timeout(Duration::from_secs(120), tunnel(&mut stream, &mut established, pressured)).await {
                                 Ok(Ok(())) => return,
                                 Ok(Err(error)) => format!("{error:#}"),
                                 Err(_) => "Package gateway connection timed out after 120 seconds".to_owned(),
@@ -327,6 +415,187 @@ impl Drop for Gateway {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn retained_completed_streams_release_capacity_only_for_waiting_requests() {
+        let slots = Arc::new(Semaphore::new(16));
+        let (pressure, pressured) = watch::channel(false);
+        let idle = Duration::from_millis(150);
+        let mut clients = Vec::new();
+        let mut remotes = Vec::new();
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let permit = slots.clone().acquire_owned().await.unwrap();
+            let (mut client, mut gateway_client) = tokio::io::duplex(64);
+            let (mut remote, mut gateway_remote) = tokio::io::duplex(64);
+            let pressured = pressured.clone();
+            tasks.spawn(async move {
+                let _permit = permit;
+                relay(
+                    &mut gateway_client,
+                    &mut gateway_remote,
+                    pressured,
+                    idle,
+                    1024,
+                    1024,
+                )
+                .await
+            });
+            remote.write_all(b"completed download").await.unwrap();
+            let mut received = [0u8; 18];
+            client.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, b"completed download");
+            clients.push(client);
+            remotes.push(remote);
+        }
+        // All downloads have finished but the peers retain their streams.
+        tokio::time::sleep(idle * 2).await;
+        assert_eq!(slots.available_permits(), 0);
+        assert!(slots.clone().try_acquire_owned().is_err());
+        pressure.send_replace(true);
+        let permit = tokio::time::timeout(Duration::from_secs(2), slots.clone().acquire_owned())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!clients.is_empty() && !remotes.is_empty());
+        let error = tasks.join_next().await.unwrap().unwrap().unwrap_err();
+        assert!(error.to_string().contains("idle timeout"));
+        drop(permit);
+        pressure.send_replace(false);
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn one_way_traffic_in_either_direction_resets_the_shared_idle_deadline() {
+        for upload in [false, true] {
+            let (_pressure, pressured) = watch::channel(true);
+            let (mut client, mut gateway_client) = tokio::io::duplex(64);
+            let (mut remote, mut gateway_remote) = tokio::io::duplex(64);
+            let task = tokio::spawn(async move {
+                relay(
+                    &mut gateway_client,
+                    &mut gateway_remote,
+                    pressured,
+                    Duration::from_millis(250),
+                    1024,
+                    1024,
+                )
+                .await
+            });
+            // Exercise a transfer lasting much longer than the idle deadline,
+            // with no traffic at all in the other direction.
+            for value in 0..10 {
+                let (writer, reader) = if upload {
+                    (&mut client, &mut remote)
+                } else {
+                    (&mut remote, &mut client)
+                };
+                writer.write_all(&[value]).await.unwrap();
+                assert_eq!(reader.read_u8().await.unwrap(), value);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(!task.is_finished());
+            let error = tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert!(error.to_string().contains("idle timeout"));
+        }
+    }
+
+    #[tokio::test]
+    async fn clearing_admission_pressure_preserves_a_silent_stream() {
+        let (pressure, pressured) = watch::channel(true);
+        let (mut client, mut gateway_client) = tokio::io::duplex(64);
+        let (mut remote, mut gateway_remote) = tokio::io::duplex(64);
+        let idle = Duration::from_millis(150);
+        let task = tokio::spawn(async move {
+            relay(
+                &mut gateway_client,
+                &mut gateway_remote,
+                pressured,
+                idle,
+                1024,
+                1024,
+            )
+            .await
+        });
+        client.write_all(b"request").await.unwrap();
+        let mut request = [0; 7];
+        remote.read_exact(&mut request).await.unwrap();
+        pressure.send_replace(false);
+        tokio::time::sleep(idle * 2).await;
+        assert!(!task.is_finished());
+        remote.write_all(b"slow response").await.unwrap();
+        let mut response = [0; 13];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"slow response");
+        drop(remote);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn monitored_copy_preserves_upload_and_download_byte_limits() {
+        for upload in [false, true] {
+            let (_pressure, pressured) = watch::channel(false);
+            let (mut client, mut gateway_client) = tokio::io::duplex(64);
+            let (mut remote, mut gateway_remote) = tokio::io::duplex(64);
+            let task = tokio::spawn(async move {
+                relay(
+                    &mut gateway_client,
+                    &mut gateway_remote,
+                    pressured,
+                    PRESSURE_IDLE_TIMEOUT,
+                    3,
+                    5,
+                )
+                .await
+            });
+            let (writer, reader) = if upload {
+                (&mut client, &mut remote)
+            } else {
+                (&mut remote, &mut client)
+            };
+            writer.write_all(b"oversized").await.unwrap();
+            let mut received = Vec::new();
+            reader.read_to_end(&mut received).await.unwrap();
+            assert_eq!(
+                received,
+                if upload {
+                    b"ove".as_slice()
+                } else {
+                    b"overs".as_slice()
+                }
+            );
+            task.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_admission_monitor_ends_the_relay() {
+        let (pressure, pressured) = watch::channel(false);
+        let (_client, mut gateway_client) = tokio::io::duplex(64);
+        let (_remote, mut gateway_remote) = tokio::io::duplex(64);
+        drop(pressure);
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            relay(
+                &mut gateway_client,
+                &mut gateway_remote,
+                pressured,
+                PRESSURE_IDLE_TIMEOUT,
+                1024,
+                1024,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.to_string().contains("admission monitor closed"));
+    }
+
     fn hello(host: &str, sni: bool) -> Vec<u8> {
         let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),

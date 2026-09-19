@@ -2,7 +2,7 @@
 
 These scripts replay public GitHub PRs through Crow's production reviewer locally. They do not publish reviews or comments upstream. Repository code runs through Crow's container tools. The reviewer chooses its own setup and test commands using the original PR title/body and repository instructions.
 
-`cases.json` includes seven real PRs and a labelled inverse of one fix. The inverse is a regression control, not an upstream PR. Its reviewer context uses a neutral description without disclosing the expected bug.
+`cases.json` includes real PRs across several repositories, five further T3 Code comparisons, and a labelled inverse of one fix. The inverse is a regression control, not an upstream PR. Its reviewer context uses a neutral description without disclosing the expected bug.
 
 Repository guidance comes from the pinned target-branch tip, even when it differs from the comparison merge base or the comparison is reversed. Run the local regression check with `python3 examples/historical_reviews/test_prepare.py`; it uses local Git repositories without GitHub or model calls.
 
