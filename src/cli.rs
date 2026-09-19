@@ -19,12 +19,12 @@ enum OutputFormat {
     name = "crow",
     about = "Review GitHub pull requests with your own Crow service",
     disable_version_flag = true,
-    after_help = "Get started:
+    help_template = root_help_template(),
+    before_help = "Get started:
   crow setup                    Set up this machine
   crow enroll owner/repo        Start reviewing a repository
-  crow status                   See reviews and worker health
-
-Use crow <command> --help for details and examples.
+  crow status                   See reviews and worker health",
+    after_help = "Use crow <command> --help for details and examples.
 For scripts: crow status --format json
 CROW_HOME sets the installation directory (default: ~/.local/share/crow)."
 )]
@@ -42,24 +42,19 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Show the installed Crow version.
-    #[command(display_order = 31)]
     Version,
     /// Install Crow on this machine and start setup.
-    #[command(display_order = 1)]
     Install {
         /// Install without opening the setup wizard.
         #[arg(long)]
         no_setup: bool,
     },
     /// Set up GitHub access, a review worker, and the service.
-    #[command(
-        display_order = 2,
-        after_help = "Examples:
+    #[command(after_help = "Examples:
   crow setup
   crow setup --role worker
 
-The service receives GitHub events. Workers run reviews. Choose both for one machine."
-    )]
+The service receives GitHub events. Workers run reviews. Choose both for one machine.")]
     Setup {
         /// What this machine runs: both, the service, or a worker.
         #[arg(long, value_parser = ["both", "service", "worker"])]
@@ -72,44 +67,32 @@ The service receives GitHub events. Workers run reviews. Choose both for one mac
         port: Option<u16>,
     },
     /// Run Crow in this terminal until you press Ctrl-C.
-    #[command(display_order = 28)]
     Run,
     /// Start Crow in the background.
-    #[command(display_order = 15)]
     Start,
     /// Stop Crow's background service.
-    #[command(display_order = 16)]
     Stop,
-    /// Restart the background service to apply configuration changes.
-    #[command(display_order = 17)]
+    /// Restart the service after configuration changes.
     ServiceRestart,
     /// Show repositories, workers, and recent reviews.
-    #[command(display_order = 3)]
     Status,
     /// Check the installation and explain any problems.
-    #[command(display_order = 4)]
     Doctor {
         /// Also check Codex capabilities without running a review.
         #[arg(long)]
         runtime: bool,
     },
     /// Follow service logs; press Ctrl-C to stop watching.
-    #[command(display_order = 5)]
     Logs,
     /// Sign in to the review provider on this worker.
-    #[command(display_order = 18)]
     Login,
     /// List available review models and reasoning levels.
-    #[command(display_order = 19)]
     Models,
     /// Enable automatic reviews for a GitHub repository.
-    #[command(
-        display_order = 6,
-        after_help = "Example: crow enroll owner/repo
+    #[command(after_help = "Example: crow enroll owner/repo
 
 By default, reviews cover new pull requests by your GitHub account.
-Use crow policy to change who receives or requests reviews."
-    )]
+Use crow policy to change who receives or requests reviews.")]
     Enroll {
         /// Repository in OWNER/REPO format.
         repo: String,
@@ -123,8 +106,8 @@ Use crow policy to change who receives or requests reviews."
         #[arg(long)]
         worker: Option<String>,
     },
-    /// Choose whose pull requests are reviewed and who can request reviews.
-    #[command(display_order = 12, group(clap::ArgGroup::new("policy_change").args(["authors", "everyone", "requesters"]).required(true).multiple(true)), after_help = "Examples:
+    /// Choose whose PRs get reviews and who can request them.
+    #[command(group(clap::ArgGroup::new("policy_change").args(["authors", "everyone", "requesters"]).required(true).multiple(true)), after_help = "Examples:
   crow policy owner/repo --authors alice,bob
   crow policy owner/repo --everyone
   crow policy owner/repo --requesters alice,bob")]
@@ -142,7 +125,7 @@ Use crow policy to change who receives or requests reviews."
         requesters: Option<String>,
     },
     /// Set review options for one repository.
-    #[command(display_order = 13, group(clap::ArgGroup::new("settings").args(["json", "model", "effort", "timeout_seconds", "reset"]).required(true).multiple(true)), after_help = "Examples:
+    #[command(group(clap::ArgGroup::new("settings").args(["json", "model", "effort", "timeout_seconds", "reset"]).required(true).multiple(true)), after_help = "Examples:
   crow repo-config owner/repo --model MODEL --effort high
   crow repo-config owner/repo --reset
   crow repo-config owner/repo --json '{\"retry\":{\"count\":3}}'
@@ -169,17 +152,14 @@ Omitted options use worker defaults.")]
         reset: bool,
     },
     /// Request a review of a pull request.
-    #[command(display_order = 7, after_help = "Example: crow review owner/repo 42")]
+    #[command(after_help = "Example: crow review owner/repo 42")]
     Review(ReviewArgs),
     /// Pause a review and keep its saved work.
-    #[command(
-        display_order = 8,
-        after_help = "Example: crow pause owner/repo 42
-Continue later with crow resume owner/repo 42."
-    )]
+    #[command(after_help = "Example: crow pause owner/repo 42
+Continue later with crow resume owner/repo 42.")]
     Pause(ReviewArgs),
     /// Continue a paused review from its saved work.
-    #[command(display_order = 9, after_help = "Example: crow resume owner/repo 42")]
+    #[command(after_help = "Example: crow resume owner/repo 42")]
     Resume {
         #[command(flatten)]
         review: ReviewArgs,
@@ -190,11 +170,10 @@ Continue later with crow resume owner/repo 42."
         #[arg(long)]
         effort: Option<String>,
     },
-    /// Start a fresh review, replacing the previous attempt.
-    #[command(display_order = 10, after_help = "Example: crow restart owner/repo 42")]
+    /// Restart a pull request review from scratch.
+    #[command(after_help = "Example: crow restart owner/repo 42")]
     Restart(ReviewArgs),
     /// Find eligible open pull requests that need a review.
-    #[command(display_order = 11)]
     CatchUp {
         /// Limit to OWNER/REPO; omit to check all enrolled repositories.
         repo: Option<String>,
@@ -203,18 +182,14 @@ Continue later with crow resume owner/repo 42."
         include_backlog: bool,
     },
     /// Queue reviews held back after a large catch-up batch.
-    #[command(display_order = 22)]
     Release {
         /// Limit to OWNER/REPO; omit to release all held reviews.
         repo: Option<String>,
     },
     /// Create credentials for connecting another worker.
-    #[command(display_order = 23)]
     Pair,
     /// Show settings, or change a setting on this machine.
-    #[command(
-        display_order = 14,
-        after_help = "Examples:
+    #[command(after_help = "Examples:
   crow config
   crow config worker.model MODEL
   crow config worker.effort high
@@ -227,8 +202,7 @@ Editable settings:
   catchUp.enabled, catchUp.threshold, auditIntervalMs, retentionDays
 
 Choose the model and reasoning level from crow models.
-Restart Crow after changes with crow service-restart."
-    )]
+Restart Crow after changes with crow service-restart.")]
     Config {
         /// Setting to change; omit to show current settings.
         #[arg(requires = "value")]
@@ -238,19 +212,14 @@ Restart Crow after changes with crow service-restart."
         value: Option<String>,
     },
     /// Remove expired review records and local review files.
-    #[command(display_order = 24)]
     Cleanup,
     /// Install the latest Crow release and restart the service.
-    #[command(display_order = 20)]
     Update,
     /// Stop accepting new reviews while current reviews finish.
-    #[command(display_order = 25)]
     Drain,
     /// Accept new reviews again after crow drain.
-    #[command(display_order = 26)]
     Undrain,
     /// Save an encrypted backup of this installation.
-    #[command(display_order = 29)]
     Backup {
         /// Destination archive path.
         file: PathBuf,
@@ -260,7 +229,6 @@ Restart Crow after changes with crow service-restart."
     },
     /// Restore a backup, replacing settings and history on this machine.
     #[command(
-        display_order = 30,
         after_help = "Stop Crow before restoring with crow stop. Existing settings and review history are replaced.
 After restoring, run crow login on review workers, then crow start."
     )]
@@ -276,6 +244,70 @@ After restoring, run crow login on review workers, then crow start."
         source: PathBuf,
         context: Option<PathBuf>,
     },
+}
+
+// Keep the command index task-oriented without changing the command hierarchy.
+// Descriptions still come from the subcommands, so detailed help stays in sync.
+const COMMAND_GROUPS: &[(&str, &[&str])] = &[
+    ("Setup and workers", &["setup", "install", "login", "pair"]),
+    ("Repositories", &["enroll", "policy", "repo-config"]),
+    (
+        "Reviews",
+        &[
+            "review", "pause", "resume", "restart", "catch-up", "release",
+        ],
+    ),
+    ("Status and troubleshooting", &["status", "doctor", "logs"]),
+    (
+        "Service",
+        &[
+            "start",
+            "stop",
+            "service-restart",
+            "run",
+            "drain",
+            "undrain",
+        ],
+    ),
+    (
+        "Settings and maintenance",
+        &[
+            "config", "models", "update", "cleanup", "backup", "restore", "version", "help",
+        ],
+    ),
+];
+
+fn root_help_template() -> String {
+    use std::fmt::Write;
+
+    // Build only the subcommands here. Building Cli would recurse into this template.
+    let mut commands = Command::augment_subcommands(clap::Command::new("crow"));
+    commands.build();
+    let header = commands.get_styles().get_header();
+    let literal = commands.get_styles().get_literal();
+    let width = commands
+        .get_subcommands()
+        .filter(|command| !command.is_hide_set())
+        .map(|command| command.get_name().len())
+        .max()
+        .unwrap_or_default();
+    let mut template =
+        format!("{{about}}\n\n{header}Usage:{header:#} {{usage}}\n\n{{before-help}}");
+    for (heading, names) in COMMAND_GROUPS {
+        writeln!(template, "{header}{heading}:{header:#}").unwrap();
+        for name in *names {
+            let command = commands.find_subcommand(name).expect("help command exists");
+            let about = command.get_about().expect("help command has a description");
+            writeln!(template, "  {literal}{name:width$}{literal:#}  {about}").unwrap();
+        }
+        template.push('\n');
+    }
+    write!(
+        template,
+        "{header}Options:{header:#}\n{{options}}{{after-help}}\n"
+    )
+    .unwrap();
+    template
 }
 
 #[derive(Args, Debug)]
@@ -856,6 +888,27 @@ mod tests {
         let help = command.render_long_help().to_string();
         assert!(!help.contains("_inspection-mcp"));
         assert!(help.contains("crow status --format json"));
+        let grouped_names: Vec<_> = COMMAND_GROUPS
+            .iter()
+            .flat_map(|(_, names)| names.iter().copied())
+            .collect();
+        let visible_names: std::collections::BTreeSet<_> = command
+            .get_subcommands()
+            .filter(|command| !command.is_hide_set())
+            .map(|command| command.get_name())
+            .collect();
+        assert_eq!(
+            grouped_names.len(),
+            visible_names.len(),
+            "duplicate help entries"
+        );
+        assert_eq!(
+            grouped_names
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            visible_names
+        );
         for subcommand in command
             .get_subcommands()
             .filter(|command| !command.is_hide_set())

@@ -259,22 +259,49 @@ async fn pair_and_combined_cleanup_each_emit_one_json_document() -> Result<()> {
 #[tokio::test]
 async fn help_explains_every_public_command_and_hides_internal_entry_points() -> Result<()> {
     let fixture = Fixture::new("service", empty_status()).await?;
-    let help = stdout(&fixture.run(&["--help"]).await?);
-    assert!(help.contains("crow setup"), "{help}");
-    assert!(help.contains("--format"), "{help}");
-    assert!(!help.contains("_inspection-mcp"), "{help}");
-    let commands = help
-        .split("Commands:\n")
-        .nth(1)
-        .unwrap()
-        .split("\nOptions:")
-        .next()
-        .unwrap();
-    for line in commands.lines().filter(|line| !line.trim().is_empty()) {
-        assert!(
-            line.split_whitespace().count() > 2,
-            "Command has no useful description: {line}"
-        );
+    for args in [vec![], vec!["-h"], vec!["--help"], vec!["help"]] {
+        let help = stdout(&fixture.run(&args).await?);
+        assert!(help.contains("crow setup"), "{help}");
+        assert!(help.contains("--format"), "{help}");
+        assert!(!help.contains("_inspection-mcp"), "{help}");
+        assert!(!help.contains('\u{1b}'), "NO_COLOR must disable styling");
+        let headings = [
+            "Get started:",
+            "Setup and workers:",
+            "Repositories:",
+            "Reviews:",
+            "Status and troubleshooting:",
+            "Service:",
+            "Settings and maintenance:",
+            "Options:",
+        ];
+        let mut remaining = help.as_str();
+        for heading in headings {
+            remaining = remaining.split_once(heading).expect(heading).1;
+        }
+        let commands = help
+            .split_once("Setup and workers:\n")
+            .unwrap()
+            .1
+            .split_once("\nOptions:")
+            .unwrap()
+            .0;
+        for line in commands.lines().filter(|line| line.starts_with("  ")) {
+            assert!(
+                line.split_whitespace().count() > 2,
+                "Command has no useful description: {line}"
+            );
+        }
+        let reviews = help
+            .split_once("Reviews:\n")
+            .unwrap()
+            .1
+            .split_once("\nStatus and troubleshooting:")
+            .unwrap()
+            .0;
+        assert!(reviews.contains("  restart "), "{reviews}");
+        assert!(reviews.contains("  release "), "{reviews}");
+        assert!(!reviews.contains("service-restart"), "{reviews}");
     }
     for command in ["enroll", "review", "repo-config", "config", "pair"] {
         let detail = stdout(&fixture.run(&[command, "--help"]).await?);
