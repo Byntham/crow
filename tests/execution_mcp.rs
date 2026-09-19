@@ -356,11 +356,25 @@ exit 1
         .output()
         .unwrap();
     assert!(output.status.success());
-    assert!(
-        output.stdout.is_empty(),
-        "Leaked containers: {}",
-        String::from_utf8_lossy(&output.stdout)
-    );
+    // Other reviews may share the engine. Only this test's receipt-owned
+    // containers must be gone, including interrupted attempts recovered above.
+    let remaining = String::from_utf8(output.stdout).unwrap();
+    for entry in std::fs::read_dir(dir.path().join("experiments")).unwrap() {
+        let path = entry.unwrap().path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "json")
+        {
+            let receipt: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            if let Some(id) = receipt["id"].as_str() {
+                let name = format!("crow-experiment-{id}");
+                assert!(
+                    !remaining.lines().any(|line| line == name),
+                    "Leaked container: {name}"
+                );
+            }
+        }
+    }
     assert_eq!(std::fs::read_to_string(canary).unwrap(), "secret");
     println!(
         "Real MCP/container regression, HTTP smoke test, isolation, output bounds, timeout, signal cleanup, resume and rendered report passed.\n{body}"
