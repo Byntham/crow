@@ -297,16 +297,18 @@ async fn discovered_yarn_workspace_inherits_root_setup_and_runs_pnp_child_offlin
     let temp = tempfile::tempdir_in(&root).unwrap();
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(repo.join("packages/app/plugins/foo")).unwrap();
+    std::fs::create_dir_all(repo.join("packages/app/tools/helper")).unwrap();
     std::fs::create_dir_all(repo.join("packages/shared")).unwrap();
     git(&repo, &["init", "-b", "main"]);
-    std::fs::write(repo.join("package.json"),r#"{"name":"workspace-root","version":"1.0.0","private":true,"packageManager":"yarn@4.9.2","workspaces":["packages/*"]}"#).unwrap();
+    std::fs::write(repo.join("package.json"),r#"{"name":"workspace-root","version":"1.0.0","private":true,"packageManager":"yarn@4.9.2","workspaces":["packages/**"]}"#).unwrap();
     std::fs::write(
         repo.join(".yarnrc.yml"),
-        "nodeLinker: pnp\nenableGlobalCache: false\n",
+        "nodeLinker: pnp\nenableGlobalCache: false\nhttpTimeout: 15000\nhttpRetry: 0\n",
     )
     .unwrap();
-    std::fs::write(repo.join("packages/app/package.json"),r#"{"name":"app","version":"1.0.0","private":true,"workspaces":["plugins/*"],"dependencies":{"shared":"workspace:*"},"scripts":{"test":"node test.cjs"}}"#).unwrap();
-    std::fs::write(repo.join("packages/app/plugins/foo/package.json"),r#"{"name":"nested-plugin","version":"1.0.0","private":true,"dependencies":{"shared":"workspace:*"},"scripts":{"test":"node test.cjs"}}"#).unwrap();
+    std::fs::write(repo.join("packages/app/package.json"),r#"{"name":"app","version":"1.0.0","private":true,"workspaces":["plugins/*"],"dependencies":{"shared":"workspace:*","is-number":"7.0.0"},"scripts":{"test":"node test.cjs"}}"#).unwrap();
+    std::fs::write(repo.join("packages/app/plugins/foo/package.json"),r#"{"name":"nested-plugin","version":"1.0.0","private":true,"dependencies":{"shared":"workspace:*","is-number":"7.0.0"},"scripts":{"test":"node test.cjs"}}"#).unwrap();
+    std::fs::write(repo.join("packages/app/tools/helper/package.json"),r#"{"name":"helper","version":"1.0.0","private":true,"dependencies":{"shared":"workspace:*","is-number":"7.0.0"},"scripts":{"test":"node test.cjs"}}"#).unwrap();
     std::fs::write(
         repo.join("packages/shared/package.json"),
         r#"{"name":"shared","version":"1.0.0","private":true,"main":"index.cjs"}"#,
@@ -317,10 +319,30 @@ async fn discovered_yarn_workspace_inherits_root_setup_and_runs_pnp_child_offlin
         "module.exports = 42;\n",
     )
     .unwrap();
-    std::fs::write(repo.join("packages/app/test.cjs"),"const assert = require('node:assert/strict'); const {execFileSync}=require('node:child_process'); assert(process.versions.pnp); assert.equal(require('shared'),42); assert.equal(execFileSync('yarn',['--version'],{encoding:'utf8'}).trim(),'4.9.2'); console.log('workspace child used inherited Yarn and PnP dependency offline');\n").unwrap();
+    std::fs::write(
+        repo.join("packages/app/test.cjs"),
+        r#"const assert = require('node:assert/strict');
+const {execFileSync} = require('node:child_process');
+assert(process.versions.pnp);
+assert.equal(require('shared'), 42);
+assert.equal(require('is-number')('42'), true);
+assert.equal(require('is-number')('not a number'), false);
+for (const variable of ['YARN_HTTP_PROXY', 'YARN_HTTPS_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']) {
+  assert.equal(process.env[variable], undefined, `${variable} leaked into offline experiment`);
+}
+
+assert.equal(execFileSync('yarn', ['--version'], {encoding:'utf8'}).trim(), '4.9.2');
+console.log('workspace child used inherited Yarn and PnP dependency offline');
+"#,
+    ).unwrap();
     std::fs::copy(
         repo.join("packages/app/test.cjs"),
         repo.join("packages/app/plugins/foo/test.cjs"),
+    )
+    .unwrap();
+    std::fs::copy(
+        repo.join("packages/app/test.cjs"),
+        repo.join("packages/app/tools/helper/test.cjs"),
     )
     .unwrap();
     std::fs::write(
@@ -336,14 +358,32 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "app@workspace:packages/app"
   dependencies:
+    is-number: "npm:7.0.0"
     shared: "workspace:*"
   languageName: unknown
   linkType: soft
+
+"helper@workspace:packages/app/tools/helper":
+  version: 0.0.0-use.local
+  resolution: "helper@workspace:packages/app/tools/helper"
+  dependencies:
+    is-number: "npm:7.0.0"
+    shared: "workspace:*"
+  languageName: unknown
+  linkType: soft
+
+"is-number@npm:7.0.0":
+  version: 7.0.0
+  resolution: "is-number@npm:7.0.0"
+  checksum: 10c0/b4686d0d3053146095ccd45346461bc8e53b80aeb7671cc52a4de02dbbf7dc0d1d2a986e2fe4ae206984b4d34ef37e8b795ebc4f4295c978373e6575e295d811
+  languageName: node
+  linkType: hard
 
 "nested-plugin@workspace:packages/app/plugins/foo":
   version: 0.0.0-use.local
   resolution: "nested-plugin@workspace:packages/app/plugins/foo"
   dependencies:
+    is-number: "npm:7.0.0"
     shared: "workspace:*"
   languageName: unknown
   linkType: soft
@@ -387,9 +427,24 @@ __metadata:
     assert_eq!(direct["setup"], child["setup"]);
     assert_eq!(child["packageManager"], "yarn@4.9.2");
     assert!(child["warning"].is_null(), "{child}");
+    let helper = projects
+        .iter()
+        .find(|project| project["directory"] == "packages/app/tools/helper")
+        .unwrap();
+    assert_eq!(helper["setupDirectory"], ".", "{found}");
+    assert_eq!(helper["setup"], child["setup"]);
+    assert_eq!(helper["packageManager"], "yarn@4.9.2");
+    assert!(helper["warning"].is_null(), "{helper}");
     let setup=call(&exec,"prepare_environment",json!({"revision":"head","setup":format!("cd /workspace/{} && {}",child["setupDirectory"].as_str().unwrap(),child["setup"].as_str().unwrap())})).await;
     assert_eq!(setup["status"], "passed", "{setup}");
-    let commands: Vec<_> = [direct, child]
+    assert!(
+        setup["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("A package was added to the project"),
+        "Expected a cold remote dependency fetch: {setup}"
+    );
+    let commands: Vec<_> = [direct, child, helper]
         .into_iter()
         .map(|project| {
             format!(
@@ -412,10 +467,117 @@ __metadata:
             .unwrap()
             .matches("workspace child used inherited Yarn and PnP dependency offline")
             .count(),
-        2,
+        3,
         "{result}"
     );
     println!(
-        "Direct and nested Yarn workspaces inherited the ultimate root; both PnP dependencies and nested Yarn commands passed offline."
+        "Yarn fetched is-number@7.0.0 with an immutable lock. Direct, nested, and outer-recursive workspaces used remote and local PnP dependencies offline; nested Yarn commands passed and setup proxy settings were absent."
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires rootless Podman, the managed toolchain and public npm registry access"]
+async fn discovered_yarn_deep_member_uses_root_despite_unselected_intermediate_match() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(".crow-data/autonomous-runtime-test");
+    std::fs::create_dir_all(&root).unwrap();
+    let temp = tempfile::tempdir_in(&root).unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(repo.join("packages/app/plugins/foo")).unwrap();
+    std::fs::create_dir_all(repo.join("packages/shared")).unwrap();
+    git(&repo, &["init", "-b", "main"]);
+    std::fs::write(repo.join("package.json"), r#"{"name":"root","private":true,"packageManager":"yarn@4.9.2","workspaces":["packages/*/plugins/*","packages/shared"]}"#).unwrap();
+    // This intermediate manifest selects the plugin, but Yarn's root does
+    // not select the intermediate manifest. Setup must still use the root.
+    std::fs::write(
+        repo.join("packages/app/package.json"),
+        r#"{"name":"app","private":true,"workspaces":["plugins/*"]}"#,
+    )
+    .unwrap();
+    std::fs::write(repo.join("packages/app/plugins/foo/package.json"), r#"{"name":"plugin","private":true,"dependencies":{"shared":"workspace:*"},"scripts":{"test":"node test.cjs"}}"#).unwrap();
+    std::fs::write(
+        repo.join("packages/shared/package.json"),
+        r#"{"name":"shared","private":true,"main":"index.cjs"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("packages/shared/index.cjs"),
+        "module.exports = 42;\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("packages/app/plugins/foo/test.cjs"), "const assert = require('node:assert/strict'); assert(process.versions.pnp); assert.equal(require('shared'), 42); console.log('direct deep member imported root sibling offline');\n").unwrap();
+    std::fs::write(
+        repo.join(".yarnrc.yml"),
+        "nodeLinker: pnp\nenableGlobalCache: false\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("yarn.lock"),
+        r#"# This file is generated by running "yarn install" inside your project.
+# Manual changes might be lost - proceed with caution!
+
+__metadata:
+  version: 8
+  cacheKey: 10c0
+
+"plugin@workspace:packages/app/plugins/foo":
+  version: 0.0.0-use.local
+  resolution: "plugin@workspace:packages/app/plugins/foo"
+  dependencies:
+    shared: "workspace:*"
+  languageName: unknown
+  linkType: soft
+
+"root@workspace:.":
+  version: 0.0.0-use.local
+  resolution: "root@workspace:."
+  languageName: unknown
+  linkType: soft
+
+"shared@workspace:*, shared@workspace:packages/shared":
+  version: 0.0.0-use.local
+  resolution: "shared@workspace:packages/shared"
+  languageName: unknown
+  linkType: soft
+"#,
+    )
+    .unwrap();
+    git(&repo, &["add", "."]);
+    git(
+        &repo,
+        &["commit", "-m", "Yarn direct deep workspace fixture"],
+    );
+    let commit = git(&repo, &["rev-parse", "HEAD"]);
+    let config = json!({"podman":std::env::var("CROW_TEST_PODMAN").unwrap_or("podman".into()),"automatic":true});
+    let context = json!({"root":root,"job":{"repo":"fixture/yarn-deep-workspace","settings":{"execution":config}},"source":{"dir":repo,"head":commit,"base":commit}});
+    let exec = Execution::from_context(&context, &temp.path().join("experiments"))
+        .unwrap()
+        .unwrap();
+    let found = call(&exec, "discover_environment", json!({"revision":"head"})).await;
+    let plugin = found["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|project| project["directory"] == "packages/app/plugins/foo")
+        .unwrap();
+    assert_eq!(plugin["setupDirectory"], ".", "{found}");
+    assert_eq!(plugin["packageManager"], "yarn@4.9.2");
+    let setup = call(
+        &exec,
+        "prepare_environment",
+        json!({"revision":"head","setup":plugin["setup"]}),
+    )
+    .await;
+    assert_eq!(setup["status"], "passed", "{setup}");
+    let result = call(&exec, "run_experiment", json!({"revision":"head","environment":setup["id"],"command":format!("cd /workspace/packages/app/plugins/foo && {}",plugin["test"].as_str().unwrap())})).await;
+    assert_eq!(result["status"], "passed", "{result}");
+    assert!(
+        result["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("direct deep member imported root sibling offline"),
+        "{result}"
+    );
+    println!(
+        "Yarn directly selected a deep plugin without its intermediate app; Crow installed at the root and the plugin imported its sibling through PnP offline."
     );
 }

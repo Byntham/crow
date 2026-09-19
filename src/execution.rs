@@ -866,8 +866,10 @@ except OSError as error:
             );
         }
         let command = if gateway.is_some() {
+            // Modern Yarn ignores the generic proxy variables. Keep its own
+            // settings in this setup shell so offline experiments inherit none.
             format!(
-                "python3 -I /opt/crow/proxy.py >/tmp/crow-proxy.log 2>&1 &\nproxy=$!\ntrap 'kill $proxy 2>/dev/null || true' EXIT\nexport HTTPS_PROXY=http://127.0.0.1:3128 HTTP_PROXY=http://127.0.0.1:3128 https_proxy=http://127.0.0.1:3128 http_proxy=http://127.0.0.1:3128 NO_PROXY=127.0.0.1,localhost\nexport PIP_INDEX_URL=https://pypi.org/simple\nmkdir -p \"$HOME\"\npython3 -I -c 'import socket,time
+                "python3 -I /opt/crow/proxy.py >/tmp/crow-proxy.log 2>&1 &\nproxy=$!\ntrap 'kill $proxy 2>/dev/null || true' EXIT\nexport HTTPS_PROXY=http://127.0.0.1:3128 HTTP_PROXY=http://127.0.0.1:3128 https_proxy=http://127.0.0.1:3128 http_proxy=http://127.0.0.1:3128 NO_PROXY=127.0.0.1,localhost\nexport YARN_HTTP_PROXY=http://127.0.0.1:3128 YARN_HTTPS_PROXY=http://127.0.0.1:3128\nexport PIP_INDEX_URL=https://pypi.org/simple\nmkdir -p \"$HOME\"\npython3 -I -c 'import socket,time
 for attempt in range(100):
  try:
   socket.create_connection((\"127.0.0.1\",3128),timeout=.1).close(); break

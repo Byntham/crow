@@ -238,8 +238,20 @@ fn node_workspace_owner(
         return Ok(None);
     }
     let mut ancestor = directory;
+    let mut fallback = None;
     loop {
         ancestor = ancestor.rsplit_once('/').map_or(".", |(parent, _)| parent);
+        let independent = packages
+            .get(ancestor)
+            .is_some_and(|package| package.get("packageManager").is_some())
+            || [
+                "package-lock.json",
+                "npm-shrinkwrap.json",
+                "pnpm-lock.yaml",
+                "yarn.lock",
+            ]
+            .iter()
+            .any(|name| project_file(files, ancestor, name));
         if project_file(files, ancestor, "pnpm-workspace.yaml") {
             return Err(format!(
                 "Inspect {ancestor}/pnpm-workspace.yaml and its root package.json before choosing setup or test commands. Workspace membership has not been resolved, so no npm fallback is suggested."
@@ -255,32 +267,40 @@ fn node_workspace_owner(
             };
             match workspace_member(patterns, relative) {
                 Some(true) => {
-                    let Some(root) = node_workspace_owner(ancestor, parent, files, packages)?
-                    else {
-                        return Ok(Some(ancestor.to_owned()));
-                    };
-                    // Yarn 2+ recursively discovers workspace declarations in
-                    // member packages. Do not assume npm or unknown Yarn
-                    // versions install the same nested workspace graph.
-                    let modern_yarn = packages[&root]["packageManager"]
-                        .as_str()
-                        .and_then(pinned_manager)
-                        .is_some_and(|(manager, version)| {
-                            manager == "yarn"
-                                && version
-                                    .split('.')
-                                    .next()
-                                    .and_then(|major| major.parse::<u64>().ok())
-                                    .is_some_and(|major| major >= 2)
-                        });
-                    if !modern_yarn {
-                        return Err(format!(
-                            "Inspect nested workspaces in {ancestor}/package.json and {root}/package.json before choosing setup or test commands. Automatic nested-workspace inheritance requires an exact Yarn 2+ pin; no npm fallback is suggested."
-                        ));
+                    if let Some(root) = node_workspace_owner(ancestor, parent, files, packages)? {
+                        // Yarn 2+ recursively discovers workspace declarations in
+                        // member packages. Do not assume npm or unknown Yarn
+                        // versions install the same nested workspace graph.
+                        let modern_yarn = packages[&root]["packageManager"]
+                            .as_str()
+                            .and_then(pinned_manager)
+                            .is_some_and(|(manager, version)| {
+                                manager == "yarn"
+                                    && version
+                                        .split('.')
+                                        .next()
+                                        .and_then(|major| major.parse::<u64>().ok())
+                                        .is_some_and(|major| major >= 2)
+                            });
+                        if !modern_yarn {
+                            return Err(format!(
+                                "Inspect nested workspaces in {ancestor}/package.json and {root}/package.json before choosing setup or test commands. Automatic nested-workspace inheritance requires an exact Yarn 2+ pin; no npm fallback is suggested."
+                            ));
+                        }
+                        return Ok(Some(root));
                     }
-                    return Ok(Some(root));
+                    if independent || ancestor == "." {
+                        return Ok(Some(ancestor.to_owned()));
+                    }
+                    // An unpinned intermediate declaration may not itself be
+                    // a workspace member even when an outer root directly
+                    // includes this project. Prefer that root if one exists.
+                    fallback.get_or_insert_with(|| ancestor.to_owned());
                 }
-                Some(false) => return Ok(None),
+                // This declaration does not own the project, but a more
+                // distant root may include it through a recursive pattern.
+                // Check independent-package boundaries before continuing.
+                Some(false) => {}
                 None => {
                     return Err(format!(
                         "Inspect workspace patterns in {ancestor}/package.json before choosing this project's setup or test commands. Workspace membership is ambiguous, so no npm fallback is suggested."
@@ -288,25 +308,10 @@ fn node_workspace_owner(
                 }
             }
         }
-        if ancestor != "."
-            && (packages
-                .get(ancestor)
-                .is_some_and(|package| package.get("packageManager").is_some())
-                || [
-                    "package-lock.json",
-                    "npm-shrinkwrap.json",
-                    "pnpm-lock.yaml",
-                    "yarn.lock",
-                ]
-                .iter()
-                .any(|name| project_file(files, ancestor, name)))
-        {
+        if independent || ancestor == "." {
             // Do not walk through an independent nested package and inherit
             // a more distant workspace root's recursive patterns.
-            return Ok(None);
-        }
-        if ancestor == "." {
-            return Ok(None);
+            return Ok(fallback);
         }
     }
 }
@@ -729,6 +734,114 @@ mod discovery_tests {
             node_workspace_owner("packages/app/plugins/foo", &json!({}), &files, &packages),
             Ok(Some("packages/app".into()))
         );
+    }
+
+    #[test]
+    fn outer_workspace_members_survive_nonmatching_intermediate_declarations() {
+        let mut packages = BTreeMap::from([
+            (
+                ".".to_owned(),
+                json!({"packageManager":"yarn@4.9.2","workspaces":["packages/**"]}),
+            ),
+            (
+                "packages/app".to_owned(),
+                json!({"workspaces":["plugins/*"]}),
+            ),
+        ]);
+        let files = ["package.json", "yarn.lock", "packages/app/package.json"];
+        let helper = "packages/app/tools/helper";
+        assert_eq!(
+            node_workspace_owner(helper, &json!({}), &files, &packages),
+            Ok(Some(".".into()))
+        );
+        // A nonmatching declaration is not a boundary, but an explicit pin
+        // or lockfile still makes the intermediate project independent.
+        packages.get_mut("packages/app").unwrap()["packageManager"] = json!("npm@10.9.0");
+        assert_eq!(
+            node_workspace_owner(helper, &json!({}), &files, &packages),
+            Ok(None)
+        );
+        packages
+            .get_mut("packages/app")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("packageManager");
+        for lock in [
+            "package-lock.json",
+            "npm-shrinkwrap.json",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+        ] {
+            let path = format!("packages/app/{lock}");
+            let mut files = files.to_vec();
+            files.push(&path);
+            assert_eq!(
+                node_workspace_owner(helper, &json!({}), &files, &packages),
+                Ok(None),
+                "{lock} must stop inheritance"
+            );
+        }
+    }
+
+    #[test]
+    fn directly_selected_deep_members_prefer_root_over_unpinned_intermediate_match() {
+        let plugin = "packages/app/plugins/foo";
+        for (root_pattern, root_manager, expected) in [
+            ("packages/*/plugins/*", "yarn@4.9.2", Some(".")),
+            ("packages/*/plugins/*", "npm@10.9.0", Some(".")),
+            ("elsewhere/*", "yarn@4.9.2", Some("packages/app")),
+            ("packages/*", "yarn@4.9.2", Some(".")),
+            ("packages/*", "npm@10.9.0", None),
+        ] {
+            let mut packages = BTreeMap::from([
+                (
+                    ".".to_owned(),
+                    json!({"packageManager":root_manager,"workspaces":[root_pattern]}),
+                ),
+                (
+                    "packages/app".to_owned(),
+                    json!({"workspaces":["plugins/*"]}),
+                ),
+            ]);
+            let files = ["package.json", "packages/app/package.json"];
+            let owner = node_workspace_owner(plugin, &json!({}), &files, &packages);
+            if let Some(expected) = expected {
+                assert_eq!(
+                    owner,
+                    Ok(Some(expected.into())),
+                    "{root_pattern} {root_manager}"
+                );
+            } else {
+                assert!(owner.unwrap_err().contains("nested workspaces"));
+            }
+            packages.get_mut("packages/app").unwrap()["packageManager"] = json!("npm@10.9.0");
+            assert_eq!(
+                node_workspace_owner(plugin, &json!({}), &files, &packages),
+                Ok(Some("packages/app".into()))
+            );
+            packages
+                .get_mut("packages/app")
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .remove("packageManager");
+            for lock in [
+                "package-lock.json",
+                "npm-shrinkwrap.json",
+                "pnpm-lock.yaml",
+                "yarn.lock",
+            ] {
+                let path = format!("packages/app/{lock}");
+                let mut files = files.to_vec();
+                files.push(&path);
+                assert_eq!(
+                    node_workspace_owner(plugin, &json!({}), &files, &packages),
+                    Ok(Some("packages/app".into())),
+                    "{lock}"
+                );
+            }
+        }
     }
 
     #[test]
