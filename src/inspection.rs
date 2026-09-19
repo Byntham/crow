@@ -859,6 +859,38 @@ pub fn tools() -> Value {
     ])
 }
 
+// Runtime calls recover orphan containers before doing their named operation.
+// Delegation launches reserve state before awaited writes. Both must finish
+// cancellation/transactions before their futures are dropped.
+fn tool_needs_drain(name: &str) -> bool {
+    crate::execution::TOOL_NAMES.contains(&name)
+        || matches!(
+            name,
+            "start_review_task" | "resume_review_task" | "restart_review_task"
+        )
+}
+fn tool_starts_work(name: &str) -> bool {
+    matches!(
+        name,
+        "run_experiment"
+            | "prepare_environment"
+            | "start_review_task"
+            | "resume_review_task"
+            | "restart_review_task"
+    )
+}
+
+pub(crate) async fn cancelled_tool(
+    name: &str,
+    call: impl std::future::Future<Output = Result<Value>>,
+) -> Result<Value> {
+    if tool_needs_drain(name) {
+        call.await
+    } else {
+        Err(anyhow!("Tool request cancelled"))
+    }
+}
+
 // The buffer survives cancellation of this future when an active tool finishes.
 // fill_buf and consume keep partial JSON lines intact across select! iterations.
 async fn mcp_request<R: tokio::io::AsyncBufRead + Unpin>(
@@ -996,30 +1028,31 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
                         if let Some(execution) = &execution && crate::execution::TOOL_NAMES.contains(&name) { return execution.call(name, args, cancel.clone()).await; }
                         inspection_tool(&source,name,args).await
                     };
-                    let experiment = execution.is_some() && request["params"]["name"].as_str().is_some_and(|name| crate::execution::TOOL_NAMES.contains(&name));
-                    let running_container = experiment && matches!(request["params"]["name"].as_str(), Some("run_experiment" | "prepare_environment"));
+                    let name = request["params"]["name"].as_str().unwrap_or("");
+                    let experiment = execution.is_some() && crate::execution::TOOL_NAMES.contains(&name);
+                    let mutating = tool_starts_work(name);
                     // A preceding read-only call may have drained stdin to EOF
-                    // while this runtime request was waiting in the queue.
-                    if input_closed && running_container { break 'requests; }
+                    // while this state-changing request was waiting in the queue.
+                    if input_closed && mutating { break 'requests; }
                     tokio::pin!(call);
                     let output = loop {
                         tokio::select! {
                             _ = &mut stop => {
                                 cancel.cancel();
-                                if experiment { let _ = call.await; }
+                                let _ = cancelled_tool(name, &mut call).await;
                                 break 'requests;
                             },
                             result = &mut call => break result,
                             incoming = mcp_request(&mut stdin, &mut line), if !input_closed => {
                                 let incoming = match incoming {
                                     Ok(Some(incoming)) => incoming,
-                                    Ok(None) if !running_container => {
+                                    Ok(None) if !mutating => {
                                         input_closed = true;
                                         continue;
                                     },
                                     closed => {
                                         cancel.cancel();
-                                        if experiment { let _ = call.await; }
+                                        let _ = cancelled_tool(name, &mut call).await;
                                         closed?;
                                         break 'requests;
                                     }
@@ -1029,7 +1062,7 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
                                         && let Some(cancelled_id) = incoming["params"].get("requestId") {
                                         if cancelled_id == &id {
                                             cancel.cancel();
-                                            if !experiment { break Err(anyhow!("Tool request cancelled")); }
+                                            break cancelled_tool(name, &mut call).await;
                                         } else {
                                             pending.retain(|request: &Value| request.get("id") != Some(cancelled_id));
                                         }
@@ -1039,7 +1072,7 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
                                     // Limit queued requests as well as each input line.
                                     if pending.len() == 16 {
                                         cancel.cancel();
-                                        if experiment { let _ = call.await; }
+                                        let _ = cancelled_tool(name, &mut call).await;
                                         bail!("Too many queued MCP requests");
                                     }
                                     pending.push_back(incoming);
@@ -1071,6 +1104,67 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn cancellation_policy_covers_every_advertised_tool() {
+        let mut advertised: Vec<String> = tools()
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(crate::delegation::tools().as_array().unwrap().iter())
+            .chain(crate::execution::tools().iter())
+            .map(|tool| tool["name"].as_str().unwrap().to_owned())
+            .collect();
+        advertised.sort();
+        let mut expected = vec![
+            ("list_files", false, false),
+            ("read_file", false, false),
+            ("diff", false, false),
+            ("search", false, false),
+            ("review_task_status", false, false),
+            ("wait_review_task", false, false),
+            ("discover_environment", true, false),
+            ("list_experiments", true, false),
+            ("read_artifact", true, false),
+            ("prepare_environment", true, true),
+            ("run_experiment", true, true),
+            ("start_review_task", true, true),
+            ("resume_review_task", true, true),
+            ("restart_review_task", true, true),
+        ];
+        expected.sort_by_key(|(name, _, _)| *name);
+        assert_eq!(
+            advertised,
+            expected
+                .iter()
+                .map(|(name, _, _)| name.to_string())
+                .collect::<Vec<_>>()
+        );
+        for (name, drain, mutating) in expected {
+            assert_eq!(tool_needs_drain(name), drain, "{name}");
+            assert_eq!(tool_starts_work(name), mutating, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_read_only_task_waits_do_not_block_shutdown() {
+        for name in [
+            "list_files",
+            "read_file",
+            "diff",
+            "search",
+            "review_task_status",
+            "wait_review_task",
+        ] {
+            let result = tokio::time::timeout(
+                Duration::from_millis(100),
+                cancelled_tool(name, std::future::pending::<Result<Value>>()),
+            )
+            .await
+            .unwrap();
+            assert!(result.unwrap_err().to_string().contains("cancelled"));
+        }
+    }
 
     async fn fixture(huge: bool) -> (TempDir, Value) {
         let dir = tempfile::tempdir().unwrap();
