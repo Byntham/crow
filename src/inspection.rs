@@ -379,7 +379,18 @@ pub async fn checkout(
     )
 }
 
-async fn names<F>(source: &Value, args: &[String], mut visit: F) -> Result<()>
+async fn names<F>(source: &Value, args: &[String], visit: F) -> Result<()>
+where
+    F: FnMut(&str) -> Result<()>,
+{
+    names_with_cancel(source, args, CancellationToken::new(), visit).await
+}
+async fn names_with_cancel<F>(
+    source: &Value,
+    args: &[String],
+    cancel: CancellationToken,
+    mut visit: F,
+) -> Result<()>
 where
     F: FnMut(&str) -> Result<()>,
 {
@@ -388,7 +399,7 @@ where
         source_dir(source)?,
         args,
         &BTreeMap::new(),
-        CancellationToken::new(),
+        cancel,
         |chunk| {
             for part in chunk.split_inclusive(|b| *b == 0) {
                 let complete = part.last() == Some(&0);
@@ -442,6 +453,14 @@ fn diff_args(source: &Value, path: Option<&str>) -> Result<Vec<String>> {
     Ok(args)
 }
 pub async fn read_blob(source: &Value, path: &str, rev: Option<&str>) -> Result<String> {
+    read_blob_with_cancel(source, path, rev, CancellationToken::new()).await
+}
+async fn read_blob_with_cancel(
+    source: &Value,
+    path: &str,
+    rev: Option<&str>,
+    cancel: CancellationToken,
+) -> Result<String> {
     ensure!(safe_path(path), "Invalid repository path");
     let rev = revision(rev.unwrap_or(source_rev(source, "head")?))?;
     let meta = git_bytes(
@@ -449,7 +468,7 @@ pub async fn read_blob(source: &Value, path: &str, rev: Option<&str>) -> Result<
         &strings(&["ls-tree", "-z", rev, "--", path]),
         131_072,
         &BTreeMap::new(),
-        CancellationToken::new(),
+        cancel.clone(),
     )
     .await?;
     // NUL-delimited output preserves tabs, quotes and other unusual filenames.
@@ -476,7 +495,7 @@ pub async fn read_blob(source: &Value, path: &str, rev: Option<&str>) -> Result<
         &strings(&["cat-file", "blob", oid]),
         BLOB_LIMIT,
         &BTreeMap::new(),
-        CancellationToken::new(),
+        cancel,
     )
     .await?;
     ensure!(!text.contains(&0), "Binary file cannot be read as text");
@@ -670,11 +689,15 @@ pub async fn publication_patch(
     Ok(result)
 }
 pub async fn guidance(source: &Value) -> Result<Value> {
+    guidance_with_cancel(source, CancellationToken::new()).await
+}
+pub async fn guidance_with_cancel(source: &Value, cancel: CancellationToken) -> Result<Value> {
     let mut wanted = Vec::new();
     let mut size = 0;
-    names(
+    names_with_cancel(
         source,
         &tree_args(source_rev(source, "targetSha")?)?,
+        cancel.clone(),
         |path| {
             if path == "AGENTS.md" || path.ends_with("/AGENTS.md") || path == ".crow/review.md" {
                 size += path.len();
@@ -692,7 +715,13 @@ pub async fn guidance(source: &Value) -> Result<Value> {
     wanted.sort_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
     let mut files = Vec::new();
     for path in wanted {
-        let body = read_blob(source, &path, Some(source_rev(source, "targetSha")?)).await?;
+        let body = read_blob_with_cancel(
+            source,
+            &path,
+            Some(source_rev(source, "targetSha")?),
+            cancel.clone(),
+        )
+        .await?;
         size += body.len();
         ensure!(
             size <= GUIDANCE_LIMIT,
