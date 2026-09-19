@@ -9,6 +9,53 @@ use std::{
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+const READ_ONLY_ROOT_PROBE: &str =
+    "if touch /etc/host-write 2>/dev/null; then echo 'root filesystem is writable' >&2; exit 1; fi";
+const FRESH_WORKSPACE_PROBE: &str = "set -eu; grep 'total()' calculate.sh; test ! -e /tmp/www; if wget -qO- -T 1 http://127.0.0.1:8080; then echo 'previous server survived' >&2; exit 1; fi";
+
+#[test]
+fn isolation_probes_reject_each_broken_boundary() {
+    for writable in [false, true] {
+        let command = format!(
+            "touch() {{ return {}; }}; set -eu; {READ_ONLY_ROOT_PROBE}; :",
+            if writable { 0 } else { 1 }
+        );
+        assert_eq!(
+            Command::new("sh")
+                .args(["-c", &command])
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            !writable
+        );
+    }
+    for (source_ok, tmp_clean, port_closed) in [
+        (true, true, true),
+        (false, true, true),
+        (true, false, true),
+        (true, true, false),
+    ] {
+        // Stub the three shell checks independently. No host filesystem writes
+        // or network connections are needed to prove every failure propagates.
+        let command = format!(
+            "grep() {{ return {}; }}; test() {{ return {}; }}; wget() {{ return {}; }}; {FRESH_WORKSPACE_PROBE}",
+            if source_ok { 0 } else { 1 },
+            if tmp_clean { 0 } else { 1 },
+            if port_closed { 1 } else { 0 }
+        );
+        assert_eq!(
+            Command::new("sh")
+                .args(["-c", &command])
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            source_ok && tmp_clean && port_closed
+        );
+    }
+}
+
 fn git(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .arg("-C")
@@ -260,7 +307,7 @@ async fn real_mcp_regression_isolation_deadline_recovery_and_publication() {
 [ -z "${{GITHUB_TOKEN:-}}" ]; [ -z "${{CROW_CODEX_PROXY_TOKEN:-}}" ]
 [ -L linked.sh ]; ./executable.sh
 [ "$(cat substitution.txt)" = '$Format:%H$' ]
-! touch /etc/host-write 2>/dev/null
+{READ_ONLY_ROOT_PROBE}
 [ "$(ls /sys/class/net)" = lo ]
 [ "$(awk '/CapEff/ {{ print $2 }}' /proc/self/status)" = 0000000000000000 ]
 [ "$(awk '/NoNewPrivs/ {{ print $2 }}' /proc/self/status)" = 1 ]
@@ -275,7 +322,7 @@ read request
 printf 'HTTP/1.0 200 OK\r\nContent-Length: 8\r\n\r\nhealthy\n'
 SERVER
 chmod +x /tmp/www/server.sh
-nc -l -p 8080 -e /tmp/www/server.sh &
+while :; do nc -l -p 8080 -e /tmp/www/server.sh; done </dev/null >/tmp/www/server.log 2>&1 &
 for attempt in 1 2 3 4 5; do
     wget -qO- http://127.0.0.1:8080 && exit 0
     sleep 0.1
@@ -292,7 +339,12 @@ exit 1
         .await;
     assert_eq!(isolation["status"], "passed", "{isolation}");
     assert!(isolation["stdout"].as_str().unwrap().contains("healthy"));
-    let fresh = mcp.call("run_experiment", json!({"revision":"head","command":"grep 'total()' calculate.sh; test ! -e /tmp/www; ! wget -qO- -T 1 http://127.0.0.1:8080"})).await;
+    let fresh = mcp
+        .call(
+            "run_experiment",
+            json!({"revision":"head","command":FRESH_WORKSPACE_PROBE}),
+        )
+        .await;
     assert_eq!(fresh["status"], "passed", "{fresh}");
     let limit = mcp.call("run_experiment", json!({"revision":"head","command":"yes output | head -c 100000; echo error-output >&2; exit 7"})).await;
     assert_eq!(limit["exitCode"], 7, "{limit}");
