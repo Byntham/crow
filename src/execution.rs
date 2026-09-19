@@ -154,8 +154,6 @@ pub struct Execution {
     dir: PathBuf,
     env: BTreeMap<String, String>,
     cache: PathBuf,
-    repository: String,
-    cache_scope: String,
 }
 fn environment() -> BTreeMap<String, String> {
     // Podman needs the user's runtime directory and session bus for cgroups.
@@ -182,10 +180,6 @@ impl Execution {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| dir.to_owned())
                 .join("runtime-cache"),
-            repository: crate::util::repo_name(&repo)?,
-            cache_scope: context["job"]["number"]
-                .as_u64()
-                .map_or_else(|| "local".to_owned(), |number| format!("pr:{number}")),
             executable: cfg.podman,
             policy,
             source: context["source"].clone(),
@@ -363,25 +357,6 @@ impl Execution {
                     }
                 }
             }
-            let package_plan = if prepare {
-                match crate::runtime_cache::plan(
-                    &self.source,
-                    key,
-                    &self.repository,
-                    &self.cache_scope,
-                    &image,
-                )
-                .await
-                {
-                    Ok(plan) => plan,
-                    Err(error) => {
-                        record["cacheRestoreError"] = json!(bounded_error(error));
-                        None
-                    }
-                }
-            } else {
-                None
-            };
             let output = self
                 .run(
                     &name,
@@ -398,7 +373,6 @@ impl Execution {
                     &id,
                     &live,
                     &trace,
-                    package_plan.as_ref(),
                     &completed,
                 )
                 .await?;
@@ -417,12 +391,7 @@ impl Execution {
             && let Some(mut finished) = completed.lock().unwrap().take()
         {
             let last = crate::util::read_json(&path)?.unwrap_or_default();
-            if last["stage"] == "cache_save" {
-                finished["cacheSaveError"] = json!(
-                    "Optional dependency cache save did not finish before the experiment stopped."
-                );
-                result = Ok(finished);
-            } else if last["stage"] == "artifact_collection" {
+            if last["stage"] == "artifact_collection" {
                 let mut saved = finished["artifacts"]
                     .as_array()
                     .cloned()
@@ -607,7 +576,6 @@ impl Execution {
         id: &str,
         live: &LiveOutput,
         trace: &Trace,
-        package_plan: Option<&crate::runtime_cache::Plan>,
         completed: &std::sync::Mutex<Option<Value>>,
     ) -> Result<Value> {
         trace.set(Stage::SourceArchive)?;
@@ -736,88 +704,6 @@ except OSError as error:
             p.pids,
             p.cpus
         );
-        let mut cache_info = json!({});
-        if let Some(plan) = package_plan {
-            cache_info["packageCacheKey"] = json!(plan.key);
-            trace.set(Stage::CacheRestore)?;
-            let checked = self
-                .command(
-                    &[
-                        "exec",
-                        name,
-                        "/bin/sh",
-                        "-c",
-                        limits.rsplit_once(';').unwrap().0,
-                    ],
-                    None,
-                    None,
-                )
-                .await?;
-            ensure!(
-                checked["status"] == "passed",
-                "Cannot enforce resource limits: {checked}"
-            );
-            let packages = tempfile::Builder::new()
-                .prefix(".crow-runtime-packages-")
-                .tempfile_in(&self.dir)?;
-            let root = self.cache.clone();
-            let key = plan.key.clone();
-            let (packages, loaded) = tokio::task::spawn_blocking(move || {
-                let loaded = crate::runtime_cache::load(&root, &key, packages.path());
-                (packages, loaded)
-            })
-            .await?;
-            match loaded {
-                Ok(true) => {
-                    let pins = plan.pins.to_string();
-                    let workspace_bytes = self.policy.workspace_mi_b * 1024 * 1024;
-                    let import_budget = workspace_bytes
-                        .saturating_sub(archive.as_file().metadata()?.len())
-                        .saturating_sub(workspace_bytes / 4)
-                        .min(workspace_bytes / 4)
-                        .min(128 * 1024 * 1024)
-                        .to_string();
-                    let imported = self
-                        .command(
-                            &[
-                                "exec",
-                                "--interactive",
-                                name,
-                                "python3",
-                                "-I",
-                                "-c",
-                                include_str!("runtime/packages.py"),
-                                "import",
-                                &pins,
-                                "/workspace",
-                                &import_budget,
-                            ],
-                            Some(packages.path()),
-                            None,
-                        )
-                        .await;
-                    match imported {
-                        Ok(result) if result["status"] == "passed" => {
-                            let stats: Value =
-                                serde_json::from_str(result["stdout"].as_str().unwrap_or("{}"))?;
-                            cache_info["packageCacheRestored"] =
-                                json!(stats["files"].as_u64().unwrap_or(0) > 0);
-                            cache_info["packageCache"] = stats;
-                        }
-                        Ok(result) => {
-                            cache_info["cacheRestoreError"] = json!(bounded_error(result))
-                        }
-                        Err(error) => cache_info["cacheRestoreError"] = json!(bounded_error(error)),
-                    }
-                }
-                Ok(false) => {
-                    cache_info["packageCacheRestored"] = json!(false);
-                }
-                Err(error) => {
-                    cache_info["cacheRestoreError"] = json!(bounded_error(error));
-                }
-            }
-        }
         trace.set(Stage::WorkspaceRestore)?;
         let extracted = self
             .command(
@@ -922,52 +808,7 @@ else: raise SystemExit(\"Crow dependency proxy did not start\")' || {{ cat /tmp/
             )
             .await?;
         }
-        // Once a command and its required snapshot finish, optional cache/artifact
-        // work must not relabel the actual command outcome if the deadline fires.
-        for (key, value) in cache_info.as_object().unwrap() {
-            output[key] = value.clone();
-        }
-        *completed.lock().unwrap() = Some(output.clone());
-        if let Some(plan) = package_plan
-            && output["status"] == "passed"
-        {
-            trace.set(Stage::CacheSave)?;
-            let save = async {
-                let packages = tempfile::Builder::new()
-                    .prefix(".crow-runtime-packages-")
-                    .tempfile_in(&self.dir)?;
-                let pins = plan.pins.to_string();
-                self.export(
-                    &[
-                        "exec",
-                        name,
-                        "python3",
-                        "-I",
-                        "-c",
-                        include_str!("runtime/packages.py"),
-                        "export",
-                        &pins,
-                    ],
-                    packages.path(),
-                    crate::runtime_cache::ARCHIVE_LIMIT,
-                )
-                .await?;
-                let root = self.cache.clone();
-                let key = plan.key.clone();
-                tokio::task::spawn_blocking(move || {
-                    crate::runtime_cache::save(&root, &key, packages.path())
-                })
-                .await??;
-                Ok::<_, anyhow::Error>(())
-            }
-            .await;
-            if let Err(error) = save {
-                cache_info["cacheSaveError"] = json!(bounded_error(error));
-            }
-        }
-        for (key, value) in cache_info.as_object().unwrap() {
-            output[key] = value.clone();
-        }
+        // Optional artifact collection must not relabel a completed command.
         *completed.lock().unwrap() = Some(output.clone());
         let mut saved = Vec::new();
         for (index, path) in artifacts.iter().enumerate() {
@@ -1454,7 +1295,6 @@ mod tests {
                 let execution = Execution::from_context(&context, root.path())
                     .unwrap()
                     .unwrap();
-                assert_eq!(execution.repository, "byntham/crow");
                 assert_eq!(serde_json::to_value(execution.policy).unwrap(), policy);
             }
             assert_eq!(enabled(&settings, "byntham/other").unwrap(), automatic);

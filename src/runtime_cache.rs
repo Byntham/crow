@@ -1,868 +1,96 @@
-//! Bounded package-download archives. Prepared workspaces stay local to a review.
-use anyhow::{Context, Result, ensure};
-use serde_json::{Value, json};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs,
-    path::{Path, PathBuf},
-    time::{Duration, SystemTime},
-};
+//! Remove obsolete cross-review package archives. New reviews install afresh.
+use anyhow::{Result, ensure};
+use std::{fs, path::Path};
 
-pub const ARCHIVE_LIMIT: u64 = 512 * 1024 * 1024;
-const CACHE_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
-const MAX_AGE: Duration = Duration::from_secs(7 * 86400);
-
-pub struct Plan {
-    pub key: String,
-    pub pins: Value,
-}
-/// Only pinned Git metadata chooses the cache, never files modified by setup hooks.
-pub async fn plan(
-    source: &Value,
-    revision: &str,
-    repository: &str,
-    scope: &str,
-    image: &str,
-) -> Result<Option<Plan>> {
-    let commit =
-        crate::inspection::revision(source[revision].as_str().context("Missing revision")?)?;
-    let dir = Path::new(source["dir"].as_str().context("Missing source directory")?);
-    let tree = crate::inspection::git(
-        dir,
-        &["ls-tree".into(), "-r".into(), "-z".into(), commit.into()],
-    )
-    .await?;
-    let mut fingerprints = Vec::new();
-    let mut pins = json!({"npm":false,"cargo":{},"go":{}});
-    let mut locks = Vec::new();
-    let mut cargo_candidates: BTreeMap<String, Option<(String, String)>> = BTreeMap::new();
-    let mut cargo_complete = true;
-    let mut go_complete = true;
-    let mut go_conflicts = BTreeSet::new();
-    for item in tree.split('\0') {
-        let Some((meta, path)) = item.split_once('\t') else {
-            continue;
-        };
-        // Respect repositories that deliberately track the usual cache location.
-        // Optional cache directories must never change how pinned source restores.
-        if path == ".crow-home" || path.starts_with(".crow-home/") {
-            return Ok(None);
-        }
-        let name = path.rsplit('/').next().unwrap_or(path);
-        if !meta.starts_with("100644 blob ") && !meta.starts_with("100755 blob ") {
-            if name == "Cargo.lock" {
-                cargo_complete = false;
-            } else if name == "go.sum" {
-                go_complete = false;
-            }
-            continue;
-        }
-        if [
-            "package.json",
-            "package-lock.json",
-            "npm-shrinkwrap.json",
-            "Cargo.toml",
-            "Cargo.lock",
-            "go.mod",
-            "go.sum",
-        ]
-        .contains(&name)
-        {
-            fingerprints.push(item.to_owned());
-        }
-        if ["package-lock.json", "npm-shrinkwrap.json"].contains(&name) {
-            pins["npm"] = json!(true);
-        }
-        if ["Cargo.lock", "go.sum"].contains(&name) {
-            locks.push((name, path));
-        }
-    }
-    // Large or unreadable lockfiles simply disable caching for that ecosystem.
-    for (index, (name, path)) in locks.into_iter().enumerate() {
-        if index >= 256 {
-            if name == "Cargo.lock" {
-                cargo_complete = false;
-            } else if name == "go.sum" {
-                go_complete = false;
-            }
-            continue;
-        }
-        let Ok(body) = crate::inspection::read_blob(source, path, Some(commit)).await else {
-            if name == "Cargo.lock" {
-                cargo_complete = false;
-            } else if name == "go.sum" {
-                go_complete = false;
-            }
-            continue;
-        };
-        if name == "Cargo.lock" {
-            let Ok(lock) = toml::from_str::<toml::Value>(&body) else {
-                cargo_complete = false;
-                continue;
-            };
-            let Some(packages) = lock.get("package").and_then(toml::Value::as_array) else {
-                cargo_complete = false;
-                continue;
-            };
-            for package in packages {
-                let Some(name) = package.get("name").and_then(toml::Value::as_str) else {
-                    cargo_complete = false;
-                    continue;
-                };
-                let Some(version) = package.get("version").and_then(toml::Value::as_str) else {
-                    cargo_complete = false;
-                    continue;
-                };
-                if !safe_component(name) || !safe_component(version) {
-                    continue;
-                }
-                let key = format!("{name}-{version}.crate");
-                // Preserve registry identity as well as checksum. The sandbox
-                // supports only the known crates.io sparse-cache directory;
-                // alternate or unknown layouts remain uncached.
-                let identity = package
-                    .get("source")
-                    .and_then(toml::Value::as_str)
-                    .filter(|source| valid_cargo_source(source))
-                    .zip(package.get("checksum").and_then(toml::Value::as_str))
-                    .filter(|(_, checksum)| {
-                        checksum.len() == 64 && checksum.bytes().all(|b| b.is_ascii_hexdigit())
-                    })
-                    .map(|(source, checksum)| (source.to_owned(), checksum.to_lowercase()));
-                cargo_candidates
-                    .entry(key)
-                    .and_modify(|previous| {
-                        if *previous != identity {
-                            *previous = None;
-                        }
-                    })
-                    .or_insert(identity);
-            }
-        } else {
-            for line in body.lines() {
-                let parts: Vec<_> = line.split_whitespace().collect();
-                if parts.is_empty() {
-                    continue;
-                }
-                if parts.len() != 3 || !parts[2].starts_with("h1:") {
-                    go_complete = false;
-                    continue;
-                }
-                let module = parts[0];
-                let (version, extension) = parts[1]
-                    .strip_suffix("/go.mod")
-                    .map_or((parts[1], "zip"), |v| (v, "mod"));
-                if !module.split('/').all(safe_component) || !safe_component(version) {
-                    continue;
-                }
-                let escaped = |s: &str| {
-                    s.chars()
-                        .flat_map(|c| {
-                            if c.is_ascii_uppercase() {
-                                vec!['!', c.to_ascii_lowercase()]
-                            } else {
-                                vec![c]
-                            }
-                        })
-                        .collect::<String>()
-                };
-                let key = format!("{}/@v/{}.{}", escaped(module), escaped(version), extension);
-                if go_conflicts.contains(&key) {
-                    continue;
-                }
-                if pins["go"].get(&key).is_some_and(|pin| pin != parts[2]) {
-                    pins["go"].as_object_mut().unwrap().remove(&key);
-                    go_conflicts.insert(key);
-                } else {
-                    pins["go"][key] = json!(parts[2]);
-                }
-            }
-        }
-    }
-    if !go_complete {
-        pins["go"] = json!({});
-    }
-    if cargo_complete {
-        for (key, identity) in cargo_candidates {
-            if let Some((source, checksum)) = identity
-                && source == "registry+https://github.com/rust-lang/crates.io-index"
-            {
-                pins["cargo"][key] = json!({"source":source,"checksum":checksum});
-            }
-        }
-    }
-    if pins["npm"] != true
-        && pins["cargo"].as_object().unwrap().is_empty()
-        && pins["go"].as_object().unwrap().is_empty()
-    {
-        return Ok(None);
-    }
-    if pins.to_string().len() > 64000 {
-        return Ok(None);
-    }
-    fingerprints.sort();
-    let key = crate::runtime::fingerprint(&[
-        repository,
-        scope,
-        revision,
-        image,
-        &fingerprints.join("\0"),
-        "verified-downloads-v3",
-    ]);
-    Ok(Some(Plan { key, pins }))
+fn archive_name(name: &str) -> bool {
+    name.strip_suffix(".tar")
+        .is_some_and(|key| key.len() == 64 && key.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
-fn valid_cargo_source(source: &str) -> bool {
-    source.strip_prefix("registry+").is_some_and(|registry| {
-        let registry = registry.strip_prefix("sparse+").unwrap_or(registry);
-        url::Url::parse(registry).is_ok_and(|url| {
-            matches!(url.scheme(), "https" | "http")
-                && url.host_str().is_some()
-                && url.username().is_empty()
-                && url.password().is_none()
-        })
-    })
-}
-
-fn safe_component(s: &str) -> bool {
-    !s.is_empty()
-        && s != "."
-        && s != ".."
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-_.+~".contains(&b))
-}
-fn valid_key(key: &str) -> bool {
-    key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit())
-}
-struct CacheLock(fs::File);
-impl Drop for CacheLock {
-    fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self.0);
-    }
-}
-fn lock(root: &Path) -> Result<CacheLock> {
-    crate::util::private_dir(root)?;
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(root.join("packages.lock"))?;
-    fs2::FileExt::lock_exclusive(&file)?;
-    Ok(CacheLock(file))
-}
-fn files(root: &Path) -> Result<Vec<(SystemTime, u64, PathBuf)>> {
-    let mut result = Vec::new();
-    let dir = root.join("packages");
-    crate::util::private_dir(&dir)?;
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.strip_suffix(".tar").is_some_and(valid_key) {
-            continue;
-        }
-        let meta = fs::symlink_metadata(entry.path())?;
-        ensure!(
-            meta.is_file() && !meta.file_type().is_symlink(),
-            "Package cache entry is not a regular file"
-        );
-        result.push((meta.modified()?, meta.len(), entry.path()));
-    }
-    result.sort_by_key(|(time, _, _)| *time);
-    Ok(result)
-}
-fn prune_locked(root: &Path, allowance: u64, now: SystemTime) -> Result<u64> {
-    let entries = files(root)?;
-    let mut total: u64 = entries.iter().map(|(_, size, _)| size).sum();
-    let mut removed = 0;
-    for (time, size, path) in entries {
-        if total > allowance
-            || size > ARCHIVE_LIMIT
-            || now.duration_since(time).unwrap_or_default() > MAX_AGE
-        {
-            fs::remove_file(path)?;
-            total -= size;
-            removed += size;
-        }
-    }
-    Ok(removed)
-}
 pub fn maintain(root: &Path) -> Result<u64> {
-    let _lock = lock(root)?;
-    let mut removed = prune_locked(root, CACHE_LIMIT, SystemTime::now())?;
-    // Older versions saved entire workspaces here. They are no longer reusable.
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.strip_suffix(".tar").is_some_and(valid_key) && entry.file_type()?.is_file() {
-            removed += entry.metadata()?.len();
-            fs::remove_file(entry.path())?;
-        }
+    crate::util::private_dir(root)?;
+    ensure!(
+        fs::symlink_metadata(root)?.is_dir(),
+        "Runtime cache root is not a directory"
+    );
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    // Interrupted inserts are only ours, and no writer can be active under this lock.
-    for entry in fs::read_dir(root.join("packages"))? {
-        let entry = entry?;
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with(".crow-package-")
-            && entry.file_type()?.is_file()
-        {
-            fs::remove_file(entry.path())?;
+    let lock = options.open(root.join("packages.lock"))?;
+    ensure!(
+        lock.metadata()?.is_file(),
+        "Runtime cache lock is not a file"
+    );
+    fs2::FileExt::lock_exclusive(&lock)?;
+    let mut removed = 0;
+    for (directory, packages) in [(root.to_owned(), false), (root.join("packages"), true)] {
+        let metadata = match fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        ensure!(metadata.is_dir(), "Legacy cache path is not a directory");
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !archive_name(&name) && !(packages && name.starts_with(".crow-package-")) {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if metadata.is_file() || metadata.is_symlink() {
+                removed += metadata.len();
+                fs::remove_file(entry.path())?;
+            }
         }
     }
     Ok(removed)
-}
-pub fn load(root: &Path, key: &str, target: &Path) -> Result<bool> {
-    ensure!(valid_key(key), "Invalid package cache key");
-    let _lock = lock(root)?;
-    let source = root.join("packages").join(format!("{key}.tar"));
-    let meta = match fs::symlink_metadata(&source) {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e.into()),
-    };
-    ensure!(
-        meta.is_file() && !meta.file_type().is_symlink() && meta.len() <= ARCHIVE_LIMIT,
-        "Invalid package cache archive"
-    );
-    if meta.modified()?.elapsed().unwrap_or_default() > MAX_AGE {
-        fs::remove_file(source)?;
-        return Ok(false);
-    }
-    fs::copy(&source, target)?;
-    fs::File::open(source)?.set_times(fs::FileTimes::new().set_modified(SystemTime::now()))?;
-    Ok(true)
-}
-pub fn save(root: &Path, key: &str, source: &Path) -> Result<()> {
-    ensure!(valid_key(key), "Invalid package cache key");
-    let size = fs::metadata(source)?.len();
-    ensure!(size <= ARCHIVE_LIMIT, "Package cache archive exceeds limit");
-    let _lock = lock(root)?;
-    let dir = root.join("packages");
-    crate::util::private_dir(&dir)?;
-    let target = dir.join(format!("{key}.tar"));
-    // Remove the replaced entry first; cache insertion failure may lose a cache hit, never evidence.
-    if target.exists() {
-        fs::remove_file(&target)?;
-    }
-    prune_locked(root, CACHE_LIMIT - size, SystemTime::now())?;
-    let temporary = tempfile::Builder::new()
-        .prefix(".crow-package-")
-        .tempfile_in(dir)?;
-    fs::copy(source, temporary.path())?;
-    temporary.persist(target)?;
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn cache_expires_without_new_preparations_and_discards_legacy_workspaces() {
+    fn maintenance_removes_all_legacy_archives_without_touching_images_or_evidence() {
         let root = tempfile::tempdir().unwrap();
-        let source = root.path().join("source");
-        fs::write(&source, b"archive").unwrap();
-        let key = "a".repeat(64);
-        save(root.path(), &key, &source).unwrap();
-        let archive = root.path().join("packages").join(format!("{key}.tar"));
-        let old = SystemTime::now() - MAX_AGE - Duration::from_secs(1);
-        fs::File::open(&archive)
-            .unwrap()
-            .set_times(fs::FileTimes::new().set_modified(old))
-            .unwrap();
-        let legacy = root.path().join(format!("{}.tar", "b".repeat(64)));
-        fs::write(&legacy, b"old workspace").unwrap();
-        assert!(maintain(root.path()).unwrap() > 0);
-        assert!(!archive.exists() && !legacy.exists());
-        assert!(source.exists());
-    }
-    #[test]
-    fn reads_touch_access_time_and_pruning_removes_oldest_entries() {
-        let root = tempfile::tempdir().unwrap();
-        let source = root.path().join("source");
-        fs::write(&source, b"1234").unwrap();
-        for key in ["a".repeat(64), "b".repeat(64)] {
-            save(root.path(), &key, &source).unwrap();
-        }
-        let a = root
-            .path()
-            .join("packages")
-            .join(format!("{}.tar", "a".repeat(64)));
-        fs::File::open(&a)
-            .unwrap()
-            .set_times(fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
-            .unwrap();
-        assert_eq!(prune_locked(root.path(), 4, SystemTime::now()).unwrap(), 4);
-        assert!(!a.exists());
-        assert!(load(root.path(), &"b".repeat(64), &root.path().join("copy")).unwrap());
-        assert_eq!(fs::read(root.path().join("copy")).unwrap(), b"1234");
-    }
-
-    fn git(dir: &Path, arguments: &[&str]) -> String {
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(arguments)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout).unwrap().trim().to_owned()
-    }
-    fn repository() -> tempfile::TempDir {
-        let root = tempfile::tempdir().unwrap();
-        git(root.path(), &["init", "--quiet"]);
-        git(
-            root.path(),
-            &["config", "user.email", "cache-test@example.invalid"],
-        );
-        git(root.path(), &["config", "user.name", "Cache test"]);
-        root
-    }
-    fn commit(dir: &Path) -> String {
-        git(dir, &["add", "."]);
-        git(dir, &["commit", "--quiet", "-m", "fixture"]);
-        git(dir, &["rev-parse", "HEAD"])
-    }
-    fn source(dir: &Path, revision: &str) -> Value {
-        json!({"dir":dir,"head":revision,"base":revision})
-    }
-
-    #[tokio::test]
-    async fn plans_reuse_dependencies_across_code_changes_but_invalidate_changed_locks() {
-        let repo = repository();
-        fs::write(repo.path().join("package.json"), r#"{"name":"example"}"#).unwrap();
-        fs::write(
-            repo.path().join("package-lock.json"),
-            r#"{"lockfileVersion":3}"#,
-        )
-        .unwrap();
-        fs::write(repo.path().join("app.js"), "first source").unwrap();
-        let first = commit(repo.path());
-        let original_source = source(repo.path(), &first);
-        let original = plan(&original_source, "head", "owner/repo", "pr:1", "image")
-            .await
-            .unwrap()
-            .unwrap();
-        fs::write(repo.path().join("app.js"), "fixed source").unwrap();
-        let fixed = commit(repo.path());
-        let same_dependencies = plan(
-            &source(repo.path(), &fixed),
-            "head",
-            "owner/repo",
-            "pr:1",
-            "image",
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(original.key, same_dependencies.key);
-        // Working-directory edits and a different checkout location cannot change
-        // the pinned dependency plan or prevent reuse.
-        fs::write(
-            repo.path().join("package-lock.json"),
-            "uncommitted malicious edit",
-        )
-        .unwrap();
-        let pinned = plan(&original_source, "head", "owner/repo", "pr:1", "image")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(original.key, pinned.key);
-        let other_checkout = tempfile::tempdir().unwrap();
-        git(
-            other_checkout.path(),
-            &["clone", "--quiet", repo.path().to_str().unwrap(), "copy"],
-        );
-        let other = plan(
-            &source(&other_checkout.path().join("copy"), &first),
-            "head",
-            "owner/repo",
-            "pr:1",
-            "image",
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(original.key, other.key);
-        let changed_lock = commit(repo.path());
-        let changed = plan(
-            &source(repo.path(), &changed_lock),
-            "head",
-            "owner/repo",
-            "pr:1",
-            "image",
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_ne!(original.key, changed.key);
-    }
-
-    #[tokio::test]
-    async fn cache_namespaces_separate_repositories_prs_images_and_base_from_head() {
-        let repo = repository();
-        fs::write(repo.path().join("package-lock.json"), "{}").unwrap();
-        let commit = commit(repo.path());
-        let source = source(repo.path(), &commit);
-        let original = plan(&source, "head", "owner/repo", "pr:1", "image")
-            .await
-            .unwrap()
-            .unwrap();
-        for (revision, repository, scope, image) in [
-            ("base", "owner/repo", "pr:1", "image"),
-            ("head", "other/repo", "pr:1", "image"),
-            ("head", "owner/repo", "pr:2", "image"),
-            ("head", "owner/repo", "pr:1", "other-image"),
+        let packages = root.path().join("packages");
+        fs::create_dir(&packages).unwrap();
+        let name = format!("{}.tar", "a".repeat(64));
+        for path in [
+            root.path().join(&name),
+            packages.join(&name),
+            packages.join(".crow-package-partial"),
         ] {
-            let separate = plan(&source, revision, repository, scope, image)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_ne!(original.key, separate.key);
+            fs::write(path, b"obsolete").unwrap();
         }
-    }
-
-    #[tokio::test]
-    async fn plans_derive_cargo_and_go_integrity_from_pinned_git_blobs() {
-        let repo = repository();
-        let checksum = "AB".repeat(32);
-        fs::write(
-            repo.path().join("Cargo.lock"),
-            format!(
-                r#"
-version = 3
-[[package]]
-name = "safe-crate"
-version = "1.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "{checksum}"
-[[package]]
-name = "../escape"
-version = "1.0.0"
-checksum = "{checksum}"
-[[package]]
-name = "no-checksum"
-version = "1.0.0"
-"#
-            ),
-        )
-        .unwrap();
-        fs::write(
-            repo.path().join("go.sum"),
-            concat!(
-                "github.com/Example/Module v1.2.3 h1:zipchecksum\n",
-                "github.com/Example/Module v1.2.3/go.mod h1:modchecksum\n",
-                "../escape v1.0.0 h1:invalid\n",
-            ),
-        )
-        .unwrap();
-        let commit = commit(repo.path());
-        let plan = plan(
-            &source(repo.path(), &commit),
-            "head",
-            "owner/repo",
-            "pr:1",
-            "image",
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            plan.pins["cargo"],
-            json!({"safe-crate-1.2.3.crate":{"source":"registry+https://github.com/rust-lang/crates.io-index","checksum":checksum.to_lowercase()}})
-        );
-        assert_eq!(
-            plan.pins["go"],
-            json!({
-                "github.com/!example/!module/@v/v1.2.3.zip":"h1:zipchecksum",
-                "github.com/!example/!module/@v/v1.2.3.mod":"h1:modchecksum"
-            })
-        );
-        assert_eq!(plan.pins["npm"], false);
+        let image = root.path().join("managed-image.json");
+        let evidence = packages.join("unrelated.txt");
+        fs::write(&image, "image").unwrap();
+        fs::write(&evidence, "evidence").unwrap();
+        assert_eq!(maintain(root.path()).unwrap(), 24);
+        assert_eq!(maintain(root.path()).unwrap(), 0);
+        assert_eq!(fs::read_to_string(image).unwrap(), "image");
+        assert_eq!(fs::read_to_string(evidence).unwrap(), "evidence");
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn tracked_cache_home_symlinks_and_gitlinks_disable_package_caching() {
-        let repo = repository();
-        fs::write(repo.path().join("package-lock.json"), "{}").unwrap();
-        let original = commit(repo.path());
-        assert!(
-            plan(
-                &source(repo.path(), &original),
-                "head",
-                "owner/repo",
-                "pr:1",
-                "image"
-            )
-            .await
-            .unwrap()
-            .is_some()
-        );
-
-        // A source-only PR update retains the lockfile cache key. It must not
-        // import a directory where pinned source now requires a symlink.
-        std::os::unix::fs::symlink("home", repo.path().join(".crow-home")).unwrap();
-        let linked = commit(repo.path());
-        assert!(
-            plan(
-                &source(repo.path(), &linked),
-                "head",
-                "owner/repo",
-                "pr:1",
-                "image"
-            )
-            .await
-            .unwrap()
-            .is_none()
-        );
-
-        fs::remove_file(repo.path().join(".crow-home")).unwrap();
-        git(repo.path(), &["rm", "--cached", ".crow-home"]);
-        git(
-            repo.path(),
-            &[
-                "update-index",
-                "--add",
-                "--cacheinfo",
-                "160000",
-                &original,
-                ".crow-home",
-            ],
-        );
-        git(
-            repo.path(),
-            &["commit", "--quiet", "-m", "cache home submodule"],
-        );
-        let submodule = git(repo.path(), &["rev-parse", "HEAD"]);
-        assert!(
-            plan(
-                &source(repo.path(), &submodule),
-                "head",
-                "owner/repo",
-                "pr:1",
-                "image"
-            )
-            .await
-            .unwrap()
-            .is_none()
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn symlink_locks_and_unpinned_manifests_do_not_enable_package_caching() {
-        let repo = repository();
-        fs::write(repo.path().join("real-lock.json"), "{}").unwrap();
-        fs::write(repo.path().join("package.json"), "{}").unwrap();
-        std::os::unix::fs::symlink("real-lock.json", repo.path().join("package-lock.json"))
-            .unwrap();
-        let commit = commit(repo.path());
-        assert!(
-            plan(
-                &source(repo.path(), &commit),
-                "head",
-                "owner/repo",
-                "pr:1",
-                "image"
-            )
-            .await
-            .unwrap()
-            .is_none()
-        );
-    }
-
-    fn cargo_package(name: &str, source: &str, checksum: &str) -> String {
-        format!(
-            "[[package]]\nname = {name:?}\nversion = \"1.0.0\"\nsource = {source:?}\nchecksum = {checksum:?}\n"
-        )
-    }
-
-    #[tokio::test]
-    async fn cargo_cache_excludes_ambiguous_sources_checksums_and_missing_identity() {
-        let repo = repository();
-        let registry_a = "registry+https://github.com/rust-lang/crates.io-index";
-        let registry_b = "registry+sparse+https://registry-b.example/index/";
-        let good = "a".repeat(64);
-        let different = "b".repeat(64);
-        let mut first = String::new();
-        let mut second = String::new();
-        for name in [
-            "same",
-            "registry-conflict",
-            "checksum-conflict",
-            "missing-source",
-            "bad-source",
-        ] {
-            first += &cargo_package(name, registry_a, &good);
-            let (source, checksum) = match name {
-                "registry-conflict" => (registry_b, &good),
-                "checksum-conflict" => (registry_a, &different),
-                "missing-source" => ("", &good),
-                "bad-source" => ("registry+not-a-url", &good),
-                _ => (registry_a, &good),
-            };
-            second += &cargo_package(name, source, checksum);
-        }
-        // A third matching occurrence must never restore an excluded filename.
-        second += &cargo_package("registry-conflict", registry_a, &good);
-        fs::write(repo.path().join("Cargo.lock"), first).unwrap();
-        fs::create_dir(repo.path().join("nested")).unwrap();
-        fs::write(repo.path().join("nested/Cargo.lock"), second).unwrap();
-        let revision = commit(repo.path());
-        let plan = plan(
-            &source(repo.path(), &revision),
-            "head",
-            "owner/repo",
-            "pr:1",
-            "image",
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            plan.pins["cargo"],
-            json!({"same-1.0.0.crate":{"source":registry_a,"checksum":good}})
-        );
-    }
-
-    #[tokio::test]
-    async fn cargo_cache_requires_complete_readable_lockfile_visibility() {
-        for missing in ["malformed", "oversized", "beyond-limit"] {
-            let repo = repository();
-            fs::write(repo.path().join("package-lock.json"), "{}").unwrap();
-            fs::write(
-                repo.path().join("Cargo.lock"),
-                cargo_package(
-                    "safe",
-                    "registry+https://example.org/index",
-                    &"a".repeat(64),
-                ),
-            )
-            .unwrap();
-            fs::create_dir(repo.path().join("nested")).unwrap();
-            let body = if missing == "oversized" {
-                "#".repeat(3 * 1024 * 1024)
-            } else {
-                "not valid TOML".into()
-            };
-            fs::write(repo.path().join("nested/Cargo.lock"), body).unwrap();
-            if missing == "beyond-limit" {
-                for index in 0..256 {
-                    let directory = repo.path().join(format!("a{index:03}"));
-                    fs::create_dir(&directory).unwrap();
-                    fs::write(directory.join("go.sum"), "").unwrap();
-                }
-            }
-            let revision = commit(repo.path());
-            let plan = plan(
-                &source(repo.path(), &revision),
-                "head",
-                "owner/repo",
-                "pr:1",
-                "image",
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            assert_eq!(plan.pins["cargo"], json!({}), "{missing}");
-        }
-    }
-
-    #[tokio::test]
-    async fn go_cache_excludes_conflicting_checksums_across_lockfiles() {
-        let repo = repository();
-        fs::write(
-            repo.path().join("go.sum"),
-            "example.org/module v1.0.0 h1:first\nexample.org/module v1.0.0/go.mod h1:same\n",
-        )
-        .unwrap();
-        fs::create_dir(repo.path().join("nested")).unwrap();
-        fs::write(repo.path().join("nested/go.sum"), "example.org/module v1.0.0 h1:second\nexample.org/module v1.0.0 h1:first\nexample.org/module v1.0.0/go.mod h1:same\n").unwrap();
-        let revision = commit(repo.path());
-        let plan = plan(
-            &source(repo.path(), &revision),
-            "head",
-            "owner/repo",
-            "pr:1",
-            "image",
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            plan.pins["go"],
-            json!({"example.org/module/@v/v1.0.0.mod":"h1:same"})
-        );
-    }
-
-    #[tokio::test]
-    async fn go_cache_requires_complete_readable_lockfile_visibility() {
-        for missing in ["malformed", "oversized", "beyond-limit"] {
-            let repo = repository();
-            fs::write(repo.path().join("package-lock.json"), "{}").unwrap();
-            fs::write(
-                repo.path().join("go.sum"),
-                "example.org/module v1.0.0 h1:pin\n",
-            )
-            .unwrap();
-            fs::create_dir(repo.path().join("nested")).unwrap();
-            let body = if missing == "oversized" {
-                "#".repeat(3 * 1024 * 1024)
-            } else {
-                "malformed line".into()
-            };
-            fs::write(repo.path().join("nested/go.sum"), body).unwrap();
-            if missing == "beyond-limit" {
-                for index in 0..256 {
-                    let directory = repo.path().join(format!("a{index:03}"));
-                    fs::create_dir(&directory).unwrap();
-                    fs::write(directory.join("go.sum"), "").unwrap();
-                }
-            }
-            let revision = commit(repo.path());
-            let plan = plan(
-                &source(repo.path(), &revision),
-                "head",
-                "owner/repo",
-                "pr:1",
-                "image",
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            assert_eq!(plan.pins["go"], json!({}), "{missing}");
-        }
-    }
-
-    #[tokio::test]
-    async fn alternate_cargo_registries_are_not_shared_even_without_conflicts() {
-        let repo = repository();
-        fs::write(repo.path().join("package-lock.json"), "{}").unwrap();
-        fs::write(
-            repo.path().join("Cargo.lock"),
-            cargo_package(
-                "other",
-                "registry+sparse+https://other.example/index/",
-                &"a".repeat(64),
-            ),
-        )
-        .unwrap();
-        let revision = commit(repo.path());
-        let plan = plan(
-            &source(repo.path(), &revision),
-            "head",
-            "owner/repo",
-            "pr:1",
-            "image",
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(plan.pins["cargo"], json!({}));
+    #[test]
+    fn maintenance_does_not_follow_legacy_archive_or_directory_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let name = format!("{}.tar", "b".repeat(64));
+        let target = external.path().join(&name);
+        fs::write(&target, "keep").unwrap();
+        std::os::unix::fs::symlink(&target, root.path().join(&name)).unwrap();
+        maintain(root.path()).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep");
+        std::os::unix::fs::symlink(external.path(), root.path().join("packages")).unwrap();
+        assert!(maintain(root.path()).is_err());
+        assert_eq!(fs::read_to_string(target).unwrap(), "keep");
     }
 }

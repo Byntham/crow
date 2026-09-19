@@ -146,11 +146,6 @@ if args[2] == 'tar':
         sys.stdout.buffer.flush()
         time.sleep(60)
     sys.exit(0)
-if args[2] == 'python3':
-    assert args[-2] == 'export', args
-    assert mode == 'cache_timeout', mode
-    time.sleep(60)
-    sys.exit(0)
 if args[2] == 'cat':
     if args[-1] == '/first.png':
         with open(png_path, 'rb') as image:
@@ -250,37 +245,6 @@ async fn denied_gateway_is_reported_before_repository_setup() {
     assert_eq!(result["containerStarted"], true);
     assert!(result["error"].as_str().unwrap().contains("SELinux policy"));
     assert!(!fixture.snapshot(&result).exists());
-    fixture.check_clean(&result);
-}
-
-#[tokio::test]
-async fn optional_cache_timeout_preserves_completed_setup_and_required_snapshot() {
-    let fixture = PostCommandFixture::new("cache_timeout");
-    let result = fixture
-        .execution
-        .call(
-            "prepare_environment",
-            &json!({"revision":"head","setup":fixture.command()}),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(result["status"], "passed", "{result}");
-    assert_eq!(result["exitCode"], 0);
-    assert!(
-        result["cacheSaveError"]
-            .as_str()
-            .unwrap()
-            .contains("did not finish")
-    );
-    assert!(result.get("failureStage").is_none(), "{result}");
-    assert!(
-        result["stdout"]
-            .as_str()
-            .unwrap()
-            .contains("fixture command completed")
-    );
-    assert!(fixture.snapshot(&result).is_file());
     fixture.check_clean(&result);
 }
 

@@ -371,7 +371,11 @@ checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
     )
     .await;
     assert_eq!(setup["status"], "passed", "{setup}");
-    assert_eq!(setup["packageCacheRestored"], false, "{setup}");
+    assert!(setup["packageCacheKey"].is_null(), "{setup}");
+    assert!(
+        !setup["packageCacheRestored"].as_bool().unwrap_or(false),
+        "{setup}"
+    );
     let tested=call(&exec,"run_experiment",json!({"revision":"head","environment":setup["id"],"command":"rustc --version && cargo --version && node --version && python3 --version && node -e \"require('node:assert/strict').ok(Number(process.versions.node.split('.')[0]) >= 24)\" && cargo test --offline && GOPROXY=off go test ./..."})).await;
     assert_eq!(tested["status"], "passed", "{tested}");
     let output = tested["stdout"].as_str().unwrap();
@@ -390,12 +394,36 @@ checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
     let second = Execution::from_context(&context, &dir.path().join("next-review"))
         .unwrap()
         .unwrap();
-    let reused = call(&second,"prepare_environment",json!({"revision":"head","setup":"test -n \"$(find .crow-home/.cargo/registry/cache -name itoa-1.0.15.crate)\" && test -f .crow-home/go/pkg/mod/cache/download/github.com/google/uuid/@v/v1.6.0.zip && test -f .crow-home/go/pkg/mod/cache/download/github.com/google/uuid/@v/v1.6.0.mod && test ! -e .crow-home/go/pkg/mod/cache/download/github.com/google/uuid/@v/v1.6.0.ziphash && cargo fetch --locked && go mod download all"})).await;
-    assert_eq!(reused["status"], "passed", "{reused}");
-    assert_eq!(reused["packageCacheRestored"], true, "{reused}");
+    let fresh = call(&second,"prepare_environment",json!({"revision":"head","setup":"test ! -e .crow-home/.cargo && test ! -e .crow-home/go/pkg/mod/cache/download && echo 'NEXT_REVIEW_HAS_NO_CARGO_OR_GO_CACHE' && cargo fetch --locked && go mod download all"})).await;
+    assert_eq!(fresh["status"], "passed", "{fresh}");
+    assert!(fresh["packageCacheKey"].is_null(), "{fresh}");
     assert!(
-        reused["packageCache"]["files"].as_u64().unwrap() >= 3,
-        "{reused}"
+        !fresh["packageCacheRestored"].as_bool().unwrap_or(false),
+        "{fresh}"
+    );
+    assert!(fresh["packageCache"].is_null(), "{fresh}");
+    assert!(
+        fresh["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("NEXT_REVIEW_HAS_NO_CARGO_OR_GO_CACHE"),
+        "{fresh}"
+    );
+    assert!(
+        fresh["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("Downloaded itoa v1.0.15"),
+        "Expected a fresh Cargo download: {fresh}"
+    );
+    let retested = call(&second,"run_experiment",json!({"revision":"head","environment":fresh["id"],"command":"cargo test --offline --locked && GOPROXY=off go test ./..."})).await;
+    assert_eq!(retested["status"], "passed", "{retested}");
+    assert!(
+        retested["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("let_chain_handles_present_absent_and_rejected_values"),
+        "{retested}"
     );
 }
 
@@ -498,7 +526,7 @@ PYTHON"#;
 
 #[tokio::test]
 #[ignore = "requires rootless Podman and the public npm registry"]
-async fn updated_pr_reuses_verified_downloads_offline_and_releases_finished_workspaces() {
+async fn updated_pr_installs_fresh_dependencies_and_releases_finished_workspaces() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(".crow-data/autonomous-runtime-test");
     std::fs::create_dir_all(&root).unwrap();
     let temp = tempfile::tempdir_in(&root).unwrap();
@@ -539,31 +567,19 @@ async fn updated_pr_reuses_verified_downloads_offline_and_releases_finished_work
     let next = Execution::from_context(&context, &second_dir)
         .unwrap()
         .unwrap();
-    let offline = call(&next,"prepare_environment",json!({"revision":"head","setup":"test ! -e generated-output.txt && test ! -d node_modules && test \"$(cat value.txt)\" = 'updated commit' && npm ci --offline --no-audit --no-fund"})).await;
-    assert_eq!(offline["status"], "passed", "{offline}");
-    assert_eq!(offline["packageCacheRestored"], true, "{offline}");
-    assert!(offline["packageCache"]["bytes"].as_u64().unwrap() > 0);
-    let tested=call(&next,"run_experiment",json!({"revision":"head","environment":offline["id"],"command":"node -e \"if(!require('is-number')('42'))process.exit(1)\" && test \"$(cat value.txt)\" = 'updated commit'"})).await;
-    assert_eq!(tested["status"], "passed", "{tested}");
-    let cache_path = root.join("runtime-cache/packages").join(format!(
-        "{}.tar",
-        offline["packageCacheKey"].as_str().unwrap()
-    ));
-    std::fs::write(&cache_path, b"corrupted archive").unwrap();
-    let fresh = Execution::from_context(&context, &temp.path().join("reviews/third/experiments"))
-        .unwrap()
-        .unwrap();
-    let repaired = call(
-        &fresh,
-        "prepare_environment",
-        json!({"revision":"head","setup":"npm ci --no-audit --no-fund"}),
-    )
-    .await;
-    assert_eq!(repaired["status"], "passed", "{repaired}");
+    let fresh = call(&next,"prepare_environment",json!({"revision":"head","setup":"test ! -e generated-output.txt && test ! -e node_modules && test ! -e .crow-home/.npm && test \"$(cat value.txt)\" = 'updated commit' && echo NEXT_REVIEW_STARTED_CLEAN && npm ci --no-audit --no-fund"})).await;
+    assert_eq!(fresh["status"], "passed", "{fresh}");
+    assert!(fresh["packageCacheKey"].is_null(), "{fresh}");
+    assert_ne!(fresh["packageCacheRestored"], true, "{fresh}");
     assert!(
-        repaired["cacheRestoreError"].is_string(),
-        "Corrupt cache must be visible without blocking fresh setup: {repaired}"
+        fresh["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("NEXT_REVIEW_STARTED_CLEAN"),
+        "{fresh}"
     );
+    let tested=call(&next,"run_experiment",json!({"revision":"head","environment":fresh["id"],"command":"node -e \"if(!require('is-number')('42'))process.exit(1)\" && test \"$(cat value.txt)\" = 'updated commit'"})).await;
+    assert_eq!(tested["status"], "passed", "{tested}");
     let cleanup = crow::retention::cleanup(
         temp.path(),
         &json!({"retentionDays":7}),
@@ -584,7 +600,23 @@ async fn updated_pr_reuses_verified_downloads_offline_and_releases_finished_work
             .exists()
     );
     assert!(second_dir.join("environments").exists());
+    let superseded = crow::retention::cleanup(
+        temp.path(),
+        &json!({"retentionDays":7}),
+        &[json!({"id":"second","state":"superseded","updatedAt":crow::util::now()})],
+    )
+    .unwrap();
+    assert!(
+        superseded["warnings"].as_array().unwrap().is_empty(),
+        "{superseded}"
+    );
+    assert!(!second_dir.join("environments").exists());
+    assert!(
+        second_dir
+            .join(format!("{}.json", fresh["id"].as_str().unwrap()))
+            .exists()
+    );
     println!(
-        "Updated source installed dependencies with npm offline, retained no generated workspace files, and terminal cleanup preserved receipts plus paused work."
+        "Updated source started without dependency caches or generated files, fetched npm dependencies, and passed offline tests. Cleanup preserved paused work, then released superseded snapshots while retaining receipts."
     );
 }
