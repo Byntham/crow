@@ -254,7 +254,32 @@ fn node_workspace_owner(
                 &directory[ancestor.len() + 1..]
             };
             match workspace_member(patterns, relative) {
-                Some(true) => return Ok(Some(ancestor.to_owned())),
+                Some(true) => {
+                    let Some(root) = node_workspace_owner(ancestor, parent, files, packages)?
+                    else {
+                        return Ok(Some(ancestor.to_owned()));
+                    };
+                    // Yarn 2+ recursively discovers workspace declarations in
+                    // member packages. Do not assume npm or unknown Yarn
+                    // versions install the same nested workspace graph.
+                    let modern_yarn = packages[&root]["packageManager"]
+                        .as_str()
+                        .and_then(pinned_manager)
+                        .is_some_and(|(manager, version)| {
+                            manager == "yarn"
+                                && version
+                                    .split('.')
+                                    .next()
+                                    .and_then(|major| major.parse::<u64>().ok())
+                                    .is_some_and(|major| major >= 2)
+                        });
+                    if !modern_yarn {
+                        return Err(format!(
+                            "Inspect nested workspaces in {ancestor}/package.json and {root}/package.json before choosing setup or test commands. Automatic nested-workspace inheritance requires an exact Yarn 2+ pin; no npm fallback is suggested."
+                        ));
+                    }
+                    return Ok(Some(root));
+                }
                 Some(false) => return Ok(None),
                 None => {
                     return Err(format!(
@@ -654,6 +679,55 @@ mod discovery_tests {
                 &nested
             ),
             Ok(Some("packages/tool".into()))
+        );
+    }
+
+    #[test]
+    fn nested_yarn_workspaces_resolve_ultimate_root_without_crossing_independent_pins() {
+        let mut packages = BTreeMap::from([
+            (
+                ".".to_owned(),
+                json!({"packageManager":"yarn@4.9.2","workspaces":["packages/*"]}),
+            ),
+            (
+                "packages/app".to_owned(),
+                json!({"workspaces":["plugins/*"]}),
+            ),
+        ]);
+        let files = ["package.json", "yarn.lock", "packages/app/package.json"];
+        assert_eq!(
+            node_workspace_owner("packages/app/plugins/foo", &json!({}), &files, &packages),
+            Ok(Some(".".into()))
+        );
+        assert_eq!(
+            node_workspace_owner("packages/app", &packages["packages/app"], &files, &packages),
+            Ok(Some(".".into()))
+        );
+        for manager in ["npm@10.9.0", "yarn@1.22.22"] {
+            packages.get_mut(".").unwrap()["packageManager"] = json!(manager);
+            assert!(
+                node_workspace_owner("packages/app/plugins/foo", &json!({}), &files, &packages)
+                    .unwrap_err()
+                    .contains("nested workspaces")
+            );
+        }
+        packages.get_mut(".").unwrap()["packageManager"] = json!("yarn@4.9.2");
+        packages.get_mut("packages/app").unwrap()["packageManager"] = json!("npm@10.9.0");
+        assert_eq!(
+            node_workspace_owner("packages/app/plugins/foo", &json!({}), &files, &packages),
+            Ok(Some("packages/app".into()))
+        );
+        packages
+            .get_mut("packages/app")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("packageManager");
+        let mut files = files.to_vec();
+        files.push("packages/app/package-lock.json");
+        assert_eq!(
+            node_workspace_owner("packages/app/plugins/foo", &json!({}), &files, &packages),
+            Ok(Some("packages/app".into()))
         );
     }
 
