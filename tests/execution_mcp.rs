@@ -286,7 +286,7 @@ async fn real_mcp_regression_isolation_deadline_recovery_and_publication() {
     let before = mcp
         .call(
             "run_experiment",
-            json!({"revision":"base","command":command}),
+            json!({"revision":"base","command":command,"purpose":"Check that total adds two numbers"}),
         )
         .await;
     assert_eq!(before["status"], "passed", "{before}");
@@ -294,7 +294,7 @@ async fn real_mcp_regression_isolation_deadline_recovery_and_publication() {
     let after = mcp
         .call(
             "run_experiment",
-            json!({"revision":"head","command":command}),
+            json!({"revision":"head","command":command,"purpose":"Check that total adds two numbers"}),
         )
         .await;
     assert_eq!(after["status"], "failed", "{after}");
@@ -538,12 +538,18 @@ exit 1
     )
     .unwrap();
     assert!(
-        body.contains("Runtime experiments")
+        body.contains("Runtime tests")
             && body.contains("passed")
             && body.contains("failed")
-            && body.contains("timed_out"),
+            && body.contains("timed out"),
         "{body}"
     );
+    assert!(body.contains("Check that total adds two numbers: **passed** (before this PR)"));
+    assert!(body.contains("Check that total adds two numbers: **failed** (PR version)"));
+    let (visible, details) = body.split_once("<details>").unwrap();
+    assert!(!visible.contains("expected=5"));
+    assert!(details.contains("expected=5"));
+    assert!(!body.contains("| Command excerpt |"));
     let output = Command::new(&podman)
         .args([
             "ps",

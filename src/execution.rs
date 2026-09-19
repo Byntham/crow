@@ -140,8 +140,8 @@ pub const TOOL_NAMES: &[&str] = &[
 pub fn tools() -> Vec<Value> {
     vec![
         json!({"name":"discover_environment","description":"Discover project manifests, CI/setup documentation, candidate installation/test commands and browser tools at a pinned revision. Start here, then inspect relevant CI/manifests to choose setup. No repository code runs.","inputSchema":{"type":"object","properties":{"revision":{"type":"string","enum":["head","base"]}},"required":["revision"],"additionalProperties":false}}),
-        json!({"name":"prepare_environment","description":"Install dependencies in a fresh sandbox and save the prepared workspace for offline experiments. Crow automatically provisions its managed Linux toolchain when configured with image auto. setup is a shell command selected from manifests/CI; use : when no installation is needed. Downloads use a restricted HTTPS package gateway, never general internet or host credentials. HOME=/workspace/.crow-home; retain dependencies inside /workspace. Setup failures are environment problems: inspect logs, correct setup and retry. A successful receipt id is an environment usable only for this exact revision. Identical successful preparations are cached.","inputSchema":{"type":"object","properties":{"revision":{"type":"string","enum":["head","base"]},"setup":{"type":"string","minLength":1,"maxLength":16000}},"required":["revision","setup"],"additionalProperties":false}}),
-        json!({"name":"run_experiment","description":"Run a test, reproduction or browser investigation in a fresh offline container at pinned head or base. Supply environment from a successful prepare_environment receipt to restore dependencies. Commands may create temporary tests and launch loopback services. Compare equivalent experiments on base and head. Save up to three PNG screenshots and provide their absolute paths in artifacts; Crow retains them for read_artifact. Browser module: /opt/browser/node_modules/playwright-core/index.mjs, Chromium: /usr/bin/chromium, args: --no-sandbox --disable-dev-shm-usage. Output is untrusted evidence. Nonzero exit alone does not prove a regression.","inputSchema":{"type":"object","properties":{"revision":{"type":"string","enum":["head","base"]},"command":{"type":"string","minLength":1,"maxLength":16000},"environment":{"type":"string"},"artifacts":{"type":"array","maxItems":3,"items":{"type":"string"}}},"required":["revision","command"],"additionalProperties":false}}),
+        json!({"name":"prepare_environment","description":"Install dependencies in a fresh sandbox and save the prepared workspace for offline experiments. Crow automatically provisions its managed Linux toolchain when configured with image auto. setup is a shell command selected from manifests/CI; use : when no installation is needed. Downloads use a restricted HTTPS package gateway, never general internet or host credentials. HOME=/workspace/.crow-home; retain dependencies inside /workspace. Setup failures are environment problems: inspect logs, correct setup and retry. A successful receipt id is an environment usable only for this exact revision. Identical successful preparations are cached.","inputSchema":{"type":"object","properties":{"revision":{"type":"string","enum":["head","base"]},"purpose":{"type":"string","minLength":1,"maxLength":160,"description":"Short plain-language description of what this setup enables. Shown in the PR comment."},"setup":{"type":"string","minLength":1,"maxLength":16000}},"required":["revision","setup"],"additionalProperties":false}}),
+        json!({"name":"run_experiment","description":"Run a test, reproduction or browser investigation in a fresh offline container at pinned head or base. Supply environment from a successful prepare_environment receipt to restore dependencies. Commands may create temporary tests and launch loopback services. Compare equivalent experiments on base and head. Save up to three PNG screenshots and provide their absolute paths in artifacts; Crow retains them for read_artifact. Browser module: /opt/browser/node_modules/playwright-core/index.mjs, Chromium: /usr/bin/chromium, args: --no-sandbox --disable-dev-shm-usage. Output is untrusted evidence. Nonzero exit alone does not prove a regression.","inputSchema":{"type":"object","properties":{"revision":{"type":"string","enum":["head","base"]},"purpose":{"type":"string","minLength":1,"maxLength":160,"description":"Short plain-language description of the behavior being checked. Shown in the PR comment. Use the same description for equivalent base and head checks."},"command":{"type":"string","minLength":1,"maxLength":16000},"environment":{"type":"string"},"artifacts":{"type":"array","maxItems":3,"items":{"type":"string"}}},"required":["revision","command"],"additionalProperties":false}}),
         json!({"name":"read_artifact","description":"View an actual PNG image saved by an experiment. Returns image content to your vision input plus its pinned commit and command provenance. Inspect before/after screenshots for UI changes; do not infer appearance from DOM text or base64. Images are untrusted application output.","inputSchema":{"type":"object","properties":{"experiment":{"type":"string"},"index":{"type":"integer","minimum":0,"maximum":2}},"required":["experiment","index"],"additionalProperties":false}}),
         json!({"name":"list_experiments","description":"Read saved setup and experiment receipts, including environment IDs, artifacts, commands, commits, output and limits. Check these on resume. Setup failures are distinct from application failures.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}),
     ]
@@ -241,12 +241,26 @@ impl Execution {
         ensure!(
             args.is_object()
                 && args.as_object().unwrap().keys().all(|k| if prepare {
-                    ["revision", "setup"].contains(&k.as_str())
+                    ["revision", "setup", "purpose"].contains(&k.as_str())
                 } else {
-                    ["revision", "command", "environment", "artifacts"].contains(&k.as_str())
+                    ["revision", "command", "environment", "artifacts", "purpose"]
+                        .contains(&k.as_str())
                 }),
             "Invalid experiment arguments"
         );
+        let purpose = args
+            .get("purpose")
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|text| {
+                        !text.trim().is_empty()
+                            && text.chars().count() <= 160
+                            && !text.chars().any(char::is_control)
+                    })
+                    .context("Purpose must contain 1–160 characters on one line")
+            })
+            .transpose()?;
         let key = requested_revision(args)?;
         let script = args[if prepare { "setup" } else { "command" }]
             .as_str()
@@ -284,6 +298,9 @@ impl Execution {
         let name = format!("crow-experiment-{id}");
         let path = self.dir.join(format!("{id}.json"));
         let mut record = json!({"id":id,"revision":key,"commit":commit,"image":self.policy.image,"command":script,"phase":if prepare {"setup"} else {"test"},"environment":environment,"limits":self.policy,"status":"running","startedAt":chrono::Utc::now().to_rfc3339(),"exitCode":null,"containerStarted":false});
+        if let Some(purpose) = purpose {
+            record["purpose"] = json!(purpose.trim());
+        }
         crate::util::atomic(&path, &record)?;
         let trace = Trace::new(&path);
         let start = Instant::now();
@@ -1106,108 +1123,191 @@ impl Drop for ContainerGuard {
     }
 }
 
-/// Append only Crow-recorded outcomes. The model cannot manufacture these rows.
+/// Outcomes come from Crow receipts; purpose labels describe the reviewer's intent.
 pub fn append_summary(report: &mut Value, dir: &Path) -> Result<()> {
     if !dir.exists() {
         return Ok(());
     }
     crate::report::validate_report(report)?;
-    let mut rows = Vec::new();
-    let mut counts = BTreeMap::<String, usize>::new();
+    let mut records = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         if entry.path().extension().is_none_or(|e| e != "json") {
             continue;
         }
-        let record =
-            crate::util::read_json(&entry.path())?.context("Missing experiment receipt")?;
-        let status = if record["status"] == "running" {
-            "interrupted"
-        } else {
-            record["status"].as_str().unwrap_or("error")
-        };
-        *counts.entry(status.to_owned()).or_default() += 1;
-        let raw = record["command"].as_str().unwrap_or("");
-        let mut command: String = raw
-            .chars()
-            .take(80)
-            .map(|c| if c.is_control() { ' ' } else { c })
-            .collect();
-        if raw.chars().count() > 80 {
-            command.push_str("...");
-        }
-        command = command
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('|', "&#124;")
-            .replace('`', "&#96;");
-        let warnings = crate::runtime_diagnostics::warnings(&record);
-        let warning_text = if warnings.is_empty() {
-            "none".to_owned()
-        } else {
-            warnings
-                .keys()
-                .map(|stage| stage.label())
-                .collect::<Vec<_>>()
-                .join("; ")
-        };
-        rows.push(format!(
-            "| `{}` | {} {} | {} | {} | {} | <code>{}</code> |",
-            record["commit"]
-                .as_str()
-                .unwrap_or("")
-                .chars()
-                .take(12)
-                .collect::<String>(),
-            record["phase"].as_str().unwrap_or("test"),
-            status,
-            serde_json::from_value::<Stage>(record["failureStage"].clone())
-                .ok()
-                .map(Stage::label)
-                .unwrap_or("none"),
-            warning_text,
-            record["exitCode"]
-                .as_i64()
-                .map_or("none".into(), |c| c.to_string()),
-            command
-        ));
+        records.push(crate::util::read_json(&entry.path())?.context("Missing experiment receipt")?);
     }
-    if rows.is_empty() {
+    if records.is_empty() {
         if !append_report_suffix(
             report,
-            "\n\nRuntime experiments were enabled, but none were run.",
+            "\n\nRuntime tests were enabled, but Crow did not run any checks.",
         ) {
             append_report_suffix(report, "\n\nRuntime tests: not attempted.");
         }
         return Ok(());
     }
-    rows.sort();
-    let total = rows.len();
-    rows.truncate(12);
-    let counts = counts
-        .iter()
-        .map(|(status, count)| format!("{count} {status}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    while !rows.is_empty() {
+    records.sort_by(|a, b| {
+        (
+            a["startedAt"].as_str(),
+            a["id"].as_str(),
+            a["command"].as_str(),
+        )
+            .cmp(&(
+                b["startedAt"].as_str(),
+                b["id"].as_str(),
+                b["command"].as_str(),
+            ))
+    });
+    let mut setups = BTreeMap::new();
+    let mut tests = BTreeMap::new();
+    let mut warning_count = 0;
+    for record in &records {
+        let counts = if record["phase"] == "setup" {
+            &mut setups
+        } else {
+            &mut tests
+        };
+        *counts.entry(experiment_outcome(record)).or_insert(0usize) += 1;
+        warning_count += usize::from(!crate::runtime_diagnostics::warnings(record).is_empty());
+    }
+    let test_counts = outcome_counts(&tests);
+    let setup_counts = outcome_counts(&setups);
+    let mut overview = format!("Test commands: {test_counts}. Dependency setup: {setup_counts}.");
+    if tests.is_empty() {
+        overview.push_str(" No application behavior was tested.");
+    } else if tests.keys().any(|status| *status != "passed") {
+        overview.push_str(" Unsuccessful checks need investigation; they do not by themselves prove a bug in this PR.");
+    }
+    if warning_count > 0 {
+        overview.push_str(&format!(
+            " {warning_count} attempts had warnings; see details below."
+        ));
+    }
+    // Keep setup separate from checks, and show failures before successes if the
+    // publication allowance cannot accommodate every receipt.
+    records.sort_by_key(|record| {
+        (
+            record["phase"] == "setup",
+            experiment_outcome(record) == "passed",
+        )
+    });
+    let total = records.len();
+    for shown in (1..=total.min(12)).rev() {
+        let mut checks = Vec::new();
+        let mut details = Vec::new();
+        for (index, record) in records.iter().take(shown).enumerate() {
+            let setup = record["phase"] == "setup";
+            let label = record["purpose"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| summary_text(s, 160))
+                .unwrap_or_else(|| {
+                    format!(
+                        "{} {}",
+                        if setup { "Dependency setup" } else { "Check" },
+                        index + 1
+                    )
+                });
+            let revision = match record["revision"].as_str() {
+                Some("head") => "PR version",
+                Some("base") => "before this PR",
+                _ => "recorded version",
+            };
+            let outcome = experiment_outcome(record);
+            if !setup {
+                checks.push(format!("- {label}: **{outcome}** ({revision})."));
+            }
+            let mut detail = format!("**{label}**\n\n- Version: {revision}");
+            let commit = record["commit"].as_str().unwrap_or("");
+            if !commit.is_empty() {
+                detail.push_str(&format!(" (<code>{}</code>)", summary_text(commit, 12)));
+            }
+            detail.push_str(&format!("\n- Result: {outcome}"));
+            if let Ok(stage) = serde_json::from_value::<Stage>(record["failureStage"].clone()) {
+                detail.push_str(&format!("\n- Stopped during: {}", stage.label()));
+            }
+            let warnings = crate::runtime_diagnostics::warnings(record);
+            if !warnings.is_empty() {
+                detail.push_str(&format!(
+                    "\n- Warnings: {}",
+                    warnings
+                        .keys()
+                        .map(|stage| stage.label())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ));
+            }
+            if let Some(code) = record["exitCode"].as_i64() {
+                detail.push_str(&format!("\n- Exit code: {code}"));
+            }
+            detail.push_str(&format!(
+                "\n\nCommand excerpt:\n\n<pre>{}</pre>",
+                summary_text(record["command"].as_str().unwrap_or(""), 240)
+            ));
+            details.push(detail);
+        }
+        let checks = if checks.is_empty() {
+            String::new()
+        } else {
+            format!("\n\n{}", checks.join("\n"))
+        };
         let rendered = format!(
-            "\n\n### Runtime experiments\n\nIsolated setup and offline tests. {counts}. Showing {} of {total} experiments. Outcomes include setup attempts; passing setup does not verify application behavior. Results describe these commands only; failures may reflect environment limits. Full receipts are retained on the worker.\n\n| Commit | Result | Failure location | Warnings | Exit | Command excerpt |\n| --- | --- | --- | --- | --- | --- |\n{}",
-            rows.len(),
-            rows.join("\n")
+            "\n\n### Runtime tests\n\n{overview}{checks}\n\n<details>\n<summary>Commands and diagnostics ({shown} of {total} attempts)</summary>\n\n{}\n\nFull logs remain on the worker.\n\n</details>",
+            details.join("\n\n---\n\n")
         );
         if append_report_suffix(report, &rendered) {
             return Ok(());
         }
-        rows.pop();
     }
-    // Preserve the model's report even when findings consume the entire publication
-    // allowance. Runtime counters also remain in the main status and worker receipts.
+    // Preserve findings if their publication allowance leaves no room for details.
     append_report_suffix(
         report,
-        &format!("\n\nRuntime setup and test attempts: {counts}."),
+        &format!("\n\nRuntime tests: {test_counts}. Setup: {setup_counts}."),
     );
     Ok(())
+}
+
+fn experiment_outcome(record: &Value) -> &'static str {
+    match record["status"].as_str() {
+        Some("passed") => "passed",
+        Some("failed") => "failed",
+        Some("timed_out") => "timed out",
+        Some("running" | "interrupted") => "interrupted",
+        _ => "could not complete",
+    }
+}
+
+fn outcome_counts(counts: &BTreeMap<&str, usize>) -> String {
+    if counts.is_empty() {
+        "not attempted".to_owned()
+    } else {
+        counts
+            .iter()
+            .map(|(status, count)| format!("{count} {status}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn summary_text(raw: &str, limit: usize) -> String {
+    let mut result = String::new();
+    for character in raw.chars().take(limit) {
+        match character {
+            '&' => result.push_str("&amp;"),
+            '<' => result.push_str("&lt;"),
+            '>' => result.push_str("&gt;"),
+            '|' => result.push_str("&#124;"),
+            '`' | '*' | '_' | '[' | ']' | '\\' | '#' | '!' => {
+                result.push_str(&format!("&#{};", character as u32))
+            }
+            c if c.is_control() => result.push(' '),
+            c => result.push(c),
+        }
+    }
+    if raw.chars().count() > limit {
+        result.push_str("...");
+    }
+    result
 }
 
 fn append_report_suffix(report: &mut Value, suffix: &str) -> bool {
@@ -1363,6 +1463,10 @@ mod tests {
             json!({"revision":"HEAD","command":"true"}),
             json!({"revision":"head","command":""}),
             json!({"revision":"head","command":"true","image":"other"}),
+            json!({"revision":"head","command":"true","purpose":""}),
+            json!({"revision":"head","command":"true","purpose":"two\nlines"}),
+            json!({"revision":"head","command":"true","purpose":"x".repeat(161)}),
+            json!({"revision":"head","command":"true","purpose":42}),
         ] {
             assert!(
                 execution
@@ -1400,7 +1504,7 @@ mod tests {
         append_summary(&mut report, dir.path()).unwrap();
         let report = crate::report::validate_report(&report).unwrap();
         let summary = report["summary"].as_str().unwrap();
-        assert!(summary.contains("50 failed") && summary.contains("Showing 12 of 50"));
+        assert!(summary.contains("50 failed") && summary.contains("of 50 attempts"));
         assert!(summary.contains("&#124;"));
     }
 
@@ -1425,6 +1529,102 @@ mod tests {
         assert!(summary.contains("screenshot collection"));
         assert!(summary.contains("container cleanup"));
         assert!(!summary.contains("private"));
+    }
+
+    #[test]
+    fn runtime_summary_explains_checks_and_keeps_setup_and_commands_separate() {
+        let dir = tempfile::tempdir().unwrap();
+        let records = [
+            json!({"phase":"setup","revision":"head","status":"passed","command":"cargo fetch --locked","purpose":"Install Rust dependencies"}),
+            json!({"phase":"test","revision":"head","status":"timed_out","command":"cargo test --offline","purpose":"Run the Rust test suite","failureStage":"test_command"}),
+            json!({"phase":"test","revision":"base","status":"failed","command":"cargo test --offline","purpose":"Run the Rust test suite","failureStage":"test_command","exitCode":101}),
+            json!({"phase":"test","revision":"head","status":"passed","command":"python3 test_archive.py","purpose":"Reject malformed archives"}),
+        ];
+        for (index, record) in records.iter().enumerate() {
+            crate::util::atomic(&dir.path().join(format!("{index}.json")), record).unwrap();
+        }
+        let mut report = json!({"summary":"No new bug confirmed.","findings":[]});
+        append_summary(&mut report, dir.path()).unwrap();
+        let summary = report["summary"].as_str().unwrap();
+        let (visible, details) = summary.split_once("<details>").unwrap();
+        assert!(visible.contains(
+            "Test commands: 1 failed, 1 passed, 1 timed out. Dependency setup: 1 passed."
+        ));
+        assert!(visible.contains("Run the Rust test suite: **timed out** (PR version)."));
+        assert!(visible.contains("Run the Rust test suite: **failed** (before this PR)."));
+        assert!(visible.contains("Reject malformed archives: **passed** (PR version)."));
+        assert!(!visible.contains("cargo test"));
+        assert!(!visible.contains("Install Rust dependencies:"));
+        assert!(!summary.contains("timed_out"));
+        assert!(!summary.contains("| Commit |"));
+        assert!(details.contains("Stopped during: test command"));
+        assert!(details.contains("Exit code: 101"));
+        assert!(details.contains("cargo test --offline"));
+        assert!(details.contains("Install Rust dependencies"));
+    }
+
+    #[test]
+    fn successful_setup_alone_is_not_reported_as_passing_tests() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::util::atomic(
+            &dir.path().join("setup.json"),
+            &json!({"phase":"setup","revision":"head","status":"passed","command":"npm ci"}),
+        )
+        .unwrap();
+        let mut report = json!({"summary":"Review complete.","findings":[]});
+        append_summary(&mut report, dir.path()).unwrap();
+        let summary = report["summary"].as_str().unwrap();
+        assert!(summary.contains("Test commands: not attempted. Dependency setup: 1 passed."));
+        assert!(summary.contains("No application behavior was tested."));
+    }
+
+    #[test]
+    fn experiment_labels_cannot_inject_images_or_break_details() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::util::atomic(
+            &dir.path().join("test.json"),
+            &json!({
+                "phase":"test","revision":"head","status":"passed",
+                "purpose":"![tracking](https://example.com/image) </details><script>bad</script>",
+                "command":"echo </pre></details> ![tracking](https://example.com/image)"
+            }),
+        )
+        .unwrap();
+        let mut report = json!({"summary":"Review complete.","findings":[]});
+        append_summary(&mut report, dir.path()).unwrap();
+        let summary = report["summary"].as_str().unwrap();
+        assert_eq!(summary.matches("</details>").count(), 1);
+        assert_eq!(summary.matches("</pre>").count(), 1);
+        assert!(!summary.contains("!["));
+        assert!(!summary.contains("<script>"));
+    }
+
+    #[tokio::test]
+    async fn experiment_purpose_is_saved_even_when_runtime_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = valid();
+        cfg["podman"] = json!("/no-runtime");
+        let context = json!({"job":{"repo":"owner/repo","settings":{"execution":cfg}},"source":{"head":"a".repeat(40),"base":"b".repeat(40)}});
+        let execution = Execution::from_context(&context, dir.path())
+            .unwrap()
+            .unwrap();
+        for (tool, command_field) in [
+            ("run_experiment", "command"),
+            ("prepare_environment", "setup"),
+        ] {
+            let args = json!({"revision":"head",command_field:"true","purpose":"  Verify the save button  "});
+            let receipt = execution
+                .call(tool, &args, CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(receipt["purpose"], "Verify the save button");
+            assert_eq!(receipt["status"], "error");
+            let id = receipt["id"].as_str().unwrap();
+            let saved = crate::util::read_json(&dir.path().join(format!("{id}.json")))
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved["purpose"], receipt["purpose"]);
+        }
     }
 
     fn unicode_report_with_serialized_size(bytes: usize) -> Value {
@@ -1475,7 +1675,7 @@ mod tests {
             } else {
                 assert!(summary.contains("12 failed"));
                 if bytes == 44_750 {
-                    assert!(summary.contains("Runtime setup and test attempts"));
+                    assert!(summary.contains("Runtime tests:"));
                     assert!(!summary.contains("| Commit |"));
                 }
             }
