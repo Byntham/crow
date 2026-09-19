@@ -32,6 +32,7 @@ pub async fn discover(source: &Value, revision: &str) -> Result<Value> {
     let mut projects = Vec::new();
     let mut evidence = Vec::new();
     let mut project_count = 0;
+    let mut node_packages = BTreeMap::new();
     // Root manifests and shallow packages should survive discovery limits even
     // when fixture directories contain hundreds of manifests.
     let mut candidates = files.clone();
@@ -78,6 +79,7 @@ pub async fn discover(source: &Value, revision: &str) -> Result<Value> {
         let mut package_manager = Value::Null;
         let mut warning = Value::Null;
         let mut toolchain_files = Vec::new();
+        let mut setup_directory = directory.to_owned();
         let (setup, tests, start) = match language {
             "node" => {
                 let package: Value = blob
@@ -85,27 +87,41 @@ pub async fn discover(source: &Value, revision: &str) -> Result<Value> {
                     .ok()
                     .and_then(|s| serde_json::from_str(s).ok())
                     .unwrap_or(Value::Null);
-                package_manager = package["packageManager"]
+                node_packages.insert(directory.to_owned(), package.clone());
+                let owner = node_workspace_owner(directory, &package, &files, &node_packages);
+                let (selected, blocked) = match owner {
+                    Ok(Some(owner)) => {
+                        setup_directory = owner.clone();
+                        (node_packages[&owner].clone(), None)
+                    }
+                    Ok(None) => (package.clone(), None),
+                    Err(note) => (package.clone(), Some(note)),
+                };
+                package_manager = selected["packageManager"]
                     .as_str()
                     .map(|value| Value::String(value.chars().take(256).collect()))
                     .unwrap_or(Value::Null);
-                let (setup, runner, note) = node_setup(
-                    &package,
-                    has("pnpm-lock.yaml"),
-                    has("yarn.lock"),
-                    has("package-lock.json"),
+                let (mut setup, mut runner, note) = node_setup(
+                    &selected,
+                    project_file(&files, &setup_directory, "pnpm-lock.yaml"),
+                    project_file(&files, &setup_directory, "yarn.lock"),
+                    project_file(&files, &setup_directory, "package-lock.json"),
                 );
-                warning = note.map_or(Value::Null, Value::String);
+                warning = blocked.clone().or(note).map_or(Value::Null, Value::String);
+                if blocked.is_some() {
+                    setup.clear();
+                    runner.clear();
+                }
                 (
                     setup,
-                    if package["scripts"]["test"].is_string() {
+                    if !runner.is_empty() && package["scripts"]["test"].is_string() {
                         format!("{runner} test")
                     } else {
                         String::new()
                     },
-                    if package["scripts"]["start"].is_string() {
+                    if !runner.is_empty() && package["scripts"]["start"].is_string() {
                         format!("{runner} start")
-                    } else if package["scripts"]["dev"].is_string() {
+                    } else if !runner.is_empty() && package["scripts"]["dev"].is_string() {
                         format!("{runner} run dev")
                     } else {
                         String::new()
@@ -136,12 +152,138 @@ pub async fn discover(source: &Value, revision: &str) -> Result<Value> {
             ),
             _ => unreachable!(),
         };
-        projects.push(json!({"directory":directory,"manifest":path,"language":language,"setup":setup,"test":tests,"start":start,"packageManager":package_manager,"toolchainFiles":toolchain_files,"warning":warning}));
+        projects.push(json!({"directory":directory,"setupDirectory":setup_directory,"manifest":path,"language":language,"setup":setup,"test":tests,"start":start,"packageManager":package_manager,"toolchainFiles":toolchain_files,"warning":warning}));
     }
     evidence.truncate(100);
     Ok(
-        json!({"revision":revision,"commit":commit,"projects":projects,"projectCount":project_count,"projectsTruncated":project_count > projects.len(),"instructionsToInspect":evidence,"browser":{"module":"/opt/browser/node_modules/playwright-core/index.mjs","executable":"/usr/bin/chromium","args":["--no-sandbox","--disable-dev-shm-usage"]},"note":"These are setup candidates, not verified commands. Read CI and manifests, respect runtime versions, select affected projects, and repair failed setup using logs. Do not change application code to make a test pass. Static sites and standard-library projects need no dependency installation."}),
+        json!({"revision":revision,"commit":commit,"projects":projects,"projectCount":project_count,"projectsTruncated":project_count > projects.len(),"instructionsToInspect":evidence,"browser":{"module":"/opt/browser/node_modules/playwright-core/index.mjs","executable":"/usr/bin/chromium","args":["--no-sandbox","--disable-dev-shm-usage"]},"note":"These are setup candidates, not verified commands. Run setup in setupDirectory, and test/start in directory. Workspace members share their owner's setup. Read CI and manifests, respect runtime versions, select affected projects, and repair failed setup using logs. Do not change application code to make a test pass. Static sites and standard-library projects need no dependency installation."}),
     )
+}
+
+fn project_file(files: &[&str], directory: &str, name: &str) -> bool {
+    let path = if directory == "." {
+        name.to_owned()
+    } else {
+        format!("{directory}/{name}")
+    };
+    files.contains(&path.as_str())
+}
+
+// Support literal components, * and ** without pretending to implement every
+// package manager's glob language. Ambiguous declarations need inspection.
+fn workspace_member(patterns: &Value, path: &str) -> Option<bool> {
+    let patterns = patterns
+        .as_array()
+        .or_else(|| patterns.get("packages")?.as_array())?;
+    if patterns.len() > 256 || path.split('/').count() > 128 {
+        return None;
+    }
+    let mut matched = false;
+    for pattern in patterns {
+        let pattern = pattern.as_str()?.trim_end_matches('/');
+        let pattern = pattern.strip_prefix("./").unwrap_or(pattern);
+        let parts: Vec<_> = pattern.split('/').collect();
+        if parts.len() > 64
+            || parts.iter().any(|part| {
+                part.is_empty()
+                    || *part == "."
+                    || *part == ".."
+                    || (*part != "*"
+                        && *part != "**"
+                        && part.chars().any(|c| "*?![]{}\\()".contains(c)))
+            })
+        {
+            return None;
+        }
+        let path: Vec<_> = path.split('/').collect();
+        // Dynamic programming avoids exponential matching of repeated **.
+        let mut previous = vec![false; path.len() + 1];
+        previous[0] = true;
+        for part in parts {
+            let mut next = vec![false; path.len() + 1];
+            if part == "**" {
+                next[0] = previous[0];
+            }
+            for index in 1..=path.len() {
+                next[index] = if part == "**" {
+                    previous[index] || next[index - 1]
+                } else {
+                    previous[index - 1] && (part == "*" || part == path[index - 1])
+                };
+            }
+            previous = next;
+        }
+        matched |= previous[path.len()];
+    }
+    Some(matched)
+}
+
+fn node_workspace_owner(
+    directory: &str,
+    package: &Value,
+    files: &[&str],
+    packages: &BTreeMap<String, Value>,
+) -> std::result::Result<Option<String>, String> {
+    if directory == "."
+        || package.get("packageManager").is_some()
+        || [
+            "package-lock.json",
+            "npm-shrinkwrap.json",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+        ]
+        .iter()
+        .any(|name| project_file(files, directory, name))
+    {
+        return Ok(None);
+    }
+    let mut ancestor = directory;
+    loop {
+        ancestor = ancestor.rsplit_once('/').map_or(".", |(parent, _)| parent);
+        if project_file(files, ancestor, "pnpm-workspace.yaml") {
+            return Err(format!(
+                "Inspect {ancestor}/pnpm-workspace.yaml and its root package.json before choosing setup or test commands. Workspace membership has not been resolved, so no npm fallback is suggested."
+            ));
+        }
+        if let Some(parent) = packages.get(ancestor)
+            && let Some(patterns) = parent.get("workspaces")
+        {
+            let relative = if ancestor == "." {
+                directory
+            } else {
+                &directory[ancestor.len() + 1..]
+            };
+            match workspace_member(patterns, relative) {
+                Some(true) => return Ok(Some(ancestor.to_owned())),
+                Some(false) => return Ok(None),
+                None => {
+                    return Err(format!(
+                        "Inspect workspace patterns in {ancestor}/package.json before choosing this project's setup or test commands. Workspace membership is ambiguous, so no npm fallback is suggested."
+                    ));
+                }
+            }
+        }
+        if ancestor != "."
+            && (packages
+                .get(ancestor)
+                .is_some_and(|package| package.get("packageManager").is_some())
+                || [
+                    "package-lock.json",
+                    "npm-shrinkwrap.json",
+                    "pnpm-lock.yaml",
+                    "yarn.lock",
+                ]
+                .iter()
+                .any(|name| project_file(files, ancestor, name)))
+        {
+            // Do not walk through an independent nested package and inherit
+            // a more distant workspace root's recursive patterns.
+            return Ok(None);
+        }
+        if ancestor == "." {
+            return Ok(None);
+        }
+    }
 }
 
 fn python_setup(directory: &str, requirements: bool) -> (String, String) {
@@ -403,6 +545,117 @@ fn image_id(output: &str) -> Result<String> {
 #[cfg(test)]
 mod discovery_tests {
     use super::*;
+
+    #[test]
+    fn workspace_members_inherit_only_their_owner_and_respect_boundaries() {
+        let packages = BTreeMap::from([
+            (
+                ".".to_owned(),
+                json!({"packageManager":"yarn@4.9.2","workspaces":["packages/*"]}),
+            ),
+            (
+                "nested".to_owned(),
+                json!({"packageManager":"npm@10.9.0","workspaces":{"packages":["apps/**"]}}),
+            ),
+        ]);
+        let files = [
+            "package.json",
+            "yarn.lock",
+            "nested/package.json",
+            "nested/package-lock.json",
+        ];
+        assert_eq!(
+            node_workspace_owner("packages/app", &json!({}), &files, &packages),
+            Ok(Some(".".into()))
+        );
+        assert_eq!(
+            node_workspace_owner("nested/apps/api", &json!({}), &files, &packages),
+            Ok(Some("nested".into()))
+        );
+        assert_eq!(
+            node_workspace_owner("examples/independent", &json!({}), &files, &packages),
+            Ok(None)
+        );
+        assert_eq!(
+            node_workspace_owner(
+                "packages/app",
+                &json!({"packageManager":"npm@10.9.1"}),
+                &files,
+                &packages
+            ),
+            Ok(None)
+        );
+        for lock in [
+            "package-lock.json",
+            "npm-shrinkwrap.json",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+        ] {
+            let path = format!("packages/app/{lock}");
+            let mut files = files.to_vec();
+            files.push(&path);
+            assert_eq!(
+                node_workspace_owner("packages/app", &json!({}), &files, &packages),
+                Ok(None)
+            );
+        }
+        assert!(
+            node_workspace_owner(
+                "packages/app",
+                &json!({}),
+                &["pnpm-workspace.yaml"],
+                &packages
+            )
+            .unwrap_err()
+            .contains("pnpm-workspace.yaml")
+        );
+        assert_eq!(
+            workspace_member(&json!(["packages/*"]), "packages/app/deep"),
+            Some(false)
+        );
+        assert_eq!(
+            workspace_member(&json!(["packages/**"]), "packages/app/deep"),
+            Some(true)
+        );
+        assert_eq!(
+            workspace_member(&json!(["packages/*", "!packages/excluded"]), "packages/app"),
+            None
+        );
+        assert_eq!(
+            workspace_member(&json!(["packages/{app,api}"]), "packages/app"),
+            None
+        );
+        let mut nested = packages.clone();
+        nested.get_mut(".").unwrap()["workspaces"] = json!(["packages/**"]);
+        nested.insert(
+            "packages/tool".into(),
+            json!({"packageManager":"npm@10.9.0"}),
+        );
+        let nested_files = [
+            "package.json",
+            "yarn.lock",
+            "packages/tool/package-lock.json",
+        ];
+        assert_eq!(
+            node_workspace_owner(
+                "packages/tool/examples/demo",
+                &json!({}),
+                &nested_files,
+                &nested
+            ),
+            Ok(None)
+        );
+        nested.get_mut("packages/tool").unwrap()["workspaces"] = json!(["examples/*"]);
+        assert_eq!(
+            node_workspace_owner(
+                "packages/tool/examples/demo",
+                &json!({}),
+                &nested_files,
+                &nested
+            ),
+            Ok(Some("packages/tool".into()))
+        );
+    }
 
     #[test]
     fn python_projects_keep_separate_environments_and_safe_nested_paths() {
