@@ -514,7 +514,7 @@ impl Service {
                 db.put(
                     "completed",
                     &format!("{}:{}", s(j, "key"), comparison_key(&j["comparison"])),
-                    &json!({"job":j["id"],"reviewUrl":url,"comparison":j["comparison"]}),
+                    &json!({"job":j["id"],"reviewUrl":url,"comparison":j["comparison"],"runtime":j["runtime"]}),
                 )
             })
         })?;
@@ -1023,7 +1023,7 @@ impl Service {
                     }
                 }
                 if let Some(previous) = previous.filter(|_| !b(&j, "manual")) {
-                    self.update(id,json!({"state":"completed","comparison":c,"reviewUrl":previous["reviewUrl"],"reason":null}),Some(lease))?;
+                    self.update(id,json!({"state":"completed","comparison":c,"reviewUrl":previous["reviewUrl"],"reason":null,"runtime":previous["runtime"]}),Some(lease))?;
                     return Ok(json!({"skip":true}));
                 }
                 for field in ["guidanceFingerprint", "guidanceTargetSha"] {
@@ -2011,6 +2011,11 @@ mod tests {
         let body = f.github.statuses.lock().unwrap().last().unwrap().clone();
         assert!(body.contains("Finished. Test commands: 1 failed."));
         assert!(body.contains("base failures"));
+        // A duplicate PR event reuses the completed comparison and its runtime evidence.
+        let duplicate = f.prepared().await;
+        let saved = f.job(s(&duplicate, "id"));
+        assert_eq!(saved["state"], "completed");
+        assert_eq!(saved["runtime"], json!(runtime));
         f.close().await;
     }
 
