@@ -180,6 +180,8 @@ import { chromium } from '/opt/browser/node_modules/playwright-core/index.mjs';
 const browser=await chromium.launch({executablePath:'/usr/bin/chromium',args:['--no-sandbox','--disable-dev-shm-usage']});
 const page=await browser.newPage({viewport:{width:640,height:320}});
 await page.setContent('<html><body style="background:#123;color:white"><h1>Real Chromium screenshot</h1></body></html>');
+// setContent can finish before Chromium's first frame is available for capture.
+await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
 await page.screenshot({path:'/tmp/evidence.png'});
 await browser.close();
 JS"#;
