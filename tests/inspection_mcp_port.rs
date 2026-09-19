@@ -186,7 +186,7 @@ async fn queued_large_artifacts_are_drained_before_the_next_tool_starts() {
     let artifacts = experiments.join("artifacts");
     std::fs::create_dir_all(&artifacts).unwrap();
     let id = "a".repeat(32);
-    let mut paths = Vec::new();
+    let mut artifact_paths = Vec::new();
     for index in 0..3 {
         let path = artifacts.join(format!("{id}-{index}.png"));
         let file = std::fs::File::create(&path).unwrap();
@@ -203,21 +203,31 @@ async fn queued_large_artifacts_are_drained_before_the_next_tool_starts() {
             data.push((state >> 24) as u8);
         }
         writer.write_image_data(&data).unwrap();
-        paths.push(path);
+        artifact_paths.push(path);
     }
     let source = json!({"dir":directory.path(),"head":"a".repeat(40),"base":"b".repeat(40)});
     std::fs::write(directory.path().join("source.json"), source.to_string()).unwrap();
     let context = json!({"root":directory.path(),"source":source,"job":{"repo":"owner/repo","settings":{"execution":{"automatic":true}}}});
     std::fs::write(directory.path().join("context.json"), context.to_string()).unwrap();
-    let artifacts_json: Vec<Value> = paths
+    let artifacts_json: Vec<Value> = artifact_paths
         .iter()
         .map(|path| json!({"path":path,"saved":true}))
         .collect();
     std::fs::write(experiments.join(format!("{id}.json")), json!({"id":id,"status":"passed","commit":"a".repeat(40),"revision":"head","command":"capture","artifacts":artifacts_json}).to_string()).unwrap();
+    std::os::unix::fs::symlink(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/slow-discovery-git.py"),
+        directory.path().join("git"),
+    )
+    .unwrap();
+    let env_paths = std::iter::once(directory.path().to_owned()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect::<Vec<_>>(),
+    );
     let mut child = tokio::process::Command::new(crow_binary())
         .arg("_inspection-mcp")
         .arg(directory.path().join("source.json"))
         .arg(directory.path().join("context.json"))
+        .env("PATH", std::env::join_paths(env_paths).unwrap())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -226,10 +236,40 @@ async fn queued_large_artifacts_are_drained_before_the_next_tool_starts() {
         .unwrap();
     let mut input = child.stdin.take().unwrap();
     let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
-    for index in 0..3 {
-        input.write_all(format!("{}\n", json!({"id":index+1,"method":"tools/call","params":{"name":"read_artifact","arguments":{"experiment":id,"index":index}}})).as_bytes()).await.unwrap();
+    input.write_all(b"{\"id\":0,\"method\":\"tools/call\",\"params\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"package.json\"}}}\n").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !directory.path().join("git-started").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Delayed inspection did not start");
+    // Seven accepted reads are queued behind an actual blocked Git read. Six
+    // near-limit PNG responses together exceed the 16 MiB output cap twice.
+    for index in 0..7 {
+        input.write_all(format!("{}\n", json!({"id":index+1,"method":"tools/call","params":{"name":"read_artifact","arguments":{"experiment":id,"index":index % 3}}})).as_bytes()).await.unwrap();
     }
-    for index in 0..3 {
+    input
+        .write_all(b"{\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":0}}\n")
+        .await
+        .unwrap();
+    let initial: Value = serde_json::from_str(
+        &tokio::time::timeout(Duration::from_secs(5), output.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(initial["id"], 0);
+    assert_eq!(initial["result"]["isError"], true);
+    // Stop reading while the first large PNG fills stdout. The transport must
+    // still process cancellation of a queued read before starting that read.
+    input
+        .write_all(b"{\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":7}}\n")
+        .await
+        .unwrap();
+    for index in 0..6 {
         let line = tokio::time::timeout(Duration::from_secs(15), output.next_line())
             .await
             .unwrap()
@@ -246,9 +286,27 @@ async fn queued_large_artifacts_are_drained_before_the_next_tool_starts() {
                 .as_str()
                 .unwrap()
                 .len()
-                > 4_000_000
+                > 5 * 1024 * 1024
         );
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(response["result"]["content"][1]["data"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(bytes, std::fs::read(&artifact_paths[index % 3]).unwrap());
     }
+    input
+        .write_all(b"{\"id\":99,\"method\":\"ping\"}\n")
+        .await
+        .unwrap();
+    let ping: Value = serde_json::from_str(
+        &tokio::time::timeout(Duration::from_secs(3), output.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ping, json!({"jsonrpc":"2.0","id":99,"result":{}}));
     drop(input);
     assert!(
         tokio::time::timeout(Duration::from_secs(15), child.wait())

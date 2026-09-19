@@ -969,6 +969,26 @@ impl McpOutbox {
     }
 }
 
+// Used while no tool is active as well as while completed output drains.
+fn queue_mcp_request(
+    incoming: Value,
+    pending: &mut VecDeque<Value>,
+    outbox: &mut McpOutbox,
+) -> Result<()> {
+    if incoming.get("id").is_none() {
+        if incoming["method"] == "notifications/cancelled"
+            && let Some(cancelled_id) = incoming["params"].get("requestId")
+        {
+            pending.retain(|request| request.get("id") != Some(cancelled_id));
+        }
+    } else if pending.len() < 16 {
+        pending.push_back(incoming);
+    } else {
+        outbox.push(&json!({"jsonrpc":"2.0","id":incoming["id"],"error":{"code":-32000,"message":"MCP request queue is full; retry after pending requests complete"}}))?;
+    }
+    Ok(())
+}
+
 // The buffer survives cancellation of this future when an active tool finishes.
 // fill_buf and consume keep partial JSON lines intact across select! iterations.
 async fn mcp_request<R: tokio::io::AsyncBufRead + Unpin>(
@@ -1090,6 +1110,12 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
                     tokio::select! {
                         _ = &mut stop => break 'requests,
                         written = outbox.write_next(&mut stdout) => written?,
+                        incoming = mcp_request(&mut stdin, &mut line), if !input_closed => {
+                            match incoming? {
+                                Some(incoming) => queue_mcp_request(incoming, &mut pending, &mut outbox)?,
+                                None => input_closed = true,
+                            }
+                        }
                     }
                     continue;
                 }
@@ -1199,6 +1225,12 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
                 tokio::select! {
                     _ = &mut stop => break 'requests,
                     written = outbox.write_next(&mut stdout) => written?,
+                    incoming = mcp_request(&mut stdin, &mut line), if !input_closed => {
+                        match incoming? {
+                            Some(incoming) => queue_mcp_request(incoming, &mut pending, &mut outbox)?,
+                            None => input_closed = true,
+                        }
+                    }
                 }
             }
             outbox.push(&response)?;
