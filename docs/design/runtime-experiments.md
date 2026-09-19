@@ -23,7 +23,8 @@ Run the container tests with a preloaded Alpine image:
 
 ```sh
 podman pull docker.io/library/alpine:3.22
-export CROW_TEST_IMAGE=$(podman image inspect --format '{{.Id}}' docker.io/library/alpine:3.22)
+crow_image_id=$(podman image inspect --format '{{.Id}}' docker.io/library/alpine:3.22)
+export CROW_TEST_IMAGE="sha256:${crow_image_id#sha256:}"
 # Optional: export CROW_TEST_PODMAN=/path/to/podman
 cargo test --locked --test execution_mcp -- --ignored --nocapture
 ```

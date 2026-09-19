@@ -4,7 +4,7 @@ use base64::Engine;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256, Sha512};
 use std::{
-    io::Write,
+    io::{Read, Write},
     path::Path,
     process::{Command, Stdio},
 };
@@ -88,6 +88,45 @@ fn names(bytes: &[u8]) -> Vec<String> {
         })
         .collect()
 }
+
+fn assert_normalized_go_zip(root: &Path, relative: &str, pins: &Value, contents: Value) -> Vec<u8> {
+    let path = root.join(relative);
+    let inspected = Command::new("python3")
+        .args(["-I", "-c", concat!(
+            "import json,sys,zipfile\n",
+            "with zipfile.ZipFile(sys.argv[1]) as z:\n",
+            " assert z.testzip() is None\n",
+            " assert not z.comment\n",
+            " assert all(e.compress_type==zipfile.ZIP_DEFLATED and not e.extra and not e.comment and not(e.flag_bits & 8) and e.date_time==(1980,1,1,0,0,0) for e in z.infolist())\n",
+            " print(json.dumps({e.filename:z.read(e).decode() for e in z.infolist()}))\n",
+        )])
+        .arg(&path).output().unwrap();
+    assert!(
+        inspected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspected.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&inspected.stdout).unwrap(),
+        contents
+    );
+    let bytes = std::fs::read(path).unwrap();
+    let exported = run("export", root, pins, &[]);
+    assert!(exported.status.success());
+    let repeated = tempfile::tempdir().unwrap();
+    let imported = run("import", repeated.path(), pins, &exported.stdout);
+    assert!(
+        imported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    assert_eq!(
+        std::fs::read(repeated.path().join(relative)).unwrap(),
+        bytes
+    );
+    bytes
+}
+
 fn h1(name: &str, content: &[u8]) -> String {
     let line = format!("{}  {name}\n", hex::encode(Sha256::digest(content)));
     format!(
@@ -342,9 +381,14 @@ fn go_zip_directory_entries_match_go_dirhash_and_invalidate_old_pins() {
         "{}",
         String::from_utf8_lossy(&imported.stderr)
     );
-    assert_eq!(
-        std::fs::read(destination.path().join(&relative)).unwrap(),
-        bytes
+    let normalized = assert_normalized_go_zip(
+        destination.path(),
+        &relative,
+        &correct_pins,
+        json!({
+            "example.org/module@v1.0.0/source.go":"package module\n",
+            "example.org/module@v1.0.0/empty/":""
+        }),
     );
     // An empty directory still needs a valid local ZIP header. Go validates it
     // before returning the empty stream; hashing only central metadata misses it.
@@ -372,7 +416,7 @@ fn go_zip_directory_entries_match_go_dirhash_and_invalidate_old_pins() {
     assert!(!imported.status.success());
     assert_eq!(
         std::fs::read(destination.path().join(&relative)).unwrap(),
-        bytes
+        normalized
     );
 }
 
@@ -501,9 +545,13 @@ fn go_zip_parser_filename_normalization_cannot_match_an_unrelated_pin() {
             "{kind}"
         );
         if accepted {
-            assert_eq!(
-                std::fs::read(destination.path().join(&relative)).unwrap(),
-                bytes
+            assert_normalized_go_zip(
+                destination.path(),
+                &relative,
+                &pins,
+                json!({
+                    format!("example.org/module@v1.0.0/{expected_name}"):"package module\n"
+                }),
             );
         }
     }
@@ -577,12 +625,141 @@ fn go_zip_cache_accepts_only_supported_compression_and_unencrypted_entries() {
             "{method}/{flags}"
         );
         if accepted {
-            assert_eq!(
-                std::fs::read(destination.path().join(&relative)).unwrap(),
-                bytes
+            assert_normalized_go_zip(
+                destination.path(),
+                &relative,
+                &pins,
+                json!({
+                    "example.org/module@v1.0.0/source.go":"package module\n"
+                }),
             );
         }
     }
+}
+
+#[test]
+fn go_zip_metadata_is_rebuilt_before_export_and_import() {
+    let source = tempfile::tempdir().unwrap();
+    let path = "example.org/module/@v/v1.0.0.zip";
+    let relative = format!("{GO}/{path}");
+    let fullpath = source.path().join(&relative);
+    std::fs::create_dir_all(fullpath.parent().unwrap()).unwrap();
+    let pins = json!({"go":{path:"h1://SsL+qsG2XNW4UV2fUFcFBpYyh+eYSho1uh0pTCTGM="}});
+    // Real Go rejects these original archives with "checksum error" and
+    // "not a valid zip file", respectively. Their verified contents are intact.
+    for kind in ["descriptor-crc", "understated-size"] {
+        let fixture = Command::new("python3").args(["-I", "-c", concat!(
+            "import io,pathlib,struct,sys,zipfile,zlib\n",
+            "class Nonseekable(io.BytesIO):\n",
+            " def seekable(self): return False\n",
+            " def seek(self,*args): raise OSError('no seek')\n",
+            "kind=sys.argv[2]; content=b'package module\\n'\n",
+            "buffer=Nonseekable() if kind=='descriptor-crc' else io.BytesIO()\n",
+            "with zipfile.ZipFile(buffer,'w') as z: z.writestr('example.org/module@v1.0.0/source.go',content+(b'hidden' if kind=='understated-size' else b''))\n",
+            "data=bytearray(buffer.getvalue())\n",
+            "if kind=='descriptor-crc': data[data.index(b'PK\\x07\\x08')+4]^=1\n",
+            "else:\n",
+            " local=data.index(b'PK\\x03\\x04'); central=data.index(b'PK\\x01\\x02')\n",
+            " for offset in (local+14,central+16): struct.pack_into('<I',data,offset,zlib.crc32(content))\n",
+            " for offset in (local+22,central+24): struct.pack_into('<I',data,offset,len(content))\n",
+            "pathlib.Path(sys.argv[1]).write_bytes(data)\n",
+        )]).arg(&fullpath).arg(kind).output().unwrap();
+        assert!(
+            fixture.status.success(),
+            "{}",
+            String::from_utf8_lossy(&fixture.stderr)
+        );
+        let original = std::fs::read(&fullpath).unwrap();
+        let exported = run("export", source.path(), &pins, &[]);
+        assert!(
+            exported.status.success(),
+            "{}",
+            String::from_utf8_lossy(&exported.stderr)
+        );
+        let mut normalized = Vec::new();
+        let mut archive_reader = tar::Archive::new(exported.stdout.as_slice());
+        archive_reader
+            .entries()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .read_to_end(&mut normalized)
+            .unwrap();
+        assert_ne!(normalized, original, "{kind}");
+        let destination = tempfile::tempdir().unwrap();
+        // Exercise import directly with original metadata too, including old cache entries.
+        let raw_archive = archive(&relative, &original, false);
+        let imported = run_budget(
+            "import",
+            destination.path(),
+            &pins,
+            &raw_archive,
+            Some(normalized.len() as u64),
+        );
+        assert!(
+            imported.status.success(),
+            "{}",
+            String::from_utf8_lossy(&imported.stderr)
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&imported.stdout).unwrap()["bytes"],
+            normalized.len()
+        );
+        assert_eq!(
+            std::fs::read(destination.path().join(&relative)).unwrap(),
+            normalized
+        );
+        assert_normalized_go_zip(
+            destination.path(),
+            &relative,
+            &pins,
+            json!({
+                "example.org/module@v1.0.0/source.go":"package module\n"
+            }),
+        );
+        let too_small = tempfile::tempdir().unwrap();
+        let imported = run_budget(
+            "import",
+            too_small.path(),
+            &pins,
+            &raw_archive,
+            Some(normalized.len() as u64 - 1),
+        );
+        assert!(imported.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&imported.stdout).unwrap(),
+            json!({"files":0,"bytes":0,"skipped":1})
+        );
+        assert!(!too_small.path().join(&relative).exists());
+    }
+}
+
+#[test]
+fn normalized_go_zip_output_limit_is_enforced_during_writing() {
+    // A stored random payload expands slightly under Deflate. Lowering the test
+    // limit exercises the same bounded writer without constructing a 128 MiB ZIP.
+    let output = Command::new("python3").args(["-I", "-c", concat!(
+        "import base64,hashlib,io,random,sys,zipfile\n",
+        "namespace={'__name__':'cache_test'}; exec(sys.argv[1],namespace)\n",
+        "name='example.org/module@v1.0.0/random.bin'; content=random.Random(7).randbytes(8192)\n",
+        "buffer=io.BytesIO()\n",
+        "with zipfile.ZipFile(buffer,'w') as z: z.writestr(name,content)\n",
+        "data=buffer.getvalue()\n",
+        "line=(hashlib.sha256(content).hexdigest()+'  '+name+'\\n').encode()\n",
+        "pin='h1:'+base64.b64encode(hashlib.sha256(line).digest()).decode()\n",
+        "normalized=namespace['checked_download'](data,('gozip',pin))\n",
+        "assert len(normalized)>len(data)\n",
+        "namespace['FILE_LIMIT']=len(data)\n",
+        "try: namespace['checked_download'](data,('gozip',pin))\n",
+        "except ValueError as error: assert 'exceeds limit' in str(error),error\n",
+        "else: raise AssertionError('Normalized ZIP exceeded output limit')\n",
+    )]).arg(HELPER).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

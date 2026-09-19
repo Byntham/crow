@@ -92,6 +92,42 @@ def verified(data, specification):
     return digest_h1(data, kind == 'gozip') == expected
 
 
+class BoundedZipBuffer(io.BytesIO):
+    def write(self, data):
+        if self.tell() + len(data) > FILE_LIMIT:
+            raise ValueError('Normalized module zip exceeds limit')
+        return super().write(data)
+
+
+def checked_download(data, specification):
+    if not verified(data, specification):
+        raise ValueError('Package cache integrity mismatch')
+    if specification[0] != 'gozip':
+        return data
+    # Go and Python differ in how they validate ZIP descriptors, lengths and
+    # other metadata not covered by h1. Transfer only the verified names and
+    # contents into a fresh standard ZIP, never the original untrusted metadata.
+    output = BoundedZipBuffer()
+    total = 0
+    with zipfile.ZipFile(io.BytesIO(data)) as original:
+        with zipfile.ZipFile(output, mode='w', allowZip64=False) as normalized:
+            for entry in sorted(original.infolist(), key=lambda entry: entry.filename):
+                clean = zipfile.ZipInfo(entry.filename, date_time=(1980, 1, 1, 0, 0, 0))
+                clean.compress_type = zipfile.ZIP_DEFLATED
+                clean.external_attr = ((0o40700 << 16) | 0x10) if entry.is_dir() else (0o100600 << 16)
+                with original.open(entry) as source, normalized.open(clean, mode='w') as target:
+                    while chunk := source.read(65536):
+                        total += len(chunk)
+                        if total > LIMIT:
+                            raise ValueError('Normalized module zip contents exceed limit')
+                        target.write(chunk)
+    data = output.getvalue()
+    # Check the exact emitted archive against the same trusted pin as well.
+    if len(data) > FILE_LIMIT or digest_h1(data, True) != specification[1]:
+        raise ValueError('Normalized module zip integrity mismatch')
+    return data
+
+
 def parent_fd(root, parts, create=False):
     current = os.dup(root)
     try:
@@ -149,8 +185,9 @@ def export_cache(root, pins):
                                     or entry.st_size > FILE_LIMIT):
                                 continue
                             data = source.read(FILE_LIMIT + 1)
-                        if len(data) > FILE_LIMIT or not verified(data, specification):
+                        if len(data) > FILE_LIMIT:
                             continue
+                        data = checked_download(data, specification)
                     except (OSError, ValueError, zipfile.BadZipFile):
                         continue
                     if total + len(data) > LIMIT:
@@ -186,8 +223,9 @@ def import_cache(root, pins, budget=128 * 1024 * 1024):
                 raise ValueError('Unexpected package cache path')
             with archive.extractfile(member) as source:
                 data = source.read(FILE_LIMIT + 1)
-            if len(data) != member.size or not verified(data, specification):
+            if len(data) != member.size:
                 raise ValueError('Package cache integrity mismatch')
+            data = checked_download(data, specification)
             if imported_bytes + len(data) > budget:
                 skipped += 1
                 continue
