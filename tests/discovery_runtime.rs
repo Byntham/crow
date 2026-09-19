@@ -31,6 +31,172 @@ async fn call(exec: &Execution, name: &str, args: Value) -> Value {
 }
 
 #[tokio::test]
+async fn python_discovery_combines_manifests_and_withholds_ambiguous_package_installs() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-b", "main"]);
+    for (name, metadata, setup_py, requirements) in [
+        (
+            "package",
+            "[project]\nname='fixture'\nversion='1.0.0'\n",
+            false,
+            true,
+        ),
+        ("legacy", "[tool.ruff]\nline-length=88\n", true, true),
+        (
+            "tool_only",
+            "[tool.pytest.ini_options]\naddopts='-q'\n",
+            false,
+            true,
+        ),
+        ("config_only", "[tool.ruff]\nline-length=88\n", false, false),
+        (
+            "ambiguous",
+            "[build-system]\nrequires=['hatchling']\nbuild-backend='hatchling.build'\n",
+            false,
+            true,
+        ),
+        ("malformed", "[project\n", false, true),
+        (
+            "no_package",
+            "[project]\nname='fixture'\nversion='1.0.0'\n[tool.poetry]\npackage-mode=false\n",
+            false,
+            true,
+        ),
+    ] {
+        let directory = repo.join(name);
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("pyproject.toml"), metadata).unwrap();
+        if setup_py {
+            std::fs::write(
+                directory.join("setup.py"),
+                "from setuptools import setup\nsetup(name='fixture', version='1.0.0')\n",
+            )
+            .unwrap();
+        }
+        if requirements {
+            std::fs::write(directory.join("requirements.txt"), "pytest==8.4.2\n").unwrap();
+        }
+    }
+    let oversized = repo.join("oversized");
+    std::fs::create_dir(&oversized).unwrap();
+    // read_blob rejects files above 2 MiB. One failed manifest read must not
+    // prevent discovery of the other projects or hide this requirements file.
+    std::fs::write(
+        oversized.join("pyproject.toml"),
+        format!("#{}", "x".repeat(2 * 1024 * 1024)),
+    )
+    .unwrap();
+    std::fs::write(oversized.join("requirements.txt"), "pytest==8.4.2\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(
+        &repo,
+        &["commit", "-m", "Python manifest discovery fixtures"],
+    );
+    let commit = git(&repo, &["rev-parse", "HEAD"]);
+    let context = json!({"root":temp.path(),"job":{"repo":"fixture/python-discovery","settings":{"execution":{"automatic":true}}},"source":{"dir":repo,"head":commit,"base":commit}});
+    let exec = Execution::from_context(&context, &temp.path().join("experiments"))
+        .unwrap()
+        .unwrap();
+    let found = call(&exec, "discover_environment", json!({"revision":"head"})).await;
+    let projects = found["projects"].as_array().unwrap();
+    assert_eq!(found["projectCount"], 8, "{found}");
+    assert_eq!(projects.len(), 8, "{found}");
+    assert_eq!(found["projectsTruncated"], false);
+    for project in projects {
+        let name = project["directory"].as_str().unwrap();
+        let setup = project["setup"].as_str().unwrap();
+        assert_eq!(project["manifest"], format!("{name}/pyproject.toml"));
+        let manifests = project["manifests"].as_array().unwrap();
+        assert_eq!(
+            manifests.len(),
+            if name == "legacy" {
+                3
+            } else if name == "config_only" {
+                1
+            } else {
+                2
+            }
+        );
+        if ["package", "legacy"].contains(&name) {
+            assert!(
+                setup.ends_with("-m pip install -r requirements.txt -e ."),
+                "{project}"
+            );
+            assert!(project["warning"].is_null(), "{project}");
+        } else if name == "config_only" {
+            assert!(setup.is_empty());
+            assert_eq!(project["test"], "");
+            assert!(project["warning"].is_string());
+        } else {
+            assert!(
+                setup.ends_with("-m pip install -r requirements.txt"),
+                "{project}"
+            );
+            assert_eq!(
+                project["warning"].is_null(),
+                name == "tool_only",
+                "{project}"
+            );
+            if name == "oversized" {
+                assert!(
+                    project["warning"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Could not read pyproject.toml")
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn python_discovery_counts_projects_after_output_limit_not_manifest_duplicates() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-b", "main"]);
+    for index in 0..103 {
+        let directory = repo.join(format!("project-{index:03}"));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(
+            directory.join("pyproject.toml"),
+            "[project]\nname='fixture'\nversion='1.0.0'\n",
+        )
+        .unwrap();
+        std::fs::write(directory.join("requirements.txt"), "pytest\n").unwrap();
+        std::fs::write(
+            directory.join("setup.py"),
+            "from setuptools import setup\nsetup()\n",
+        )
+        .unwrap();
+    }
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "bounded Python discovery fixture"]);
+    let commit = git(&repo, &["rev-parse", "HEAD"]);
+    let context = json!({"root":temp.path(),"job":{"repo":"fixture/python-discovery","settings":{"execution":{"automatic":true}}},"source":{"dir":repo,"head":commit,"base":commit}});
+    let exec = Execution::from_context(&context, &temp.path().join("experiments"))
+        .unwrap()
+        .unwrap();
+    let found = call(&exec, "discover_environment", json!({"revision":"head"})).await;
+    assert_eq!(found["projectCount"], 103, "{found}");
+    assert_eq!(found["projectsTruncated"], true);
+    let projects = found["projects"].as_array().unwrap();
+    assert_eq!(projects.len(), 100);
+    assert!(
+        projects
+            .iter()
+            .all(|project| project["manifests"].as_array().unwrap().len() == 3)
+    );
+    let directories: std::collections::BTreeSet<_> = projects
+        .iter()
+        .map(|project| project["directory"].as_str().unwrap())
+        .collect();
+    assert_eq!(directories.len(), 100);
+}
+
+#[tokio::test]
 async fn pnpm_workspace_roots_withhold_guessed_commands() {
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
@@ -416,6 +582,169 @@ async fn discovered_projects_keep_distinct_manager_versions_in_one_environment()
     }
     println!(
         "Two discovered projects retained npm 10.9.0 and 10.9.1 in one prepared environment; test/start and nested commands passed offline in both execution orders."
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires rootless Podman, the managed toolchain and public PyPI access for pytest"]
+async fn discovered_python_package_installs_runtime_and_test_dependencies() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(".crow-data/autonomous-runtime-test");
+    std::fs::create_dir_all(&root).unwrap();
+    let temp = tempfile::tempdir_in(&root).unwrap();
+    let repo = temp.path().join("repo");
+    let package = repo.join("package");
+    let tools = repo.join("tools");
+    std::fs::create_dir_all(package.join("src/crow_fixture")).unwrap();
+    std::fs::create_dir(&tools).unwrap();
+    git(&repo, &["init", "-b", "main"]);
+    std::fs::write(
+        package.join("pyproject.toml"),
+        r#"[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "crow-python-discovery-fixture"
+version = "1.0.0"
+dependencies = ["humanize==4.13.0"]
+[tool.setuptools.packages.find]
+where = ["src"]
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("setup.py"),
+        "from setuptools import setup\nsetup()\n",
+    )
+    .unwrap();
+    std::fs::write(package.join("requirements.txt"), "pytest==8.4.2\n").unwrap();
+    std::fs::write(
+        package.join("src/crow_fixture/__init__.py"),
+        "import humanize\ndef size(value):\n    return humanize.naturalsize(value, binary=True)\n",
+    )
+    .unwrap();
+    std::fs::write(package.join("test_package.py"), "from crow_fixture import size\ndef test_runtime_dependency():\n    assert size(1024) == '1.0 KiB'\n").unwrap();
+    std::fs::write(
+        tools.join("pyproject.toml"),
+        "[tool.pytest.ini_options]\naddopts='-q'\n",
+    )
+    .unwrap();
+    std::fs::write(tools.join("requirements.txt"), "pytest==8.4.2\n").unwrap();
+    std::fs::write(tools.join("test_tools.py"), "import importlib.util\ndef test_separate_tools_environment():\n    assert importlib.util.find_spec('humanize') is None\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(
+        &repo,
+        &[
+            "commit",
+            "-m",
+            "package runtime dependencies and separate test requirements",
+        ],
+    );
+    let commit = git(&repo, &["rev-parse", "HEAD"]);
+    let config = json!({"podman":std::env::var("CROW_TEST_PODMAN").unwrap_or("podman".into()),"automatic":true});
+    let context = json!({"root":root,"job":{"repo":"fixture/python-installable","settings":{"execution":config}},"source":{"dir":repo,"head":commit,"base":commit}});
+    let exec = Execution::from_context(&context, &temp.path().join("experiments"))
+        .unwrap()
+        .unwrap();
+    let found = call(&exec, "discover_environment", json!({"revision":"head"})).await;
+    let projects = found["projects"].as_array().unwrap();
+    assert_eq!(found["projectCount"], 2, "{found}");
+    assert_eq!(projects.len(), 2, "{found}");
+    let package = projects
+        .iter()
+        .find(|project| project["directory"] == "package")
+        .unwrap();
+    let tools = projects
+        .iter()
+        .find(|project| project["directory"] == "tools")
+        .unwrap();
+    assert_eq!(package["manifests"].as_array().unwrap().len(), 3);
+    assert!(
+        package["setup"]
+            .as_str()
+            .unwrap()
+            .ends_with("-r requirements.txt -e .")
+    );
+    assert!(
+        tools["setup"]
+            .as_str()
+            .unwrap()
+            .ends_with("-r requirements.txt")
+    );
+
+    // Reproduce the old requirements-only candidate on the same tracked code.
+    // The src-layout package cannot be imported until editable setup runs.
+    let old_setup = package["setup"].as_str().unwrap().replace(" -e .", "");
+    let old = call(
+        &exec,
+        "prepare_environment",
+        json!({"revision":"head","setup":format!("cd /workspace/package && {old_setup}")}),
+    )
+    .await;
+    assert_eq!(old["status"], "passed", "{old}");
+    let command = format!(
+        "cd /workspace/package && {}",
+        package["test"].as_str().unwrap()
+    );
+    let missing_package = call(
+        &exec,
+        "run_experiment",
+        json!({"revision":"head","environment":old["id"],"command":command}),
+    )
+    .await;
+    assert_eq!(missing_package["status"], "failed", "{missing_package}");
+    assert!(
+        missing_package["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("No module named 'crow_fixture'"),
+        "{missing_package}"
+    );
+
+    let setup_commands: Vec<_> = projects
+        .iter()
+        .map(|project| {
+            format!(
+                "(cd /workspace/{} && {})",
+                project["directory"].as_str().unwrap(),
+                project["setup"].as_str().unwrap()
+            )
+        })
+        .collect();
+    let setup = call(
+        &exec,
+        "prepare_environment",
+        json!({"revision":"head","setup":setup_commands.join(" && ")}),
+    )
+    .await;
+    assert_eq!(setup["status"], "passed", "{setup}");
+    let test_commands: Vec<_> = projects
+        .iter()
+        .map(|project| {
+            format!(
+                "(cd /workspace/{} && {})",
+                project["directory"].as_str().unwrap(),
+                project["test"].as_str().unwrap()
+            )
+        })
+        .collect();
+    let result = call(
+        &exec,
+        "run_experiment",
+        json!({"revision":"head","environment":setup["id"],"command":test_commands.join(" && ")}),
+    )
+    .await;
+    assert_eq!(result["status"], "passed", "{result}");
+    assert_eq!(
+        result["stdout"]
+            .as_str()
+            .unwrap()
+            .matches("1 passed")
+            .count(),
+        2,
+        "{result}"
+    );
+    println!(
+        "Requirements-only setup reproduced missing src-layout package. Combined discovery installed the package, humanize runtime dependency, and pytest; both package and tool-only project passed offline in separate environments."
     );
 }
 

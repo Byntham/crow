@@ -2,7 +2,11 @@
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    time::Duration,
+};
 use tokio_util::sync::CancellationToken;
 
 pub fn fingerprint(parts: &[&str]) -> String {
@@ -33,6 +37,7 @@ pub async fn discover(source: &Value, revision: &str) -> Result<Value> {
     let mut evidence = Vec::new();
     let mut project_count = 0;
     let mut node_packages = BTreeMap::new();
+    let mut discovered_python = BTreeSet::new();
     // Root manifests and shallow packages should survive discovery limits even
     // when fixture directories contain hundreds of manifests.
     let mut candidates = files.clone();
@@ -60,11 +65,14 @@ pub async fn discover(source: &Value, revision: &str) -> Result<Value> {
             "go.mod" => "go",
             _ => continue,
         };
+        let directory = path.rsplit_once('/').map_or(".", |(d, _)| d);
+        if language == "python" && !discovered_python.insert(directory.to_owned()) {
+            continue;
+        }
         project_count += 1;
         if projects.len() >= 100 {
             continue;
         }
-        let directory = path.rsplit_once('/').map_or(".", |(d, _)| d);
         let has = |file: &str| {
             files.contains(
                 &if directory == "." {
@@ -75,7 +83,23 @@ pub async fn discover(source: &Value, revision: &str) -> Result<Value> {
                 .as_str(),
             )
         };
-        let blob = crate::inspection::read_blob(source, path, Some(commit)).await;
+        let manifests: Vec<String> = if language == "python" {
+            ["pyproject.toml", "setup.py", "requirements.txt"]
+                .into_iter()
+                .filter(|name| has(name))
+                .map(|name| {
+                    if directory == "." {
+                        name.to_owned()
+                    } else {
+                        format!("{directory}/{name}")
+                    }
+                })
+                .collect()
+        } else {
+            vec![(*path).to_owned()]
+        };
+        let manifest = &manifests[0];
+        let blob = crate::inspection::read_blob(source, manifest, Some(commit)).await;
         let mut package_manager = Value::Null;
         let mut warning = Value::Null;
         let mut toolchain_files = Vec::new();
@@ -131,7 +155,25 @@ pub async fn discover(source: &Value, revision: &str) -> Result<Value> {
                 )
             }
             "python" => {
-                let (setup, test) = python_setup(directory, has("requirements.txt"));
+                let installable = if has("pyproject.toml") {
+                    blob.as_deref()
+                        .map_err(|_| "Could not read pyproject.toml.")
+                        .and_then(|text| python_installable(Some(text), has("setup.py")))
+                } else {
+                    python_installable(None, has("setup.py"))
+                };
+                if let Err(note) = installable {
+                    warning = json!(format!(
+                        "{note} Inspect Python packaging metadata before installing the project; only requirements.txt is suggested when present."
+                    ));
+                }
+                let editable = installable.unwrap_or(false);
+                let (setup, test) = python_setup(directory, has("requirements.txt"), editable);
+                if setup.is_empty() && warning.is_null() {
+                    warning = json!(
+                        "No installable Python package or requirements.txt was found. Inspect the tool configuration and CI before choosing setup and test commands."
+                    );
+                }
                 (setup, test, String::new())
             }
             "rust" => {
@@ -154,7 +196,7 @@ pub async fn discover(source: &Value, revision: &str) -> Result<Value> {
             ),
             _ => unreachable!(),
         };
-        projects.push(json!({"directory":directory,"setupDirectory":setup_directory,"manifest":path,"language":language,"setup":setup,"test":tests,"start":start,"packageManager":package_manager,"packageManagerBootstrap":manager_bootstrap,"toolchainFiles":toolchain_files,"warning":warning}));
+        projects.push(json!({"directory":directory,"setupDirectory":setup_directory,"manifest":manifest,"manifests":manifests,"language":language,"setup":setup,"test":tests,"start":start,"packageManager":package_manager,"packageManagerBootstrap":manager_bootstrap,"toolchainFiles":toolchain_files,"warning":warning}));
     }
     evidence.truncate(100);
     Ok(
@@ -347,17 +389,18 @@ fn node_workspace_owner(
     }
 }
 
-fn python_setup(directory: &str, requirements: bool) -> (String, String) {
+fn python_setup(directory: &str, requirements: bool, editable: bool) -> (String, String) {
     // Independent Python projects may require incompatible package versions.
     // Hash the directory so repository filenames never become shell syntax.
     let prefix = format!(
         "/workspace/.crow-tools/python/{}",
         fingerprint(&[directory])
     );
-    let install = if requirements {
-        "-r requirements.txt"
-    } else {
-        "-e ."
+    let install = match (requirements, editable) {
+        (true, true) => "-r requirements.txt -e .",
+        (true, false) => "-r requirements.txt",
+        (false, true) => "-e .",
+        (false, false) => return (String::new(), String::new()),
     };
     let environment = format!("VIRTUAL_ENV={prefix} PATH=\"{prefix}/bin:$PATH\"");
     (
@@ -366,6 +409,52 @@ fn python_setup(directory: &str, requirements: bool) -> (String, String) {
         ),
         format!("{environment} {prefix}/bin/python -m pytest"),
     )
+}
+
+// A pyproject may configure only tools. Require package metadata rather than
+// treating every pyproject as an installable distribution. Discovery does not
+// execute setup.py or build backends; these remain candidates for the reviewer.
+fn python_installable(pyproject: Option<&str>, setup_py: bool) -> Result<bool, &'static str> {
+    let Some(text) = pyproject else {
+        return Ok(setup_py);
+    };
+    let metadata: toml::Value =
+        toml::from_str(text).map_err(|_| "Could not parse pyproject.toml.")?;
+    if setup_py {
+        return Ok(true);
+    }
+    let project = metadata.get("project");
+    let poetry = metadata.get("tool").and_then(|tool| tool.get("poetry"));
+    if poetry
+        .and_then(|value| value.get("package-mode"))
+        .and_then(toml::Value::as_bool)
+        == Some(false)
+    {
+        return Err("Poetry package-mode is disabled.");
+    }
+    let named = |value: &toml::Value| {
+        value
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .is_some_and(|name| !name.trim().is_empty())
+    };
+    let versioned = |value: &toml::Value| {
+        value
+            .get("version")
+            .and_then(toml::Value::as_str)
+            .is_some_and(|version| !version.trim().is_empty())
+            || value
+                .get("dynamic")
+                .and_then(toml::Value::as_array)
+                .is_some_and(|fields| fields.iter().any(|field| field.as_str() == Some("version")))
+    };
+    if project.is_some_and(|value| named(value) && versioned(value)) {
+        return Ok(true);
+    }
+    if project.is_some() || poetry.is_some() || metadata.get("build-system").is_some() {
+        return Err("Python packaging metadata is incomplete or uses an unrecognized layout.");
+    }
+    Ok(false)
 }
 
 fn rust_toolchains(files: &[&str], directory: &str) -> Vec<String> {
@@ -997,8 +1086,8 @@ mod discovery_tests {
 
     #[test]
     fn python_projects_keep_separate_environments_and_safe_nested_paths() {
-        let first = python_setup("services/first", true);
-        let second = python_setup("services/second", false);
+        let first = python_setup("services/first", true, false);
+        let second = python_setup("services/second", false, true);
         assert_ne!(first.1, second.1);
         assert!(first.0.ends_with("-m pip install -r requirements.txt"));
         assert!(second.0.ends_with("-m pip install -e ."));
@@ -1008,7 +1097,7 @@ mod discovery_tests {
             "services/second",
             "$(touch /tmp/injected); project",
         ] {
-            let (setup, test) = python_setup(directory, true);
+            let (setup, test) = python_setup(directory, true, false);
             let prefix = format!(
                 "/workspace/.crow-tools/python/{}",
                 fingerprint(&[directory])
@@ -1024,8 +1113,8 @@ mod discovery_tests {
             assert!(!test.contains("$("));
         }
         assert_eq!(
-            python_setup("services/first", true).1,
-            python_setup("services/first", false).1
+            python_setup("services/first", true, false).1,
+            python_setup("services/first", false, true).1
         );
     }
 
