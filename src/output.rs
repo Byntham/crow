@@ -250,6 +250,15 @@ fn job_rows(out: &mut String, jobs: &[&Value], limit: usize) {
         );
     }
 }
+fn maintenance(out: &mut String, value: &Value) {
+    if value["runtimeMaintenance"]["warningCount"]
+        .as_u64()
+        .unwrap_or(0)
+        > 0
+    {
+        out.push_str("\nRuntime cleanup needs attention. See runtime-maintenance.json in Crow's data directory, or run crow status --format json for details. Crow will retry maintenance automatically.\n\n");
+    }
+}
 fn status(v: &Value) -> String {
     if v.get("jobs").is_none() && v.get("repos").is_none() {
         let mut out = "Crow worker\n".to_owned();
@@ -257,6 +266,7 @@ fn status(v: &Value) -> String {
             let _ = writeln!(out, "\n{}", clean(message));
             return out;
         }
+        maintenance(&mut out, v);
         field(&mut out, "Status", state(&v["state"]));
         field(&mut out, "Service connection", state(&v["connection"]));
         field(&mut out, "Last reported", timestamp(&v["updatedAt"]));
@@ -293,6 +303,7 @@ fn status(v: &Value) -> String {
     let workers = list(&v["workers"]);
     let jobs = list(&v["jobs"]);
     let mut out = "Crow status\n".to_owned();
+    maintenance(&mut out, v);
     field(
         &mut out,
         "Service",
@@ -824,6 +835,21 @@ fn cleanup(v: &Value) -> String {
         } else {
             let _ = writeln!(out, "Removed expired files for {}.", counted(n, "review"));
         }
+    }
+    if v["skipped"] == true {
+        out.push_str(
+            "Another runtime cleanup is running. Its results will appear in crow status.\n",
+        );
+    }
+    if v["cacheBytesRemoved"].is_number() {
+        let _ = writeln!(
+            out,
+            "Runtime cleanup removed {} containers, {} image tags, {} temporary files and {} cached bytes.",
+            list(&v["runtime"]["containers"]).len(),
+            list(&v["runtime"]["images"]).len(),
+            v["runtime"]["temporaryFiles"].as_u64().unwrap_or(0),
+            v["cacheBytesRemoved"]
+        );
     }
     warnings(&mut out, v);
     out

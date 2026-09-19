@@ -31,3 +31,21 @@ These examples show the wording added to Crow's existing main status comment. Co
 | Test sandbox could not start | Finished. Test commands: 1 blocked. |
 
 Updates come from worker receipts over the existing heartbeat and final-report protocol. The service checks the worker's active lease before accepting them. Test coverage verifies live updates while a provider is waiting, setup/test separation, final counters, invalid payload rejection, and protection against late updates overwriting a completed review.
+
+## Failure locations and warnings
+
+The same status line now includes the current step while a command runs:
+
+> **Runtime testing:** Setting up the test environment. Setup attempts: 1 running. Current step: dependency setup command.
+
+A setup failure identifies its location:
+
+> **Runtime testing:** Testing blocked or interrupted during setup. Setup attempts: 1 failed. Failure locations: 1 at dependency setup command. Worker receipts contain the error details.
+
+A successful test with an unavailable screenshot remains a successful command:
+
+> **Runtime testing:** Finished. Test commands: 1 passed. Warnings: 1 at screenshot collection. Worker receipts contain the error details.
+
+Cache restore/save and container cleanup failures also appear as warnings. Public comments include only known stage names and counts. Commands, output and host errors remain in the worker's `reviews/<job-id>/experiments/<experiment-id>.json` receipts. Receipts include the pinned commit, command, exit status, bounded beginning/end of output, stage, failure location and artifact results.
+
+Maintenance failures outside an experiment appear in `crow status` and `crow status --format json`. The data directory's `runtime-maintenance.json` contains the last maintenance result. `crow cleanup` retries maintenance explicitly. Failed cleanup retains ownership records so a later attempt can find the resource.

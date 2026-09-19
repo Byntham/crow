@@ -272,6 +272,22 @@ async fn managed_rust_and_go_dependencies_run_offline() {
     )
     .unwrap();
     std::fs::write(repo.join("probe_test.go"),"package crowprobe\nimport (\"testing\";\"github.com/google/uuid\")\nfunc TestUUID(t *testing.T) { if uuid.Nil.String() != \"00000000-0000-0000-0000-000000000000\" {t.Fatal(\"bad UUID\")} }\n").unwrap();
+    std::fs::write(
+        repo.join("Cargo.lock"),
+        r#"version = 4
+[[package]]
+name = "crow-runtime-probe"
+version = "0.1.0"
+dependencies = ["itoa"]
+[[package]]
+name = "itoa"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
+"#,
+    )
+    .unwrap();
+    std::fs::write(repo.join("go.sum"), "github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=\ngithub.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=\n").unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-m", "toolchains"]);
     let commit = git(&repo, &["rev-parse", "HEAD"]);
@@ -288,11 +304,22 @@ async fn managed_rust_and_go_dependencies_run_offline() {
     assert_eq!(setup["status"], "passed", "{setup}");
     let tested=call(&exec,"run_experiment",json!({"revision":"head","environment":setup["id"],"command":"cargo test --offline && GOPROXY=off go test ./..."})).await;
     assert_eq!(tested["status"], "passed", "{tested}");
+    assert!(setup["cacheSaveError"].is_null(), "{setup}");
+    let second = Execution::from_context(&context, &dir.path().join("next-review"))
+        .unwrap()
+        .unwrap();
+    let reused = call(&second,"prepare_environment",json!({"revision":"head","setup":"test -n \"$(find .crow-home/.cargo/registry/cache -name itoa-1.0.15.crate)\" && test -f .crow-home/go/pkg/mod/cache/download/github.com/google/uuid/@v/v1.6.0.zip && test -f .crow-home/go/pkg/mod/cache/download/github.com/google/uuid/@v/v1.6.0.mod && test ! -e .crow-home/go/pkg/mod/cache/download/github.com/google/uuid/@v/v1.6.0.ziphash && cargo fetch --locked && go mod download all"})).await;
+    assert_eq!(reused["status"], "passed", "{reused}");
+    assert_eq!(reused["packageCacheRestored"], true, "{reused}");
+    assert!(
+        reused["packageCache"]["files"].as_u64().unwrap() >= 3,
+        "{reused}"
+    );
 }
 
 #[tokio::test]
 #[ignore = "requires rootless Podman and the managed Python image"]
-async fn restore_ignores_repository_imports_and_user_site_hooks_and_cache_crosses_checkouts() {
+async fn restore_ignores_repository_imports_and_user_site_hooks_and_workspaces_are_not_shared() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(".crow-data/autonomous-runtime-test");
     std::fs::create_dir_all(&root).unwrap();
     let temp = tempfile::tempdir_in(&root).unwrap();
@@ -359,7 +386,11 @@ PYTHON"#;
         json!({"revision":"head","setup":setup}),
     )
     .await;
-    assert_eq!(cached["cached"], true, "{cached}");
+    assert_eq!(cached["status"], "passed", "{cached}");
+    assert_ne!(
+        cached["cached"], true,
+        "Whole workspaces must not cross review boundaries: {cached}"
+    );
     context["job"]["repo"] = json!("fixture/different-repository");
     let different = Execution::from_context(&context, &temp.path().join("different-experiments"))
         .unwrap()
@@ -380,5 +411,98 @@ PYTHON"#;
         stdout.starts_with("BEGIN")
             && stdout.contains("output omitted")
             && stdout.ends_with("FINAL_FAILURE_DIAGNOSIS\n")
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires rootless Podman and the public npm registry"]
+async fn updated_pr_reuses_verified_downloads_offline_and_releases_finished_workspaces() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(".crow-data/autonomous-runtime-test");
+    std::fs::create_dir_all(&root).unwrap();
+    let temp = tempfile::tempdir_in(&root).unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-b", "main"]);
+    std::fs::write(repo.join("package.json"), r#"{"name":"cache-fixture","version":"1.0.0","private":true,"dependencies":{"is-number":"7.0.0"}}"#).unwrap();
+    std::fs::write(repo.join("package-lock.json"), r#"{"name":"cache-fixture","version":"1.0.0","lockfileVersion":3,"requires":true,"packages":{"":{"name":"cache-fixture","version":"1.0.0","dependencies":{"is-number":"7.0.0"}},"node_modules/is-number":{"version":"7.0.0","resolved":"https://registry.npmjs.org/is-number/-/is-number-7.0.0.tgz","integrity":"sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng=="}}}"#).unwrap();
+    std::fs::write(repo.join("value.txt"), "first commit\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "first revision"]);
+    let first = git(&repo, &["rev-parse", "HEAD"]);
+    let unique = temp
+        .path()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .trim_start_matches('.');
+    let mut context = json!({"root":root,"source":{"dir":repo,"head":first,"base":first},"job":{"id":"first","number":1,"repo":format!("fixture/cache-{unique}"),"settings":{"execution":{"automatic":true,"podman":std::env::var("CROW_TEST_PODMAN").unwrap_or("podman".into())}}}});
+    let first_dir = temp.path().join("reviews/first/experiments");
+    let exec = Execution::from_context(&context, &first_dir)
+        .unwrap()
+        .unwrap();
+    let initial = call(&exec,"prepare_environment",json!({"revision":"head","setup":"npm ci --no-audit --no-fund && printf 'must not be shared' > generated-output.txt"})).await;
+    assert_eq!(initial["status"], "passed", "{initial}");
+    assert!(initial["cacheSaveError"].is_null(), "{initial}");
+    assert_ne!(initial["packageCacheRestored"], true, "{initial}");
+    std::fs::write(repo.join("value.txt"), "updated commit\n").unwrap();
+    git(
+        &repo,
+        &["commit", "-am", "update source without dependency changes"],
+    );
+    let second = git(&repo, &["rev-parse", "HEAD"]);
+    context["source"]["head"] = json!(second);
+    context["job"]["id"] = json!("second");
+    let second_dir = temp.path().join("reviews/second/experiments");
+    let next = Execution::from_context(&context, &second_dir)
+        .unwrap()
+        .unwrap();
+    let offline = call(&next,"prepare_environment",json!({"revision":"head","setup":"test ! -e generated-output.txt && test ! -d node_modules && test \"$(cat value.txt)\" = 'updated commit' && npm ci --offline --no-audit --no-fund"})).await;
+    assert_eq!(offline["status"], "passed", "{offline}");
+    assert_eq!(offline["packageCacheRestored"], true, "{offline}");
+    assert!(offline["packageCache"]["bytes"].as_u64().unwrap() > 0);
+    let tested=call(&next,"run_experiment",json!({"revision":"head","environment":offline["id"],"command":"node -e \"if(!require('is-number')('42'))process.exit(1)\" && test \"$(cat value.txt)\" = 'updated commit'"})).await;
+    assert_eq!(tested["status"], "passed", "{tested}");
+    let cache_path = root.join("runtime-cache/packages").join(format!(
+        "{}.tar",
+        offline["packageCacheKey"].as_str().unwrap()
+    ));
+    std::fs::write(&cache_path, b"corrupted archive").unwrap();
+    let fresh = Execution::from_context(&context, &temp.path().join("reviews/third/experiments"))
+        .unwrap()
+        .unwrap();
+    let repaired = call(
+        &fresh,
+        "prepare_environment",
+        json!({"revision":"head","setup":"npm ci --no-audit --no-fund"}),
+    )
+    .await;
+    assert_eq!(repaired["status"], "passed", "{repaired}");
+    assert!(
+        repaired["cacheRestoreError"].is_string(),
+        "Corrupt cache must be visible without blocking fresh setup: {repaired}"
+    );
+    let cleanup = crow::retention::cleanup(
+        temp.path(),
+        &json!({"retentionDays":7}),
+        &[
+            json!({"id":"first","state":"completed","updatedAt":crow::util::now()}),
+            json!({"id":"second","state":"paused","updatedAt":crow::util::now()}),
+        ],
+    )
+    .unwrap();
+    assert!(
+        cleanup["warnings"].as_array().unwrap().is_empty(),
+        "{cleanup}"
+    );
+    assert!(!first_dir.join("environments").exists());
+    assert!(
+        first_dir
+            .join(format!("{}.json", initial["id"].as_str().unwrap()))
+            .exists()
+    );
+    assert!(second_dir.join("environments").exists());
+    println!(
+        "Updated source installed dependencies with npm offline, retained no generated workspace files, and terminal cleanup preserved receipts plus paused work."
     );
 }

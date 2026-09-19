@@ -26,7 +26,7 @@ An entry without `image` uses `"image":"auto"`. Existing entries specifying a lo
 
 ## What Crow does
 
-The reviewer discovers manifests and relevant CI/documentation, then selects setup commands. Discovery offers candidates for Node, Python, Rust and Go projects, including nested projects. These candidates are not promises that a particular command is correct. The reviewer inspects the project and adapts them.
+The reviewer discovers manifests and relevant CI/documentation, then selects setup commands. Discovery offers candidates for Node, Python, Rust and Go projects, including nested projects. These candidates are not promises that a particular command is correct. The reviewer inspects the project and adapts them. Discovery prioritizes root and shallow manifests, reports omitted projects in very large repositories, and honors exact npm/pnpm/Yarn versions declared by `packageManager`, including modern Yarn.
 
 `prepare_environment` runs installation in a fresh sandbox at a pinned revision. It saves the resulting workspace only after successful preparation. Dependencies and caches must stay under `/workspace`; `HOME` is `/workspace/.crow-home`. Environment variables exported in one setup shell do not persist into later test shells, so test commands must activate a virtual environment or use explicit tool paths when needed.
 
@@ -36,7 +36,19 @@ The package hosts currently cover npm/Yarn, PyPI, crates.io, the Go module proxy
 
 `run_experiment` restores the selected prepared workspace into a fresh, offline container. It verifies that the environment belongs to the exact requested commit and current image, then restores tracked source from that commit over the dependency snapshot. Setup hooks cannot silently replace the tracked source under test. The download socket is absent. Crow can run existing tests, write temporary reproductions, start services and exercise them through loopback. It compares equivalent experiments on base and head before attributing failures to the change.
 
-Successful preparations are reused when the repository identity, exact commit, image and setup command match. A new commit always invalidates that snapshot. This also permits reuse across reviews when one PR's head becomes a later comparison base. Shared snapshots are pruned by age and an approximately 4 GiB size cap; each snapshot is limited to 512 MiB. Cache entries are archived with owner-write permission so unprivileged restoration can populate read-only module directories. Original tracked-file permissions are restored from Git before testing. Crow never extracts archives on the host. The cache is an optimization, not evidence that an application passed tests.
+Identical preparations can be reused within the same review, at the same commit and image. These full workspace snapshots are not shared across reviews. Their tracked source is restored from Git before each test. Crow never extracts repository or cache archives on the host.
+
+## Dependency reuse and cleanup
+
+Across PR updates, Crow can reuse verified package downloads while installing the new revision into a fresh workspace. The download cache supports npm SHA-512 content blobs, Cargo archives pinned by `Cargo.lock`, and Go archives/module files pinned by `go.sum`. It excludes registry metadata, extracted dependency source, generated application files, and build outputs. Python and Yarn/pnpm-specific stores are not shared; those environments still work, but may download again. Cache selection uses pinned manifests and lockfiles, repository, PR, base/head side, and toolchain image. Changes to dependencies invalidate the entry. Repositories that track `.crow-home` skip this optimization.
+
+A cache failure is a warning and preparation falls back to normal installation. Imports verify each package again and reserve workspace capacity for source and installation. The download cache has a 4 GiB storage allowance shared by reviews, with entries expiring after seven days without use. Reads refresh their access time; inserts and pruning are serialized. Periodic maintenance runs even when no new test is starting. Old full-workspace cache entries are removed during migration.
+
+Containers, services, browsers and temporary workspaces are removed after each experiment. After Crow saves and submits a valid report, it releases that review's prepared workspace snapshots. Completed, superseded and cancelled jobs also release snapshots during maintenance. Paused and active reviews retain them for resumption. Receipts, logs and screenshots follow the normal configurable seven-day review retention.
+
+Maintenance runs at worker startup, hourly, and after reviews finish. It retries stopped-container cleanup, removes owned temporary files left by crashes, and prunes old Crow-managed image tags after seven unused days. Current images, images needed by resumable reviews, and explicitly configured image IDs remain protected. Cleanup touches only resources recorded by this Crow installation; it never runs a global Podman prune. Unregistered images from older Crow versions are left alone because ownership cannot be proved. PR closure follows the normal cancellation/terminal cleanup path, so storage cleanup does not depend on a PR eventually merging.
+
+When cleanup fails, Crow retains the ownership receipts needed to retry instead of forgetting the leftover resources. `crow status` flags maintenance warnings; `crow status --format json` includes the details. `runtime-maintenance.json` in the data directory records the last cleanup result, and `crow cleanup` runs maintenance explicitly.
 
 ## Status in the main comment
 
@@ -58,6 +70,8 @@ Artifacts and receipts remain in the worker's review directory and follow normal
 
 Existing experiment limits still apply. Defaults are 120 seconds per setup/test command, 1 GiB of RAM, 512 MiB for each writable filesystem, two CPUs, 128 PIDs, and 12 attempts per review. Existing overrides still work; no new budget configuration is needed. First-time toolchain provisioning has a separate internal 30-minute ceiling and remains subject to review cancellation and the existing review timeout. It is recorded separately as `provisionMs` so a cold image build does not consume the command's runtime deadline.
 
+Execution receipts record the current stage and where failures occurred, such as runtime availability, image preparation, source restoration, setup commands, test commands, exports, or cleanup. The main comment and final receipt table show stage names and warnings. Detailed bounded errors and command logs stay in `reviews/<job-id>/experiments/<experiment-id>.json` on the worker; they are not copied into public status comments. Successful commands remain successful if optional cache saving or screenshot collection fails, with those failures reported separately.
+
 Captured output retains a bounded beginning and end with an omission marker, so lengthy logs retain their final diagnostics.
 
 Every attempted setup or experiment counts toward the existing attempt limit, including cache hits and failures. Discovery and reading saved evidence do not. The main reviewer executes serially; delegated reviewers remain inspection-only. Resumes retain receipts and successful preparations.
@@ -65,6 +79,8 @@ Every attempted setup or experiment counts toward the existing attempt limit, in
 Reports distinguish setup from test commands. Passing dependency installation does not mean tests passed. An environment failure, timeout, pre-existing test failure or missing screenshot must not be reported as proof of a PR regression. If Crow cannot repair the setup, it continues inspection and explains the concrete gap in runtime coverage.
 
 Source and dependency code run only in rootless containers with no host workspace mounts, host credentials, Linux capabilities or privilege escalation. The root filesystem is read-only. During setup, the sole host mount contains the restricted download socket; tests have no host mounts. Memory, CPU, process count, scratch space, output and time are bounded. Crow verifies resource limits before extracting source. Cancellation stops the container; interrupted work is recovered on resume. Rootless containers share the host kernel, so workers reviewing hostile code should run on dedicated machines or VMs.
+
+The image includes PostgreSQL client/server tools, but its current container user and dropped privileges prevent ordinary `initdb` server initialization. Their presence does not imply PostgreSQL-backed applications can be started.
 
 Linux workloads are the first backend. Native macOS/Windows applications, GPUs, devices, private dependencies and authenticated external services can block runtime investigation. Source archives do not materialize Git metadata, submodules or LFS objects, and are limited to the configured workspace size, capped at 512 MiB. Crow reports those limits rather than treating untested behavior as verified.
 

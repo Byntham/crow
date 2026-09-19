@@ -179,6 +179,7 @@ async fn real_mcp_regression_isolation_deadline_recovery_and_publication() {
         .await;
     assert_eq!(after["status"], "failed", "{after}");
     assert_eq!(after["exitCode"], 1);
+    assert_eq!(after["failureStage"], "test_command");
     assert_eq!(after["commit"], head);
     let command = format!(
         r#"set -eu
@@ -233,6 +234,7 @@ exit 1
         )
         .await;
     assert_eq!(timeout["status"], "timed_out", "{timeout}");
+    assert_eq!(timeout["failureStage"], "test_command");
     assert!(timeout["stdout"].as_str().unwrap().contains("starting"));
     let missing = mcp
         .call(
@@ -241,6 +243,7 @@ exit 1
         )
         .await;
     assert_eq!(missing["status"], "error", "{missing}");
+    assert_eq!(missing["failureStage"], "test_command");
     mcp.close().await;
     let mut mcp = Mcp::new(&source, &context);
     let saved = mcp.call("list_experiments", json!({})).await;

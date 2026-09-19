@@ -1,4 +1,5 @@
 //! Operator-authorized experiments in disposable rootless Podman containers.
+use crate::runtime_diagnostics::{Stage, Trace, bounded_error};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -156,6 +157,7 @@ pub struct Execution {
     env: BTreeMap<String, String>,
     cache: PathBuf,
     repository: String,
+    cache_scope: String,
 }
 fn environment() -> BTreeMap<String, String> {
     // Podman needs the user's runtime directory and session bus for cgroups.
@@ -180,6 +182,9 @@ impl Execution {
                 .unwrap_or_else(|| dir.to_owned())
                 .join("runtime-cache"),
             repository: crate::util::repo_name(repo)?,
+            cache_scope: context["job"]["number"]
+                .as_u64()
+                .map_or_else(|| "local".to_owned(), |number| format!("pr:{number}")),
             executable: cfg.podman,
             policy,
             source: context["source"].clone(),
@@ -277,12 +282,15 @@ impl Execution {
         let id = crate::util::id();
         let name = format!("crow-experiment-{id}");
         let path = self.dir.join(format!("{id}.json"));
-        let mut record = json!({"id":id,"revision":key,"commit":commit,"image":self.policy.image,"command":script,"phase":if prepare {"setup"} else {"test"},"environment":environment,"limits":self.policy,"status":"running","startedAt":chrono::Utc::now().to_rfc3339(),"exitCode":null});
+        let mut record = json!({"id":id,"revision":key,"commit":commit,"image":self.policy.image,"command":script,"phase":if prepare {"setup"} else {"test"},"environment":environment,"limits":self.policy,"status":"running","startedAt":chrono::Utc::now().to_rfc3339(),"exitCode":null,"containerStarted":false});
         crate::util::atomic(&path, &record)?;
+        let trace = Trace::new(&path);
         let start = Instant::now();
         let provision = async {
+            trace.set(Stage::RuntimeCheck)?;
             check_runtime(&self.executable, &self.env).await?;
             let image = if self.policy.image == "auto" {
+                trace.set(Stage::ImageProvision)?;
                 crate::runtime::image(
                     &self.executable,
                     &self.env,
@@ -313,31 +321,60 @@ impl Execution {
             name: name.clone(),
             env: self.env.clone(),
             armed: true,
+            started: trace.container_started(),
         };
         let live = LiveOutput::default();
+        let completed = std::sync::Mutex::new(None::<Value>);
         let operation = async {
             let image = image?;
             record["image"] = json!(image);
-            let cache_key = crate::runtime::fingerprint(&[
-                &self.repository,
-                commit,
-                &image,
-                script,
-                "isolated-restore-v2",
-            ]);
-            let cached = self.cache.join(format!("{cache_key}.tar"));
             crate::util::private_dir(&self.dir.join("environments"))?;
             let snapshot = self.dir.join("environments").join(format!("{id}.tar"));
-            if prepare && cached.is_file() {
-                ensure!(
-                    std::fs::metadata(&cached)?.len() <= SNAPSHOT_LIMIT,
-                    "Cached environment too large"
-                );
-                std::fs::copy(&cached, &snapshot)?;
-                return Ok::<_, anyhow::Error>(
-                    json!({"status":"passed","exitCode":0,"cached":true,"stdout":"Restored an identical successful preparation.","stderr":"","outputTruncated":false}),
-                );
+            // Whole prepared workspaces are reusable only within this review.
+            // Hard links avoid another 512 MiB copy for identical preparation attempts.
+            if prepare {
+                for previous in self.records()? {
+                    if previous["phase"] != "setup"
+                        || previous["status"] != "passed"
+                        || previous["commit"] != commit
+                        || previous["image"] != image
+                        || previous["command"] != script
+                    {
+                        continue;
+                    }
+                    let Some(previous_id) = previous["id"].as_str() else {
+                        continue;
+                    };
+                    if let Ok((existing, _)) = self.prepared(previous_id, commit) {
+                        trace.set(Stage::CacheRestore)?;
+                        if std::fs::hard_link(&existing, &snapshot).is_err() {
+                            std::fs::copy(existing, &snapshot)?;
+                        }
+                        return Ok::<_, anyhow::Error>(
+                            json!({"status":"passed","exitCode":0,"cached":true,"stdout":"Reused an identical preparation from this review.","stderr":"","outputTruncated":false}),
+                        );
+                    }
+                }
             }
+            let package_plan = if prepare {
+                match crate::runtime_cache::plan(
+                    &self.source,
+                    key,
+                    &self.repository,
+                    &self.cache_scope,
+                    &image,
+                )
+                .await
+                {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        record["cacheRestoreError"] = json!(bounded_error(error));
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             let output = self
                 .run(
                     &name,
@@ -353,24 +390,49 @@ impl Execution {
                     &artifacts,
                     &id,
                     &live,
+                    &trace,
+                    package_plan.as_ref(),
+                    &completed,
                 )
                 .await?;
-            if prepare && output["status"] == "passed" {
-                crate::util::private_dir(&self.cache)?;
-                prune_cache(&self.cache)?;
-                let temporary = tempfile::NamedTempFile::new_in(&self.cache)?;
-                std::fs::copy(&snapshot, temporary.path())?;
-                temporary.persist(cached)?;
-            }
             Ok(output)
         };
-        let result = tokio::select! {
+        let mut result = tokio::select! {
             _ = cancel.cancelled() => Ok(json!({"status":"interrupted","exitCode":null})),
             _ = tokio::time::sleep(Duration::from_secs(self.policy.timeout_seconds)) => Ok(json!({"status":"timed_out","exitCode":null})),
             result = operation => result,
         };
+        if let Ok(interrupted) = &result
+            && matches!(
+                interrupted["status"].as_str(),
+                Some("timed_out" | "interrupted")
+            )
+            && let Some(mut finished) = completed.lock().unwrap().take()
+        {
+            let last = crate::util::read_json(&path)?.unwrap_or_default();
+            if last["stage"] == "cache_save" {
+                finished["cacheSaveError"] = json!(
+                    "Optional dependency cache save did not finish before the experiment stopped."
+                );
+                result = Ok(finished);
+            } else if last["stage"] == "artifact_collection" {
+                let mut saved = finished["artifacts"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                for path in artifacts.iter().skip(saved.len()) {
+                    saved.push(json!({"path":path,"saved":false,"error":"Screenshot collection did not finish before the experiment stopped."}));
+                }
+                finished["artifacts"] = json!(saved);
+                result = Ok(finished);
+            }
+        }
         // Cleanup is awaited even on cancellation. An armed guard covers dropped futures.
-        let cleanup = remove_container(&self.executable, &name, &self.env).await;
+        let cleanup = if trace.started() {
+            remove_container(&self.executable, &name, &self.env).await
+        } else {
+            Ok(())
+        };
         guard.armed = cleanup.is_err();
         match result {
             Ok(output) => {
@@ -384,7 +446,7 @@ impl Execution {
                 } else {
                     "error"
                 });
-                record["error"] = json!(format!("{error:#}"));
+                record["error"] = json!(bounded_error(format!("{error:#}")));
             }
         }
         if record.get("stdout").is_none() {
@@ -393,8 +455,12 @@ impl Execution {
             }
         }
         if let Err(error) = cleanup {
-            record["cleanupError"] = json!(error.to_string());
+            record["cleanupError"] = json!(bounded_error(error));
         }
+        if prepare && record["status"] != "passed" {
+            let _ = std::fs::remove_file(self.dir.join("environments").join(format!("{id}.tar")));
+        }
+        trace.finish(&mut record);
         record["durationMs"] = json!(start.elapsed().as_millis() as u64);
         crate::util::atomic(&path, &record)?;
         Ok(record)
@@ -457,13 +523,19 @@ impl Execution {
                 .as_str()
                 .filter(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
                 .context("Invalid experiment ID")?;
-            remove_container(
-                &self.executable,
-                &format!("crow-experiment-{id}"),
-                &self.env,
-            )
-            .await?;
+            // Old receipts lack this flag, so retain their conservative cleanup.
+            if record["containerStarted"] != false {
+                remove_container(
+                    &self.executable,
+                    &format!("crow-experiment-{id}"),
+                    &self.env,
+                )
+                .await?;
+            }
             record["status"] = json!("interrupted");
+            if let Some(stage) = record.get("stage").cloned() {
+                record["failureStage"] = stage;
+            }
             crate::util::atomic(&entry.path(), &record)?;
         }
         Ok(())
@@ -480,8 +552,14 @@ impl Execution {
         artifacts: &[String],
         id: &str,
         live: &LiveOutput,
+        trace: &Trace,
+        package_plan: Option<&crate::runtime_cache::Plan>,
+        completed: &std::sync::Mutex<Option<Value>>,
     ) -> Result<Value> {
-        let archive = tempfile::NamedTempFile::new_in(&self.dir)?;
+        trace.set(Stage::SourceArchive)?;
+        let archive = tempfile::Builder::new()
+            .prefix(".crow-runtime-")
+            .tempfile_in(&self.dir)?;
         if let Some(prepared) = prepared {
             std::fs::copy(prepared, archive.path())?;
         } else {
@@ -496,7 +574,8 @@ impl Execution {
         }
         let p = &self.policy;
         let gateway = if snapshot.is_some() {
-            Some(crate::downloads::Gateway::start()?)
+            trace.set(Stage::GatewayStart)?;
+            Some(crate::downloads::Gateway::start_in(&self.dir)?)
         } else {
             None
         };
@@ -548,6 +627,7 @@ impl Execution {
             "-c".into(),
             format!("exec sleep {}", p.timeout_seconds + 5),
         ]);
+        trace.set(Stage::ContainerStart)?;
         crate::process::run(
             &self.executable,
             &args,
@@ -569,6 +649,89 @@ impl Execution {
             p.pids,
             p.cpus
         );
+        let mut cache_info = json!({});
+        if let Some(plan) = package_plan {
+            cache_info["packageCacheKey"] = json!(plan.key);
+            trace.set(Stage::CacheRestore)?;
+            let checked = self
+                .command(
+                    &[
+                        "exec",
+                        name,
+                        "/bin/sh",
+                        "-c",
+                        limits.rsplit_once(';').unwrap().0,
+                    ],
+                    None,
+                    None,
+                )
+                .await?;
+            ensure!(
+                checked["status"] == "passed",
+                "Cannot enforce resource limits: {checked}"
+            );
+            let packages = tempfile::Builder::new()
+                .prefix(".crow-runtime-packages-")
+                .tempfile_in(&self.dir)?;
+            let root = self.cache.clone();
+            let key = plan.key.clone();
+            let (packages, loaded) = tokio::task::spawn_blocking(move || {
+                let loaded = crate::runtime_cache::load(&root, &key, packages.path());
+                (packages, loaded)
+            })
+            .await?;
+            match loaded {
+                Ok(true) => {
+                    let pins = plan.pins.to_string();
+                    let workspace_bytes = self.policy.workspace_mi_b * 1024 * 1024;
+                    let import_budget = workspace_bytes
+                        .saturating_sub(archive.as_file().metadata()?.len())
+                        .saturating_sub(workspace_bytes / 4)
+                        .min(workspace_bytes / 4)
+                        .min(128 * 1024 * 1024)
+                        .to_string();
+                    let imported = self
+                        .command(
+                            &[
+                                "exec",
+                                "--interactive",
+                                name,
+                                "python3",
+                                "-I",
+                                "-c",
+                                include_str!("runtime/packages.py"),
+                                "import",
+                                &pins,
+                                "/workspace",
+                                &import_budget,
+                            ],
+                            Some(packages.path()),
+                            None,
+                        )
+                        .await;
+                    match imported {
+                        Ok(result) if result["status"] == "passed" => {
+                            let stats: Value =
+                                serde_json::from_str(result["stdout"].as_str().unwrap_or("{}"))?;
+                            cache_info["packageCacheRestored"] =
+                                json!(stats["files"].as_u64().unwrap_or(0) > 0);
+                            cache_info["packageCache"] = stats;
+                        }
+                        Ok(result) => {
+                            cache_info["cacheRestoreError"] = json!(bounded_error(result))
+                        }
+                        Err(error) => cache_info["cacheRestoreError"] = json!(bounded_error(error)),
+                    }
+                }
+                Ok(false) => {
+                    cache_info["packageCacheRestored"] = json!(false);
+                }
+                Err(error) => {
+                    cache_info["cacheRestoreError"] = json!(bounded_error(error));
+                }
+            }
+        }
+        trace.set(Stage::WorkspaceRestore)?;
         let extracted = self
             .command(
                 &["exec", "--interactive", name, "/bin/sh", "-c", &limits],
@@ -583,7 +746,10 @@ impl Execution {
         // Installation hooks may edit tracked files. Always restore pinned source
         // over a dependency snapshot before testing; never silently test those edits.
         if prepared.is_some() {
-            let source_archive = tempfile::NamedTempFile::new_in(&self.dir)?;
+            trace.set(Stage::SourceRestore)?;
+            let source_archive = tempfile::Builder::new()
+                .prefix(".crow-runtime-")
+                .tempfile_in(&self.dir)?;
             crate::inspection::execution_archive(
                 &self.source,
                 revision,
@@ -614,7 +780,7 @@ impl Execution {
         }
         let command = if gateway.is_some() {
             format!(
-                "python3 -I /opt/crow/proxy.py >/tmp/crow-proxy.log 2>&1 &\nproxy=$!\ntrap 'kill $proxy 2>/dev/null || true' EXIT\nexport HTTPS_PROXY=http://127.0.0.1:3128 HTTP_PROXY=http://127.0.0.1:3128 https_proxy=http://127.0.0.1:3128 http_proxy=http://127.0.0.1:3128 NO_PROXY=127.0.0.1,localhost\nexport PIP_INDEX_URL=https://pypi.org/simple\nmkdir -p \"$HOME\"\npython3 -I -c 'import socket,time
+                "command -v python3 >/dev/null && [ -r /opt/crow/proxy.py ] || {{ echo 'Crow setup requires python3 and /opt/crow/proxy.py in the execution image' >&2; exit 125; }}\npython3 -I /opt/crow/proxy.py >/tmp/crow-proxy.log 2>&1 &\nproxy=$!\ntrap 'kill $proxy 2>/dev/null || true' EXIT\nexport HTTPS_PROXY=http://127.0.0.1:3128 HTTP_PROXY=http://127.0.0.1:3128 https_proxy=http://127.0.0.1:3128 http_proxy=http://127.0.0.1:3128 NO_PROXY=127.0.0.1,localhost\nexport PIP_INDEX_URL=https://pypi.org/simple\nmkdir -p \"$HOME\"\npython3 -I -c 'import socket,time
 for attempt in range(100):
  try:
   socket.create_connection((\"127.0.0.1\",3128),timeout=.1).close(); break
@@ -625,15 +791,25 @@ else: raise SystemExit(\"Crow dependency proxy did not start\")' || {{ cat /tmp/
         } else {
             script.to_owned()
         };
+        let command_stage = if snapshot.is_some() {
+            Stage::SetupCommand
+        } else {
+            Stage::TestCommand
+        };
+        trace.set(command_stage)?;
         let mut output = self
             .command(&["exec", name, "/bin/sh", "-c", &command], None, Some(live))
             .await?;
+        if output["status"] != "passed" {
+            output["failureStage"] = json!(command_stage);
+        }
         if let Some(gateway) = gateway {
             gateway.close().await;
         }
         if let Some(snapshot) = snapshot
             && output["status"] == "passed"
         {
+            trace.set(Stage::SnapshotExport)?;
             // UID 0 has no DAC override capability here. Archive owner-writable
             // cache entries so tar can populate Go's read-only module directories.
             // Pinned tracked-file permissions are restored before each experiment.
@@ -654,11 +830,59 @@ else: raise SystemExit(\"Crow dependency proxy did not start\")' || {{ cat /tmp/
             )
             .await?;
         }
+        // Once a command and its required snapshot finish, optional cache/artifact
+        // work must not relabel the actual command outcome if the deadline fires.
+        for (key, value) in cache_info.as_object().unwrap() {
+            output[key] = value.clone();
+        }
+        *completed.lock().unwrap() = Some(output.clone());
+        if let Some(plan) = package_plan
+            && output["status"] == "passed"
+        {
+            trace.set(Stage::CacheSave)?;
+            let save = async {
+                let packages = tempfile::Builder::new()
+                    .prefix(".crow-runtime-packages-")
+                    .tempfile_in(&self.dir)?;
+                let pins = plan.pins.to_string();
+                self.export(
+                    &[
+                        "exec",
+                        name,
+                        "python3",
+                        "-I",
+                        "-c",
+                        include_str!("runtime/packages.py"),
+                        "export",
+                        &pins,
+                    ],
+                    packages.path(),
+                    crate::runtime_cache::ARCHIVE_LIMIT,
+                )
+                .await?;
+                let root = self.cache.clone();
+                let key = plan.key.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::runtime_cache::save(&root, &key, packages.path())
+                })
+                .await??;
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            if let Err(error) = save {
+                cache_info["cacheSaveError"] = json!(bounded_error(error));
+            }
+        }
+        for (key, value) in cache_info.as_object().unwrap() {
+            output[key] = value.clone();
+        }
+        *completed.lock().unwrap() = Some(output.clone());
         let mut saved = Vec::new();
         for (index, path) in artifacts.iter().enumerate() {
-            crate::util::private_dir(&self.dir.join("artifacts"))?;
+            trace.set(Stage::ArtifactCollection)?;
             let target = self.dir.join("artifacts").join(format!("{id}-{index}.png"));
             let result = async {
+                crate::util::private_dir(&self.dir.join("artifacts"))?;
                 self.export(
                     &["exec", name, "cat", "--", path],
                     &target,
@@ -675,9 +899,11 @@ else: raise SystemExit(\"Crow dependency proxy did not start\")' || {{ cat /tmp/
                     .push(json!({"path":path,"saved":true,"bytes":size,"mimeType":"image/png"})),
                 Err(e) => {
                     let _ = std::fs::remove_file(&target);
-                    saved.push(json!({"path":path,"saved":false,"error":e.to_string()}));
+                    saved.push(json!({"path":path,"saved":false,"error":bounded_error(e)}));
                 }
             }
+            output["artifacts"] = json!(saved);
+            *completed.lock().unwrap() = Some(output.clone());
         }
         output["artifacts"] = json!(saved);
         Ok(output)
@@ -722,24 +948,40 @@ else: raise SystemExit(\"Crow dependency proxy did not start\")' || {{ cat /tmp/
         Ok(result)
     }
     async fn export(&self, args: &[&str], target: &Path, limit: u64) -> Result<()> {
-        let temporary =
-            tempfile::NamedTempFile::new_in(target.parent().context("Missing export directory")?)?;
+        let temporary = tempfile::Builder::new()
+            .prefix(".crow-runtime-")
+            .tempfile_in(target.parent().context("Missing export directory")?)?;
         let mut child = Command::new(&self.executable)
             .args(args)
             .env_clear()
             .envs(&self.env)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
+        let stderr = child.stderr.take().unwrap();
+        let captured = std::sync::Mutex::new(Captured::default());
         let mut output = child.stdout.take().unwrap().take(limit + 1);
         let mut file = tokio::fs::File::create(temporary.path()).await?;
-        let size = tokio::io::copy(&mut output, &mut file).await?;
-        ensure!(size <= limit, "Export exceeds {limit} bytes");
+        let copy = async {
+            let size = tokio::io::copy(&mut output, &mut file).await?;
+            ensure!(size <= limit, "Export exceeds {limit} bytes");
+            Ok::<_, anyhow::Error>(())
+        };
+        let (_, _, status) = tokio::try_join!(
+            copy,
+            async {
+                capture_shared(stderr, &captured)
+                    .await
+                    .map_err(anyhow::Error::from)
+            },
+            async { child.wait().await.map_err(anyhow::Error::from) }
+        )?;
         ensure!(
-            child.wait().await?.success(),
-            "Could not export container file"
+            status.success(),
+            "Could not export container file: {}",
+            captured.lock().unwrap().text()
         );
         drop(file);
         temporary.persist(target)?;
@@ -788,27 +1030,6 @@ fn validate_png(bytes: &[u8]) -> Result<()> {
 }
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\"'\"'"))
-}
-fn prune_cache(dir: &Path) -> Result<()> {
-    let mut files = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        if entry.path().extension().is_some_and(|e| e == "tar") {
-            let meta = entry.metadata()?;
-            files.push((meta.modified()?, meta.len(), entry.path()));
-        }
-    }
-    files.sort_by_key(|(time, _, _)| *time);
-    let mut bytes: u64 = files.iter().map(|(_, len, _)| len).sum();
-    for (time, len, path) in files {
-        if (bytes > 4 * 1024 * 1024 * 1024 - SNAPSHOT_LIMIT
-            || time.elapsed().unwrap_or_default() > Duration::from_secs(7 * 86400))
-            && std::fs::remove_file(path).is_ok()
-        {
-            bytes -= len;
-        }
-    }
-    Ok(())
 }
 
 #[derive(Clone, Default)]
@@ -930,10 +1151,11 @@ struct ContainerGuard {
     name: String,
     env: BTreeMap<String, String>,
     armed: bool,
+    started: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 impl Drop for ContainerGuard {
     fn drop(&mut self) {
-        if self.armed {
+        if self.armed && self.started.load(std::sync::atomic::Ordering::Relaxed) {
             // Best effort for a dropped future; the runtime deadline also applies
             // if Crow is killed before it can request removal.
             let mut command = std::process::Command::new(&self.executable);
@@ -995,8 +1217,18 @@ pub fn append_summary(report: &mut Value, dir: &Path) -> Result<()> {
             .replace('>', "&gt;")
             .replace('|', "&#124;")
             .replace('`', "&#96;");
+        let warnings = crate::runtime_diagnostics::warnings(&record);
+        let warning_text = if warnings.is_empty() {
+            "none".to_owned()
+        } else {
+            warnings
+                .keys()
+                .map(|stage| stage.label())
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
         rows.push(format!(
-            "| `{}` | {} {} | {} | <code>{}</code> |",
+            "| `{}` | {} {} | {} | {} | {} | <code>{}</code> |",
             record["commit"]
                 .as_str()
                 .unwrap_or("")
@@ -1005,6 +1237,11 @@ pub fn append_summary(report: &mut Value, dir: &Path) -> Result<()> {
                 .collect::<String>(),
             record["phase"].as_str().unwrap_or("test"),
             status,
+            serde_json::from_value::<Stage>(record["failureStage"].clone())
+                .ok()
+                .map(Stage::label)
+                .unwrap_or("none"),
+            warning_text,
             record["exitCode"]
                 .as_i64()
                 .map_or("none".into(), |c| c.to_string()),
@@ -1026,12 +1263,19 @@ pub fn append_summary(report: &mut Value, dir: &Path) -> Result<()> {
         .map(|(status, count)| format!("{count} {status}"))
         .collect::<Vec<_>>()
         .join(", ");
-    report["summary"] = json!(format!(
-        "{}\n\n### Runtime experiments\n\nIsolated setup and offline tests. {counts}. Showing {} of {total} experiments. Outcomes include setup attempts; passing setup does not verify application behavior. Results describe these commands only; failures may reflect environment limits. Full receipts are retained on the worker.\n\n| Commit | Result | Exit | Command excerpt |\n| --- | --- | --- | --- |\n{}",
-        report["summary"].as_str().unwrap_or(""),
-        rows.len(),
-        rows.join("\n")
-    ));
+    let summary = loop {
+        let rendered = format!(
+            "{}\n\n### Runtime experiments\n\nIsolated setup and offline tests. {counts}. Showing {} of {total} experiments. Outcomes include setup attempts; passing setup does not verify application behavior. Results describe these commands only; failures may reflect environment limits. Full receipts are retained on the worker.\n\n| Commit | Result | Failure location | Warnings | Exit | Command excerpt |\n| --- | --- | --- | --- | --- | --- |\n{}",
+            report["summary"].as_str().unwrap_or(""),
+            rows.len(),
+            rows.join("\n")
+        );
+        if rendered.encode_utf16().count() <= 16000 || rows.is_empty() {
+            break rendered;
+        }
+        rows.pop();
+    };
+    report["summary"] = json!(summary);
     Ok(())
 }
 
@@ -1173,6 +1417,29 @@ mod tests {
         let summary = report["summary"].as_str().unwrap();
         assert!(summary.contains("50 failed") && summary.contains("Showing 12 of 50"));
         assert!(summary.contains("&#124;"));
+    }
+
+    #[test]
+    fn receipt_warnings_are_visible_bounded_and_exclude_private_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in 0..50 {
+            crate::util::atomic(&dir.path().join(format!("{n}.json")), &json!({
+                "commit":"a".repeat(40), "phase":"setup", "status":"passed", "exitCode":0,
+                "command":"|".repeat(16000), "cleanupError":"private cleanup detail",
+                "cacheRestoreError":"private cache detail", "cacheSaveError":"private cache detail",
+                "artifacts":[{"saved":false,"error":"private artifact detail"}]
+            })).unwrap();
+        }
+        let mut report = json!({"summary":"x".repeat(8000),"findings":[]});
+        append_summary(&mut report, dir.path()).unwrap();
+        crate::report::validate_report(&report).unwrap();
+        let summary = report["summary"].as_str().unwrap();
+        assert!(summary.contains("50 passed"));
+        assert!(summary.contains("dependency cache restore"));
+        assert!(summary.contains("dependency cache save"));
+        assert!(summary.contains("screenshot collection"));
+        assert!(summary.contains("container cleanup"));
+        assert!(!summary.contains("private"));
     }
 
     #[test]

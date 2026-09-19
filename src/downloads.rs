@@ -100,8 +100,23 @@ pub struct Gateway {
     _directory: tempfile::TempDir,
 }
 impl Gateway {
+    #[cfg(test)]
     pub fn start() -> Result<Self> {
-        let directory = tempfile::Builder::new().prefix("downloads-").tempdir()?;
+        Self::start_in(&std::env::temp_dir())
+    }
+    pub fn start_in(root: &Path) -> Result<Self> {
+        let directory = tempfile::Builder::new()
+            .prefix(".crow-runtime-downloads-")
+            .tempdir_in(root)?;
+        // A review directory can exceed the Unix socket address limit. Bind through
+        // its open directory descriptor while keeping the socket inside the review.
+        #[cfg(target_os = "linux")]
+        let listener = {
+            use std::os::fd::AsRawFd;
+            let dir = std::fs::File::open(directory.path())?;
+            UnixListener::bind(format!("/proc/self/fd/{}/socket", dir.as_raw_fd()))?
+        };
+        #[cfg(not(target_os = "linux"))]
         let listener = UnixListener::bind(directory.path().join("socket"))?;
         let stop = CancellationToken::new();
         let cancelled = stop.clone();
@@ -164,6 +179,35 @@ impl Drop for Gateway {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn gateway_socket_survives_long_review_paths_and_is_removed() {
+        use std::os::fd::AsRawFd;
+        let root = tempfile::tempdir().unwrap();
+        let long = root.path().join("long-review-directory-".repeat(8));
+        std::fs::create_dir(&long).unwrap();
+        let gateway = Gateway::start_in(&long).unwrap();
+        let dir = gateway.directory().to_owned();
+        assert!(dir.starts_with(&long));
+        let handle = std::fs::File::open(&dir).unwrap();
+        let mut client =
+            UnixStream::connect(format!("/proc/self/fd/{}/socket", handle.as_raw_fd()))
+                .await
+                .unwrap();
+        client
+            .write_all(b"CONNECT forbidden.invalid:443 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(Duration::from_secs(2), client.read_to_string(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.contains("Package host is not allowed"));
+        gateway.close().await;
+        assert!(!dir.exists());
+    }
+
     #[tokio::test]
     async fn concurrent_downloads_wait_for_capacity_without_connection_resets() {
         let gateway = Gateway::start().unwrap();

@@ -46,6 +46,8 @@ jobs:
           export CROW_TEST_IMAGE="sha256:${crow_image_id#sha256:}"
           systemd-run --user --scope -p Delegate=yes -- cargo test --locked --test execution_mcp -- --ignored --nocapture --test-threads=1
           systemd-run --user --scope -p Delegate=yes -- cargo test --locked --test autonomous_runtime -- --ignored --nocapture --test-threads=1
+          systemd-run --user --scope -p Delegate=yes -- cargo test --locked --test discovery_runtime -- --ignored --nocapture --test-threads=1
+          systemd-run --user --scope -p Delegate=yes -- cargo test --locked --lib real_podman_cleanup -- --ignored --nocapture --test-threads=1
       - name: Install native musl compiler
         run: sudo apt-get update && sudo apt-get install --yes musl-tools binutils
       - name: Build and package portable native executable

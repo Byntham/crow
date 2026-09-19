@@ -364,6 +364,7 @@ struct Shared {
     state: Mutex<State>,
     changed: Notify,
     wake: Notify,
+    maintenance_requested: Notify,
     stop: CancellationToken,
 }
 pub struct WorkerHandle {
@@ -580,6 +581,13 @@ async fn execute(shared: Arc<Shared>, work: Value, cancel: CancellationToken) {
         cancelled(&cancel)?;
         let runtime=crate::runtime_status::Progress::read(&shared.root,&job).ok();
         shared.send(&job,"report",json!({"report":report,"patch":patch,"runtime":runtime})).await?;
+        // The validated report is durable locally and accepted by the service.
+        // Publishing retries need evidence, not the large prepared workspaces.
+        let root = shared.root.clone(); let mut finished = job.clone(); finished["state"] = json!("completed");
+        let cleanup = tokio::task::spawn_blocking(move || crate::retention::cleanup_runtime(&root, &[finished])).await;
+        let cleanup = match cleanup { Ok(Ok(result)) => result, other => json!({"warnings":[format!("Prepared environment cleanup failed: {other:?}")]}) };
+        let _ = util::atomic(&shared.root.join("reviews").join(string(&job["id"])?).join("runtime-cleanup.json"), &cleanup);
+        if cleanup["warnings"].as_array().is_some_and(|warnings| !warnings.is_empty()) { eprintln!("Prepared environment cleanup needs attention; inspect the review's runtime-cleanup.json."); }
         Ok(())
     }.await;
     if let Err(error) = result {
@@ -688,6 +696,7 @@ async fn run_loop(shared: Arc<Shared>) {
                             task_shared.state.lock().await.active.remove(&id);
                             task_shared.changed.notify_waiters();
                             task_shared.status().await;
+                            task_shared.maintenance_requested.notify_one();
                         });
                         delay = Duration::ZERO;
                     } else {
@@ -715,38 +724,213 @@ async fn run_loop(shared: Arc<Shared>) {
         }
     }
 }
-async fn maintain(shared: &Arc<Shared>) {
+/// Cleanup for the worker loop and `crow cleanup`. Ownership receipts survive failures.
+pub async fn cleanup_runtime_data(
+    root: &Path,
+    execution: &Value,
+    jobs: &[Value],
+    days: &Value,
+) -> Result<Value> {
+    let Some(_lock) = maintenance_lock(root)? else {
+        return Ok(
+            json!({"skipped":true,"reason":"Another runtime maintenance pass is running.","previous":runtime_maintenance_status(root)}),
+        );
+    };
+    let cache = prune_runtime_cache(root).await;
+    cleanup_runtime_data_locked(root, execution, jobs, days, cache).await
+}
+fn maintenance_lock(root: &Path) -> Result<Option<crate::retention::Lock>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(root.join("runtime-maintenance.lock"))?;
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(Some(crate::retention::Lock(file))),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+pub fn runtime_maintenance_status(root: &Path) -> Value {
+    match util::read_json(&root.join("runtime-maintenance.json")) {
+        Ok(Some(value)) if value.is_object() => value,
+        Ok(None) => Value::Null,
+        other => {
+            json!({"warningCount":1,"warnings":[crate::runtime_diagnostics::bounded_error(format!("Could not read runtime-maintenance.json: {other:?}"))]})
+        }
+    }
+}
+async fn prune_runtime_cache(root: &Path) -> Result<u64> {
+    let cache_root = root.join("runtime-cache");
+    tokio::task::spawn_blocking(move || crate::runtime_cache::maintain(&cache_root)).await?
+}
+async fn cleanup_runtime_data_locked(
+    root: &Path,
+    execution: &Value,
+    jobs: &[Value],
+    days: &Value,
+    cache: Result<u64>,
+) -> Result<Value> {
+    let mut warnings = Vec::new();
+    let cache_bytes = match cache {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            warnings.push(format!("Package cache cleanup: {error:#}"));
+            0
+        }
+    };
+    let executable = execution["podman"].as_str().unwrap_or("podman");
+    let env = util::host_env().into_iter().collect();
+    let configured_images: Vec<_> = execution["repositories"]
+        .as_object()
+        .into_iter()
+        .flat_map(|repositories| repositories.values())
+        .filter_map(|policy| policy["image"].as_str())
+        .map(str::to_owned)
+        .collect();
+    let runtime = match crate::runtime_cleanup::cleanup_with_images(
+        root,
+        executable,
+        &env,
+        jobs,
+        &configured_images,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            warnings.push(format!("Runtime resource cleanup: {error:#}"));
+            json!({"deferredJobs":jobs.iter().map(|job| job["id"].clone()).collect::<Vec<_>>()})
+        }
+    };
+    let deferred = runtime["deferredJobs"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let retained: Vec<_> = jobs
+        .iter()
+        .map(|job| {
+            let mut job = job.clone();
+            if deferred.contains(&job["id"]) {
+                job["state"] = json!("paused");
+            }
+            job
+        })
+        .collect();
+    let root_path = root.to_owned();
+    let config = json!({"retentionDays":days});
+    let retention = tokio::task::spawn_blocking(move || {
+        crate::retention::cleanup(&root_path, &config, &retained)
+    })
+    .await??;
+    for result in [&runtime, &retention] {
+        for warning in result["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            warnings.push(warning.to_owned());
+        }
+    }
+    let warning_count = warnings.len();
+    let warnings: Vec<_> = warnings
+        .into_iter()
+        .take(100)
+        .map(crate::runtime_diagnostics::bounded_error)
+        .collect();
+    let result = json!({"updatedAt":util::now(),"cacheBytesRemoved":cache_bytes,"runtime":runtime,"removed":retention["removed"],"retention":retention,"warningCount":warning_count,"warnings":warnings});
+    util::atomic(&root.join("runtime-maintenance.json"), &result)?;
+    Ok(result)
+}
+async fn maintain(shared: &Arc<Shared>) -> bool {
+    let _lock = match maintenance_lock(&shared.root) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return false,
+        Err(error) => {
+            eprintln!(
+                "Runtime maintenance could not acquire its lock: {}",
+                crate::runtime_diagnostics::bounded_error(error)
+            );
+            return true;
+        }
+    };
     let result: Result<()> = async {
-        let response = shared.rpc("maintenance", &json!({}), shared.stop.clone()).await?;
+        // Cache cleanup failures must not block container or evidence cleanup.
+        // Expiration still runs when the service is unavailable.
+        let cache = prune_runtime_cache(&shared.root).await;
+        let response = match shared
+            .rpc("maintenance", &json!({}), shared.stop.clone())
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let cache_error = cache
+                    .err()
+                    .map(|error| format!("; package cache cleanup also failed: {error:#}"))
+                    .unwrap_or_default();
+                bail!("Service maintenance request failed: {error:#}{cache_error}");
+            }
+        };
         if let Some(jobs) = response["jobs"].as_array() {
             let mut state = shared.state.lock().await;
             for job in jobs {
-                if matches!(job["state"].as_str(), Some("completed" | "superseded" | "cancelled"))
-                    && let Some(id) = job["id"].as_str() { state.sessions.remove(id); }
-            }
-            // Keep active records as nonterminal so their delegated sessions protect shared rollouts.
-            let retained: Vec<Value> = jobs.iter().map(|job| {
-                let mut job = job.clone();
-                if job["id"].as_str().is_some_and(|id| state.active.contains_key(id)) {
-                    job["state"] = json!("reviewing");
+                if matches!(
+                    job["state"].as_str(),
+                    Some("completed" | "superseded" | "cancelled")
+                ) && let Some(id) = job["id"].as_str()
+                {
+                    state.sessions.remove(id);
                 }
-                job
-            }).collect();
+            }
+            let retained: Vec<Value> = jobs
+                .iter()
+                .map(|job| {
+                    let mut job = job.clone();
+                    if job["id"]
+                        .as_str()
+                        .is_some_and(|id| state.active.contains_key(id))
+                    {
+                        job["state"] = json!("reviewing");
+                    }
+                    job
+                })
+                .collect();
             drop(state);
-            let root = shared.root.clone();
-            let config = json!({"retentionDays": response["retentionDays"]});
-            // Large Codex session trees must not delay lease heartbeats.
-            let outcome = tokio::task::spawn_blocking(move || crate::retention::cleanup(&root, &config, &retained)).await??;
-            if outcome["warnings"].as_array().is_some_and(|v| !v.is_empty()) {
-                eprintln!("Some retained review files could not be cleaned; inspect local file permissions.");
+            let outcome = cleanup_runtime_data_locked(
+                &shared.root,
+                &shared.config["worker"]["execution"],
+                &retained,
+                &response["retentionDays"],
+                cache,
+            )
+            .await?;
+            for warning in outcome["warnings"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                eprintln!("Runtime maintenance: {warning}");
             }
         }
         Ok(())
-    }.await;
-    if result.is_err() && !shared.stop.is_cancelled() {
-        eprintln!("Review retention cleanup deferred until the next maintenance check.");
     }
+    .await;
+    if let Err(error) = result
+        && !shared.stop.is_cancelled()
+    {
+        let diagnostic = json!({"updatedAt":util::now(),"warningCount":1,"warnings":[crate::runtime_diagnostics::bounded_error(format!("Maintenance could not finish: {error:#}"))]});
+        let _ = util::atomic(&shared.root.join("runtime-maintenance.json"), &diagnostic);
+        eprintln!(
+            "Runtime maintenance deferred; inspect runtime-maintenance.json in Crow's data directory."
+        );
+    }
+    true
 }
+
 pub async fn start_worker(config: Value, root: PathBuf) -> Result<WorkerHandle> {
     start_worker_with(
         config,
@@ -791,6 +975,7 @@ pub async fn start_worker_with(
         }),
         changed: Notify::new(),
         wake: Notify::new(),
+        maintenance_requested: Notify::new(),
         stop: CancellationToken::new(),
     });
     shared.status().await;
@@ -799,8 +984,12 @@ pub async fn start_worker_with(
         let s = shared.clone();
         tokio::spawn(async move {
             loop {
-                maintain(&s).await;
-                tokio::select! {_=s.stop.cancelled()=>break,_=tokio::time::sleep(s.options.maintenance)=>()}
+                let delay = if maintain(&s).await {
+                    s.options.maintenance
+                } else {
+                    Duration::from_secs(1)
+                };
+                tokio::select! {biased; _=s.stop.cancelled()=>break,_=s.maintenance_requested.notified()=>(),_=tokio::time::sleep(delay)=>()}
             }
         })
     };
@@ -897,6 +1086,8 @@ mod tests {
         fail_report: AtomicBool,
         fail_session: AtomicBool,
         fail_heartbeat: bool,
+        fail_maintenance: bool,
+        maintenance_gate: Option<Arc<Semaphore>>,
         execution_enabled: bool,
         retry: bool,
         wait_cancel: bool,
@@ -917,6 +1108,8 @@ mod tests {
                 fail_report: AtomicBool::new(false),
                 fail_session: AtomicBool::new(false),
                 fail_heartbeat: false,
+                fail_maintenance: false,
+                maintenance_gate: None,
                 execution_enabled: false,
                 retry: false,
                 wait_cancel: false,
@@ -964,7 +1157,15 @@ mod tests {
                     }
                     Ok(self.queue.lock().await.pop_front().unwrap_or(Value::Null))
                 }
-                "maintenance" => Ok(json!({"jobs":[],"retentionDays":7})),
+                "maintenance" => {
+                    if let Some(gate) = &self.maintenance_gate {
+                        gate.acquire().await.unwrap().forget();
+                    }
+                    if self.fail_maintenance {
+                        bail!("Service unavailable");
+                    }
+                    Ok(json!({"jobs":[],"retentionDays":7}))
+                }
                 "heartbeat" if self.fail_heartbeat => bail!("Connection lost"),
                 "report" if self.fail_report.swap(false, Ordering::SeqCst) => {
                     bail!("Lost response")
@@ -1054,6 +1255,192 @@ mod tests {
         start_worker_with(config, root.to_owned(), f, options())
             .await
             .unwrap()
+    }
+    #[tokio::test]
+    async fn maintenance_errors_preserve_receipts_until_resource_cleanup_succeeds() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("podman");
+        let id = "a".repeat(32);
+        fs::write(
+            &executable,
+            format!(
+                r#"#!/bin/sh
+case "$1" in
+ ps) printf '%s\n' '[{{"Names":["crow-experiment-{id}"],"State":"exited"}}]' ;;
+ rm) test ! -e "$0.fail" ;;
+ *) exit 7 ;;
+esac
+"#
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(root.path().join("podman.fail"), "fail").unwrap();
+        let experiment = root.path().join("reviews/done/experiments");
+        fs::create_dir_all(experiment.join("environments")).unwrap();
+        fs::write(experiment.join("environments/prepared.tar"), "dependencies").unwrap();
+        util::atomic(
+            &experiment.join(format!("{id}.json")),
+            &json!({"id":id,"status":"running"}),
+        )
+        .unwrap();
+        let jobs = [json!({"id":"done","state":"completed","updatedAt":0})];
+        let config = json!({"podman":executable});
+        let first = cleanup_runtime_data(root.path(), &config, &jobs, &json!(0))
+            .await
+            .unwrap();
+        assert_eq!(first["runtime"]["deferredJobs"], json!(["done"]));
+        assert!(first["warningCount"].as_u64().unwrap() > 0);
+        assert!(experiment.join(format!("{id}.json")).exists());
+        fs::remove_file(root.path().join("podman.fail")).unwrap();
+        let second = cleanup_runtime_data(root.path(), &config, &jobs, &json!(0))
+            .await
+            .unwrap();
+        assert_eq!(second["warningCount"], 0, "{second}");
+        assert_eq!(second["retention"]["removed"], json!(["done"]));
+        assert!(!experiment.exists());
+        assert_eq!(runtime_maintenance_status(root.path())["warningCount"], 0);
+    }
+    #[tokio::test]
+    async fn cache_failure_does_not_prevent_terminal_snapshot_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("runtime-cache/packages.lock")).unwrap();
+        let experiment = root.path().join("reviews/done/experiments");
+        fs::create_dir_all(experiment.join("environments")).unwrap();
+        let id = "a".repeat(32);
+        util::atomic(
+            &experiment.join(format!("{id}.json")),
+            &json!({"id":id,"status":"blocked","containerStarted":false}),
+        )
+        .unwrap();
+        let jobs = [json!({"id":"done","state":"completed","updatedAt":util::now()})];
+        let result = cleanup_runtime_data(
+            root.path(),
+            &json!({"podman":"/missing-podman"}),
+            &jobs,
+            &json!(7),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["warningCount"], 1, "{result}");
+        assert!(
+            result["warnings"][0]
+                .as_str()
+                .unwrap()
+                .contains("Package cache cleanup")
+        );
+        assert!(!experiment.join("environments").exists());
+        assert!(experiment.join(format!("{id}.json")).exists());
+    }
+    #[tokio::test]
+    async fn concurrent_maintenance_preserves_previous_diagnostics() {
+        let root = tempfile::tempdir().unwrap();
+        let previous = json!({"warningCount":1,"warnings":["Previous cleanup needs retry"]});
+        util::atomic(&root.path().join("runtime-maintenance.json"), &previous).unwrap();
+        let lock = maintenance_lock(root.path()).unwrap().unwrap();
+        let result = cleanup_runtime_data(root.path(), &json!({}), &[], &json!(7))
+            .await
+            .unwrap();
+        assert_eq!(result["skipped"], true);
+        assert_eq!(runtime_maintenance_status(root.path()), previous);
+        drop(lock);
+        let result = cleanup_runtime_data(root.path(), &json!({}), &[], &json!(7))
+            .await
+            .unwrap();
+        assert_eq!(result["warningCount"], 0);
+        assert_eq!(runtime_maintenance_status(root.path())["warningCount"], 0);
+    }
+    #[tokio::test]
+    async fn configured_immutable_images_are_protected_without_active_reviews() {
+        let root = tempfile::tempdir().unwrap();
+        let image = format!("sha256:{}", "a".repeat(64));
+        let record = root.path().join("runtime-cache/images/old.json");
+        util::atomic(&record, &json!({"tag":format!("localhost/crow-runtime:{}", "a".repeat(20)),"image":image,"lastUsedAt":0})).unwrap();
+        // A protected image must be skipped before invoking Podman at all.
+        let config =
+            json!({"podman":"/missing-podman","repositories":{"owner/project":{"image":image}}});
+        let result = cleanup_runtime_data(root.path(), &config, &[], &json!(7))
+            .await
+            .unwrap();
+        assert_eq!(result["warningCount"], 0, "{result}");
+        assert_eq!(result["runtime"]["images"], json!([]));
+        assert!(record.exists());
+    }
+    #[test]
+    fn corrupt_maintenance_record_is_a_status_warning() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(runtime_maintenance_status(root.path()).is_null());
+        for body in ["{broken", "[]", "null"] {
+            fs::write(root.path().join("runtime-maintenance.json"), body).unwrap();
+            let result = runtime_maintenance_status(root.path());
+            assert_eq!(result["warningCount"], 1);
+            assert!(
+                result["warnings"][0]
+                    .as_str()
+                    .unwrap()
+                    .contains("runtime-maintenance.json")
+            );
+        }
+    }
+    #[tokio::test]
+    async fn review_completion_wakes_tracked_maintenance_and_close_waits_for_it() {
+        let root = tempfile::tempdir().unwrap();
+        let review_gate = Arc::new(Semaphore::new(0));
+        let maintenance_gate = Arc::new(Semaphore::new(0));
+        let fake = Arc::new(Fake {
+            review_gate: Some(review_gate.clone()),
+            maintenance_gate: Some(maintenance_gate.clone()),
+            ..Fake::new()
+        });
+        let worker = Arc::new(start(root.path(), fake.clone()).await);
+        fake.review_started.acquire().await.unwrap().forget();
+        fake.until("maintenance", 1).await;
+        maintenance_gate.add_permits(1);
+        review_gate.add_permits(1);
+        fake.until("report", 1).await;
+        fake.until("maintenance", 2).await;
+        let closed = {
+            let worker = worker.clone();
+            tokio::spawn(async move {
+                worker.close().await.unwrap();
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!closed.is_finished());
+        maintenance_gate.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(3), closed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fake.count("maintenance").await, 2);
+    }
+    #[tokio::test]
+    async fn offline_maintenance_reports_service_and_cache_failures() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("runtime-cache/packages.lock")).unwrap();
+        let fake = Arc::new(Fake {
+            fail_maintenance: true,
+            queue: Mutex::new(VecDeque::new()),
+            ..Fake::new()
+        });
+        let worker = start(root.path(), fake.clone()).await;
+        fake.until("maintenance", 1).await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if runtime_maintenance_status(root.path())["warningCount"] == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let value = runtime_maintenance_status(root.path());
+        let warning = value["warnings"][0].as_str().unwrap();
+        assert!(warning.contains("Service maintenance request failed"));
+        assert!(warning.contains("package cache cleanup also failed"));
+        worker.close().await.unwrap();
     }
     #[tokio::test]
     async fn worker_reports_live_receipts_and_final_runtime_without_provider_progress() {

@@ -1,7 +1,9 @@
 //! Small, command-free runtime summaries sent by the worker to the service.
+use crate::runtime_diagnostics::Stage;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +67,16 @@ pub struct Progress {
     pub enabled: bool,
     pub setup: Counts,
     pub tests: Counts,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "activeStage"
+    )]
+    pub active_stage: Option<Stage>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub failures: BTreeMap<Stage, u32>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub warnings: BTreeMap<Stage, u32>,
 }
 impl Progress {
     pub fn validate(value: &Value) -> Result<Self> {
@@ -73,6 +85,30 @@ impl Progress {
         ensure!(
             total <= 50 && (progress.enabled || total == 0),
             "Invalid runtime counters"
+        );
+        ensure!(
+            progress
+                .failures
+                .values()
+                .map(|n| u64::from(*n))
+                .sum::<u64>()
+                <= total
+                && progress
+                    .warnings
+                    .values()
+                    .map(|n| u64::from(*n))
+                    .sum::<u64>()
+                    <= total * 6
+                && (progress.active_stage.is_none()
+                    || progress.setup.running + progress.tests.running > 0)
+                && progress.warnings.keys().all(|stage| matches!(
+                    stage,
+                    Stage::Cleanup
+                        | Stage::ArtifactCollection
+                        | Stage::CacheRestore
+                        | Stage::CacheSave
+                )),
+            "Invalid runtime diagnostics"
         );
         Ok(progress)
     }
@@ -108,6 +144,16 @@ impl Progress {
                 _ => continue,
             };
             counts.add(record["status"].as_str().unwrap_or("error"));
+            if record["status"] == "running" {
+                progress.active_stage = serde_json::from_value(record["stage"].clone()).ok();
+            } else if record["status"] != "passed"
+                && let Ok(stage) = serde_json::from_value(record["failureStage"].clone())
+            {
+                *progress.failures.entry(stage).or_default() += 1;
+            }
+            for (stage, count) in crate::runtime_diagnostics::warnings(&record) {
+                *progress.warnings.entry(stage).or_default() += count;
+            }
         }
         Self::validate(&serde_json::to_value(progress)?)
     }
@@ -137,6 +183,24 @@ impl Progress {
         }
         if self.tests.failed > 0 {
             text.push_str(" Failed commands can include base failures and investigation attempts; see the review for confirmed bugs.");
+        }
+        if active && let Some(stage) = self.active_stage {
+            text.push_str(&format!(" Current step: {}.", stage.label()));
+        }
+        for (label, stages) in [
+            ("Failure locations", &self.failures),
+            ("Warnings", &self.warnings),
+        ] {
+            if !stages.is_empty() {
+                let parts = stages
+                    .iter()
+                    .map(|(stage, count)| format!("{count} at {}", stage.label()))
+                    .collect::<Vec<_>>();
+                text.push_str(&format!(" {label}: {}.", parts.join(", ")));
+            }
+        }
+        if !self.failures.is_empty() || !self.warnings.is_empty() {
+            text.push_str(" Worker receipts contain the error details.");
         }
         text
     }
@@ -228,5 +292,60 @@ mod tests {
         invalid["tests"]["running"] = json!(1);
         invalid["enabled"] = json!(false);
         assert!(Progress::validate(&invalid).is_err());
+    }
+
+    #[test]
+    fn runtime_errors_show_stages_without_publishing_private_details() {
+        let temp = tempfile::tempdir().unwrap();
+        let job =
+            json!({"id":"job1","repo":"owner/repo","settings":{"execution":{"automatic":true}}});
+        let dir = temp.path().join("reviews/job1/experiments");
+        crate::util::atomic(
+            &dir.join("one.json"),
+            &json!({
+                "phase":"test", "status":"error", "failureStage":"container_start",
+                "error":"/private/operator/token: secret", "cleanupError":"private cleanup error",
+                "artifacts":[{"saved":false,"error":"private screenshot failure"}]
+            }),
+        )
+        .unwrap();
+        let progress = Progress::read(temp.path(), &job).unwrap();
+        let text = progress.render(false);
+        assert!(text.contains("1 blocked"));
+        assert!(text.contains("container startup"));
+        assert!(text.contains("container cleanup"));
+        assert!(text.contains("screenshot collection"));
+        assert!(!text.contains("private"));
+        assert!(!serde_json::to_string(&progress).unwrap().contains("secret"));
+        let mut value = serde_json::to_value(progress).unwrap();
+        value["failures"] = json!({"/private/operator/token":1});
+        assert!(Progress::validate(&value).is_err());
+        value["failures"] = json!({"container_start":2});
+        assert!(Progress::validate(&value).is_err());
+    }
+
+    #[test]
+    fn cache_warnings_remain_visible_and_recovered_cleanup_is_cleared() {
+        let temp = tempfile::tempdir().unwrap();
+        let job =
+            json!({"id":"job1","repo":"owner/repo","settings":{"execution":{"automatic":true}}});
+        let path = temp.path().join("reviews/job1/experiments/one.json");
+        let mut receipt = json!({"phase":"setup","status":"passed",
+            "cacheRestoreError":"private restore detail", "cacheSaveError":"private save detail",
+            "cleanupError":"private cleanup detail", "artifacts":[{"saved":false},{"saved":false},{"saved":false}]});
+        crate::util::atomic(&path, &receipt).unwrap();
+        let progress = Progress::read(temp.path(), &job).unwrap();
+        assert_eq!(progress.warnings.values().sum::<u32>(), 6);
+        let text = progress.render(false);
+        assert!(text.contains("dependency cache restore"));
+        assert!(text.contains("dependency cache save"));
+        assert!(text.contains("container cleanup"));
+        assert!(!text.contains("private"));
+        receipt["cleanupRecoveredAt"] = json!("2026-09-18T00:00:00Z");
+        crate::util::atomic(&path, &receipt).unwrap();
+        let recovered = Progress::read(temp.path(), &job).unwrap();
+        assert_eq!(recovered.warnings.values().sum::<u32>(), 5);
+        assert!(!recovered.render(false).contains("container cleanup"));
+        assert!(recovered.render(false).contains("dependency cache save"));
     }
 }
