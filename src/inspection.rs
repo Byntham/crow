@@ -4,7 +4,7 @@ use base64::Engine;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     path::Path,
     process::Stdio,
     time::Duration,
@@ -224,6 +224,57 @@ fn strings(args: &[&str]) -> Vec<String> {
     args.iter().map(|s| (*s).to_owned()).collect()
 }
 
+/// Export pinned source without consulting repository export-ignore/export-subst
+/// attributes. The archive is passed to the container, never unpacked on the host.
+pub async fn execution_archive(
+    source: &Value,
+    revision_key: &str,
+    output: &Path,
+    max_bytes: u64,
+    cancel: CancellationToken,
+) -> Result<()> {
+    use std::io::Write;
+    let attributes = tempfile::tempdir()?;
+    let mut file = std::fs::File::create(output)?;
+    let mut total = 0u64;
+    git_stream(
+        source_dir(source)?,
+        &strings(&[
+            "-c",
+            "core.bare=false",
+            "archive",
+            "--worktree-attributes",
+            "--format=tar",
+            source_rev(source, revision_key)?,
+        ]),
+        &BTreeMap::from([
+            (
+                "GIT_WORK_TREE".into(),
+                attributes.path().to_string_lossy().into_owned(),
+            ),
+            (
+                "GIT_INDEX_FILE".into(),
+                attributes
+                    .path()
+                    .join("empty-index")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        ]),
+        cancel,
+        |chunk| {
+            total += chunk.len() as u64;
+            ensure!(
+                total <= max_bytes,
+                "Execution source archive exceeds {max_bytes} bytes"
+            );
+            file.write_all(chunk)?;
+            Ok(())
+        },
+    )
+    .await
+}
+
 pub async fn checkout(
     root: &Path,
     job: &Value,
@@ -328,7 +379,18 @@ pub async fn checkout(
     )
 }
 
-async fn names<F>(source: &Value, args: &[String], mut visit: F) -> Result<()>
+async fn names<F>(source: &Value, args: &[String], visit: F) -> Result<()>
+where
+    F: FnMut(&str) -> Result<()>,
+{
+    names_with_cancel(source, args, CancellationToken::new(), visit).await
+}
+async fn names_with_cancel<F>(
+    source: &Value,
+    args: &[String],
+    cancel: CancellationToken,
+    mut visit: F,
+) -> Result<()>
 where
     F: FnMut(&str) -> Result<()>,
 {
@@ -337,7 +399,7 @@ where
         source_dir(source)?,
         args,
         &BTreeMap::new(),
-        CancellationToken::new(),
+        cancel,
         |chunk| {
             for part in chunk.split_inclusive(|b| *b == 0) {
                 let complete = part.last() == Some(&0);
@@ -391,6 +453,14 @@ fn diff_args(source: &Value, path: Option<&str>) -> Result<Vec<String>> {
     Ok(args)
 }
 pub async fn read_blob(source: &Value, path: &str, rev: Option<&str>) -> Result<String> {
+    read_blob_with_cancel(source, path, rev, CancellationToken::new()).await
+}
+async fn read_blob_with_cancel(
+    source: &Value,
+    path: &str,
+    rev: Option<&str>,
+    cancel: CancellationToken,
+) -> Result<String> {
     ensure!(safe_path(path), "Invalid repository path");
     let rev = revision(rev.unwrap_or(source_rev(source, "head")?))?;
     let meta = git_bytes(
@@ -398,7 +468,7 @@ pub async fn read_blob(source: &Value, path: &str, rev: Option<&str>) -> Result<
         &strings(&["ls-tree", "-z", rev, "--", path]),
         131_072,
         &BTreeMap::new(),
-        CancellationToken::new(),
+        cancel.clone(),
     )
     .await?;
     // NUL-delimited output preserves tabs, quotes and other unusual filenames.
@@ -425,7 +495,7 @@ pub async fn read_blob(source: &Value, path: &str, rev: Option<&str>) -> Result<
         &strings(&["cat-file", "blob", oid]),
         BLOB_LIMIT,
         &BTreeMap::new(),
-        CancellationToken::new(),
+        cancel,
     )
     .await?;
     ensure!(!text.contains(&0), "Binary file cannot be read as text");
@@ -619,11 +689,15 @@ pub async fn publication_patch(
     Ok(result)
 }
 pub async fn guidance(source: &Value) -> Result<Value> {
+    guidance_with_cancel(source, CancellationToken::new()).await
+}
+pub async fn guidance_with_cancel(source: &Value, cancel: CancellationToken) -> Result<Value> {
     let mut wanted = Vec::new();
     let mut size = 0;
-    names(
+    names_with_cancel(
         source,
         &tree_args(source_rev(source, "targetSha")?)?,
+        cancel.clone(),
         |path| {
             if path == "AGENTS.md" || path.ends_with("/AGENTS.md") || path == ".crow/review.md" {
                 size += path.len();
@@ -641,7 +715,13 @@ pub async fn guidance(source: &Value) -> Result<Value> {
     wanted.sort_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
     let mut files = Vec::new();
     for path in wanted {
-        let body = read_blob(source, &path, Some(source_rev(source, "targetSha")?)).await?;
+        let body = read_blob_with_cancel(
+            source,
+            &path,
+            Some(source_rev(source, "targetSha")?),
+            cancel.clone(),
+        )
+        .await?;
         size += body.len();
         ensure!(
             size <= GUIDANCE_LIMIT,
@@ -808,6 +888,110 @@ pub fn tools() -> Value {
     ])
 }
 
+// Runtime calls recover orphan containers before doing their named operation.
+// Delegation launches reserve state before awaited writes. Both must finish
+// cancellation/transactions before their futures are dropped.
+fn tool_needs_drain(name: &str) -> bool {
+    crate::execution::TOOL_NAMES.contains(&name)
+        || matches!(
+            name,
+            "start_review_task" | "resume_review_task" | "restart_review_task"
+        )
+}
+fn tool_starts_work(name: &str) -> bool {
+    matches!(
+        name,
+        "run_experiment"
+            | "prepare_environment"
+            | "start_review_task"
+            | "resume_review_task"
+            | "restart_review_task"
+    )
+}
+
+pub(crate) async fn cancelled_tool(
+    name: &str,
+    call: impl std::future::Future<Output = Result<Value>>,
+) -> Result<Value> {
+    if tool_needs_drain(name) {
+        call.await
+    } else {
+        Err(anyhow!("Tool request cancelled"))
+    }
+}
+
+// Retain partial writes across select! cancellation. Backpressure may delay
+// delivery, but must not stop tool deadlines or input cancellation processing.
+#[derive(Default)]
+struct McpOutbox {
+    messages: VecDeque<Vec<u8>>,
+    offset: usize,
+    bytes: usize,
+}
+impl McpOutbox {
+    fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+    fn push(&mut self, response: &Value) -> Result<()> {
+        let mut bytes = serde_json::to_vec(response)?;
+        bytes.push(b'\n');
+        ensure!(
+            self.messages.len() < 64 && self.bytes + bytes.len() <= 16 * 1024 * 1024,
+            "MCP output backlog exceeded; client is not consuming responses"
+        );
+        self.bytes += bytes.len();
+        self.messages.push_back(bytes);
+        Ok(())
+    }
+    async fn write_next<W: tokio::io::AsyncWrite + Unpin>(&mut self, stdout: &mut W) -> Result<()> {
+        let bytes = self.messages.front().context("Empty MCP output queue")?;
+        let count = stdout.write(&bytes[self.offset..]).await?;
+        ensure!(count > 0, "MCP output closed");
+        self.offset += count;
+        if self.offset == bytes.len() {
+            self.bytes -= bytes.len();
+            self.messages.pop_front();
+            self.offset = 0;
+        }
+        Ok(())
+    }
+}
+
+// The buffer survives cancellation of this future when an active tool finishes.
+// fill_buf and consume keep partial JSON lines intact across select! iterations.
+async fn mcp_request<R: tokio::io::AsyncBufRead + Unpin>(
+    stdin: &mut R,
+    line: &mut Vec<u8>,
+) -> Result<Option<Value>> {
+    loop {
+        let chunk = stdin.fill_buf().await?;
+        if chunk.is_empty() && line.is_empty() {
+            return Ok(None);
+        }
+        let eof = chunk.is_empty();
+        let n = chunk
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(chunk.len(), |n| n + 1);
+        ensure!(
+            line.len() + n <= 4 * 1024 * 1024,
+            "MCP request exceeds 4 MiB"
+        );
+        let complete = eof || chunk[n - 1] == b'\n';
+        line.extend_from_slice(&chunk[..n]);
+        stdin.consume(n);
+        if complete {
+            let request = serde_json::from_slice::<Value>(line);
+            line.clear();
+            if let Ok(request) = request
+                && request.is_object()
+            {
+                return Ok(Some(request));
+            }
+        }
+    }
+}
+
 pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) -> Result<()> {
     let source: Value = serde_json::from_slice(&tokio::fs::read(source_path).await?)?;
     let context: Option<Value> = if let Some(path) = context_path {
@@ -815,6 +999,19 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
     } else {
         None
     };
+    let execution = context
+        .as_ref()
+        .map(|context| {
+            crate::execution::Execution::from_context(
+                context,
+                &source_path
+                    .parent()
+                    .context("Missing review directory")?
+                    .join("experiments"),
+            )
+        })
+        .transpose()?
+        .flatten();
     let delegation = if let Some(context) = context.filter(|v| {
         v["job"]["settings"]["subagents"]["max"]
             .as_u64()
@@ -849,6 +1046,9 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
             definitions.push(tool);
         }
     }
+    if execution.is_some() {
+        definitions.extend(crate::execution::tools());
+    }
     let mut stdin = BufReader::new(crate::process::NonblockingIo::stdin()?);
     let mut stdout = crate::process::NonblockingIo::stdout()?;
     #[cfg(unix)]
@@ -865,37 +1065,106 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
     };
     tokio::pin!(stop);
     let result=async {
-        loop {
-            // A bounded line reader prevents malformed MCP input from exhausting memory.
-            let mut line=Vec::new();
-            let read=async {loop {let chunk=stdin.fill_buf().await?; if chunk.is_empty(){break;} let n=chunk.iter().position(|b|*b==b'\n').map_or(chunk.len(),|n|n+1); ensure!(line.len()+n<=4*1024*1024,"MCP request exceeds 4 MiB"); let done=chunk[n-1]==b'\n'; line.extend_from_slice(&chunk[..n]); stdin.consume(n); if done {break;} } Ok::<_,anyhow::Error>(())};
-            tokio::select!{_=&mut stop=>break,result=read=>result?}
-            if line.is_empty(){break;}
-            let request: Value=match serde_json::from_slice(&line){Ok(v)=>v,Err(_)=>continue};
-            if !request.is_object() || request.get("id").is_none(){continue;}
+        let mut line = Vec::new();
+        let mut pending = VecDeque::new();
+        let mut input_closed = false;
+        let mut outbox = McpOutbox::default();
+        'requests: loop {
+            let request = loop {
+                if let Some(request) = pending.pop_front() { break request; }
+                if input_closed && outbox.is_empty() { break 'requests; }
+                tokio::select! {
+                    _ = &mut stop => break 'requests,
+                    written = outbox.write_next(&mut stdout), if !outbox.is_empty() => written?,
+                    request = mcp_request(&mut stdin, &mut line), if !input_closed => match request? {
+                        Some(request) => break request,
+                        None => input_closed = true,
+                    }
+                }
+            };
+            if request.get("id").is_none(){continue;}
             let id=request["id"].clone();
             let response=match request["method"].as_str(){
                 Some("initialize")=>json!({"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"crow-inspection","version":"1.0.0"}}}),
                 Some("tools/list")=>json!({"result":{"tools":definitions}}), Some("ping")=>json!({"result":{}}),
                 Some("tools/call")=>{
+                    let cancel = CancellationToken::new();
                     let call=async {
                         let params=&request["params"]; let name=params["name"].as_str().ok_or_else(||anyhow!("Invalid tool request"))?;
                         let empty=json!({}); let args=params.get("arguments").filter(|v|!v.is_null()).unwrap_or(&empty);
                         if let Some(delegate)=&delegation&& crate::delegation::tools().as_array().is_some_and(|ts|ts.iter().any(|t|t["name"]==name)){return delegate.call(name,args).await;}
+                        if let Some(execution) = &execution && crate::execution::TOOL_NAMES.contains(&name) { return execution.call(name, args, cancel.clone()).await; }
                         inspection_tool(&source,name,args).await
                     };
-                    let output=tokio::select!{_=&mut stop=>break,result=call=>result};
-                    match output {Ok(value)=>json!({"result":{"content":[{"type":"text","text":value.as_str().map(str::to_owned).unwrap_or_else(||value.to_string())}]}}),Err(e)=>json!({"result":{"isError":true,"content":[{"type":"text","text":e.to_string()}]}})}
+                    let name = request["params"]["name"].as_str().unwrap_or("");
+                    let experiment = execution.is_some() && crate::execution::TOOL_NAMES.contains(&name);
+                    let mutating = tool_starts_work(name);
+                    // A preceding read-only call may have drained stdin to EOF
+                    // while this state-changing request was waiting in the queue.
+                    if input_closed && mutating { continue 'requests; }
+                    tokio::pin!(call);
+                    let output = loop {
+                        tokio::select! {
+                            _ = &mut stop => {
+                                cancel.cancel();
+                                let _ = cancelled_tool(name, &mut call).await;
+                                break 'requests;
+                            },
+                            result = &mut call => break result,
+                            written = outbox.write_next(&mut stdout), if !outbox.is_empty() => {
+                                if let Err(error) = written {
+                                    cancel.cancel();
+                                    let _ = cancelled_tool(name, &mut call).await;
+                                    return Err(error);
+                                }
+                            },
+                            incoming = mcp_request(&mut stdin, &mut line), if !input_closed => {
+                                let incoming = match incoming {
+                                    Ok(Some(incoming)) => incoming,
+                                    Ok(None) if !mutating => {
+                                        input_closed = true;
+                                        continue;
+                                    },
+                                    closed => {
+                                        cancel.cancel();
+                                        let _ = cancelled_tool(name, &mut call).await;
+                                        closed?;
+                                        break 'requests;
+                                    }
+                                };
+                                if incoming.get("id").is_none() {
+                                    if incoming["method"] == "notifications/cancelled"
+                                        && let Some(cancelled_id) = incoming["params"].get("requestId") {
+                                        if cancelled_id == &id {
+                                            cancel.cancel();
+                                            break cancelled_tool(name, &mut call).await;
+                                        } else {
+                                            pending.retain(|request: &Value| request.get("id") != Some(cancelled_id));
+                                        }
+                                    }
+                                } else {
+                                    // Keep calls serial while still accepting cancellation.
+                                    // Limit queued requests as well as each input line.
+                                    if pending.len() == 16 {
+                                        let busy = json!({"jsonrpc":"2.0","id":incoming["id"],"error":{"code":-32000,"message":"MCP request queue is full; retry after pending requests complete"}});
+                                        if let Err(error) = outbox.push(&busy) {
+                                            cancel.cancel();
+                                            let _ = cancelled_tool(name, &mut call).await;
+                                            return Err(error);
+                                        }
+                                    } else {
+                                        pending.push_back(incoming);
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    match output {Ok(value) if experiment && request["params"]["name"] == "read_artifact" => json!({"result":value}),Ok(value)=>json!({"result":{"content":[{"type":"text","text":value.as_str().map(str::to_owned).unwrap_or_else(||value.to_string())}]}}),Err(e)=>json!({"result":{"isError":true,"content":[{"type":"text","text":e.to_string()}]}})}
                 }
                 _=>json!({"error":{"code":-32601,"message":"Unsupported method"}}),
             };
             let mut response=response; response["jsonrpc"]="2.0".into(); response["id"]=id;
-            let write = async {
-                stdout.write_all(response.to_string().as_bytes()).await?;
-                stdout.write_all(b"\n").await?;
-                stdout.flush().await
-            };
-            tokio::select! { _ = &mut stop => break, result = write => result? }
+            outbox.push(&response)?;
 
         } Ok::<_,anyhow::Error>(())
     }.await;
@@ -909,6 +1178,80 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn mcp_output_backlog_bounds_count_and_bytes() {
+        let mut outbox = McpOutbox::default();
+        for _ in 0..64 {
+            outbox.push(&json!({"id":1,"result":{}})).unwrap();
+        }
+        assert!(outbox.push(&json!({"id":2,"result":{}})).is_err());
+        let mut outbox = McpOutbox::default();
+        let large = json!({"id":"x".repeat(8 * 1024 * 1024)});
+        outbox.push(&large).unwrap();
+        assert!(outbox.push(&large).is_err());
+    }
+
+    #[test]
+    fn cancellation_policy_covers_every_advertised_tool() {
+        let mut advertised: Vec<String> = tools()
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(crate::delegation::tools().as_array().unwrap().iter())
+            .chain(crate::execution::tools().iter())
+            .map(|tool| tool["name"].as_str().unwrap().to_owned())
+            .collect();
+        advertised.sort();
+        let mut expected = vec![
+            ("list_files", false, false),
+            ("read_file", false, false),
+            ("diff", false, false),
+            ("search", false, false),
+            ("review_task_status", false, false),
+            ("wait_review_task", false, false),
+            ("discover_environment", true, false),
+            ("list_experiments", true, false),
+            ("read_artifact", true, false),
+            ("prepare_environment", true, true),
+            ("run_experiment", true, true),
+            ("start_review_task", true, true),
+            ("resume_review_task", true, true),
+            ("restart_review_task", true, true),
+        ];
+        expected.sort_by_key(|(name, _, _)| *name);
+        assert_eq!(
+            advertised,
+            expected
+                .iter()
+                .map(|(name, _, _)| name.to_string())
+                .collect::<Vec<_>>()
+        );
+        for (name, drain, mutating) in expected {
+            assert_eq!(tool_needs_drain(name), drain, "{name}");
+            assert_eq!(tool_starts_work(name), mutating, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_read_only_task_waits_do_not_block_shutdown() {
+        for name in [
+            "list_files",
+            "read_file",
+            "diff",
+            "search",
+            "review_task_status",
+            "wait_review_task",
+        ] {
+            let result = tokio::time::timeout(
+                Duration::from_millis(100),
+                cancelled_tool(name, std::future::pending::<Result<Value>>()),
+            )
+            .await
+            .unwrap();
+            assert!(result.unwrap_err().to_string().contains("cancelled"));
+        }
+    }
 
     async fn fixture(huge: bool) -> (TempDir, Value) {
         let dir = tempfile::tempdir().unwrap();
@@ -986,6 +1329,27 @@ mod tests {
             dir,
             json!({"dir":bare,"base":base,"head":head,"targetSha":base,"target":"main"}),
         )
+    }
+
+    #[tokio::test]
+    async fn execution_archive_obeys_storage_budget() {
+        let (dir, source) = fixture(false).await;
+        let output = dir.path().join("source.tar");
+        let error = execution_archive(&source, "head", &output, 1024, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds 1024 bytes"));
+        assert!(std::fs::metadata(&output).unwrap().len() <= 1024);
+        execution_archive(
+            &source,
+            "head",
+            &output,
+            1024 * 1024,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(std::fs::metadata(&output).unwrap().len() > 1024);
     }
 
     #[test]

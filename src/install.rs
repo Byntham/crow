@@ -1214,13 +1214,27 @@ mod tests {
     #[tokio::test]
     async fn version_check_bounds_output_and_requires_success() {
         let tmp = tempfile::tempdir().unwrap();
-        let executable = tmp.path().join("check");
-        fs::write(&executable, "#!/bin/sh\nprintf 'crow 1.2.3\\n'\n").unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
-        assert_eq!(executable_version(&executable).await.unwrap(), "crow 1.2.3");
-        fs::write(&executable, "#!/bin/sh\nprintf 'crow 1.2.3\\n'\nexit 1\n").unwrap();
-        assert!(executable_version(&executable).await.is_err());
-        fs::write(&executable, "#!/bin/sh\nhead -c 5000 /dev/zero\n").unwrap();
-        assert!(executable_version(&executable).await.is_err());
+        // Immutable script bytes avoid ETXTBSY when parallel tests fork while
+        // another thread has a freshly generated executable open for writing.
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/version-check.sh");
+        for name in ["success", "failure", "oversized"] {
+            std::os::unix::fs::symlink(&fixture, tmp.path().join(name)).unwrap();
+        }
+        assert_eq!(
+            executable_version(&tmp.path().join("success"))
+                .await
+                .unwrap(),
+            "crow 1.2.3"
+        );
+        assert!(
+            executable_version(&tmp.path().join("failure"))
+                .await
+                .is_err()
+        );
+        assert!(
+            executable_version(&tmp.path().join("oversized"))
+                .await
+                .is_err()
+        );
     }
 }

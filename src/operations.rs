@@ -767,6 +767,11 @@ pub async fn doctor(config: &Value, root: &Path, runtime: bool) -> Result<Value>
             }
             .await;
             check_result(&mut checks, "review runtime", diagnostics);
+            check_result(
+                &mut checks,
+                "runtime experiments",
+                crate::execution::diagnostics(&config["worker"]).await,
+            );
         }
     }
     let persistent = async {

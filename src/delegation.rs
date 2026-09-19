@@ -758,6 +758,103 @@ mod tests {
             .insert("ab12".into(), task.clone());
         task
     }
+    #[tokio::test]
+    async fn mcp_cancellation_drains_delegation_launch_transactions() {
+        for name in [
+            "start_review_task",
+            "resume_review_task",
+            "restart_review_task",
+        ] {
+            for shutdown in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let runner: Runner = if shutdown {
+                    waiting_runner()
+                } else {
+                    Arc::new(|_, _, _, _, _, _| {
+                        Box::pin(async {
+                            Ok(json!({"summary":"Inspected the task.","findings":[]}))
+                        })
+                    })
+                };
+                let d = Delegation::init_with_runner(context(root.path(), 1), runner)
+                    .await
+                    .unwrap();
+                let args = if name == "start_review_task" {
+                    json!({"task":"inspect"})
+                } else {
+                    paused_task(
+                        &d,
+                        if name == "resume_review_task" {
+                            Some("saved-session")
+                        } else {
+                            None
+                        },
+                    )
+                    .await;
+                    json!({"id":"ab12"})
+                };
+                // Stop launch after reserving its active entry, before the first
+                // durable write and before a worker owns that entry.
+                let persistence = d.inner.persistence.lock().await;
+                let launch = d.call(name, &args);
+                tokio::pin!(launch);
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(25), &mut launch)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(d.inner.state.lock().unwrap().active.len(), 1);
+                let drained = crate::inspection::cancelled_tool(name, &mut launch);
+                tokio::pin!(drained);
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(25), &mut drained)
+                        .await
+                        .is_err(),
+                    "{name} must finish its transaction"
+                );
+                drop(persistence);
+                let launched = tokio::time::timeout(std::time::Duration::from_secs(3), drained)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let id = launched["id"].as_str().unwrap();
+                if shutdown {
+                    tokio::time::timeout(std::time::Duration::from_secs(3), d.close())
+                        .await
+                        .unwrap();
+                    assert_eq!(d.task(id).unwrap()["state"], "paused");
+                } else {
+                    assert_eq!(complete(&d, id).await["state"], "completed");
+                    assert!(
+                        d.inner
+                            .state
+                            .lock()
+                            .unwrap()
+                            .tasks
+                            .values()
+                            .all(|task| matches!(
+                                task["state"].as_str(),
+                                Some("completed" | "superseded")
+                            ))
+                    );
+                }
+                assert!(d.inner.state.lock().unwrap().active.is_empty());
+                assert_eq!(d.inner.slots.available_permits(), 1);
+                let durable: Value = serde_json::from_slice(
+                    &tokio::fs::read(d.inner.dir.join(format!("{id}.json")))
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    durable["state"],
+                    if shutdown { "paused" } else { "completed" }
+                );
+                d.close().await;
+            }
+        }
+    }
+
     // A directory at the destination makes atomic rename fail even when tests run as root.
     async fn block_task_write(d: &Delegation, id: &str) -> (PathBuf, PathBuf) {
         let path = d.inner.dir.join(format!("{id}.json"));

@@ -1,0 +1,7 @@
+FROM docker.io/library/alpine:3.23
+RUN apk add --no-cache python3 py3-pip nodejs npm chromium font-dejavu bash git curl ca-certificates build-base linux-headers pkgconf openssl-dev libffi-dev cargo rust go sqlite postgresql postgresql-client
+RUN mkdir -p /opt/browser && cd /opt/browser && npm install --ignore-scripts --no-audit --no-fund playwright-core@1.58.2
+COPY proxy.py /opt/crow/proxy.py
+ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
+# GNU tar defers directory permission restoration when unpacking read-only module caches.
+RUN apk add --no-cache tar

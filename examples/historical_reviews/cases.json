@@ -1,0 +1,67 @@
+[
+  {
+    "id": "werkzeug-3255",
+    "repo": "pallets/werkzeug",
+    "number": 3255,
+    "scenario": "Python HTTP Range parsing fix",
+    "baseTip": "12abecb2de7ddf4767570c67dc3a5a1fc5b9c81d",
+    "head": "0c419f951f3206c89e7c95155f0bd771b02a961f"
+  },
+  {
+    "id": "chi-1185",
+    "repo": "go-chi/chi",
+    "number": 1185,
+    "scenario": "Go HTTP response flushing fix",
+    "baseTip": "b1c9ab47626cc46b34393ad4d35779c4363c4e1e",
+    "head": "9b3e51c349f3fa6cf120ae786a2835e89e81da2e"
+  },
+  {
+    "id": "itoa-68",
+    "repo": "dtolnay/itoa",
+    "number": 68,
+    "scenario": "Rust integer formatting optimization",
+    "baseTip": "0d8a4899bf99e559fdf7017d3b9ad22fdbcab70d",
+    "head": "7b4c86b03eceb1fdb6e0bb8e85160dac8ba6a24a"
+  },
+  {
+    "id": "t3code-12488",
+    "repo": "pingdotgg/t3code",
+    "number": 12488,
+    "scenario": "Node/TypeScript build-tool parsing fix",
+    "baseTip": "ccad9f69aae7465c4ad4ea169d273f61ffac1eb5",
+    "head": "26aff3d65ab531c211e43bd4bdd39958c3a8ece7"
+  },
+  {
+    "id": "t3code-12443",
+    "repo": "pingdotgg/t3code",
+    "number": 12443,
+    "scenario": "Web workspace controls",
+    "baseTip": "934da57498bc0edd03148054fffa91e1e98e0de7",
+    "head": "15bd4aa4ac8d1ed40a79992bea38f6da49864c35"
+  },
+  {
+    "id": "t3code-12394",
+    "repo": "pingdotgg/t3code",
+    "number": 12394,
+    "scenario": "Android native input styling",
+    "baseTip": "994654198d5820b6fab9ee09063646a8b6fd8e22",
+    "head": "1a10f487f180d00e1f02df9bae22220adb5305f6"
+  },
+  {
+    "id": "werkzeug-3255-reversed",
+    "repo": "pallets/werkzeug",
+    "number": 3255,
+    "reverse": true,
+    "scenario": "Regression control: inverse of the Python fix",
+    "baseTip": "12abecb2de7ddf4767570c67dc3a5a1fc5b9c81d",
+    "head": "0c419f951f3206c89e7c95155f0bd771b02a961f"
+  },
+  {
+    "id": "htmx-4056",
+    "repo": "bigskysoftware/htmx",
+    "number": 4056,
+    "scenario": "Browser radio-button state during CSS transitions",
+    "baseTip": "d66f4e921a8b8207832e873dfd552cbca612581e",
+    "head": "40119cd872dc14a62268792412e239fb46127e2b"
+  }
+]

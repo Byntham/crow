@@ -198,7 +198,7 @@ Continue later with crow resume owner/repo 42.")]
 
 Editable settings:
   worker.model, worker.effort, worker.concurrency, worker.timeoutMs
-  worker.subagents, worker.retry (JSON objects)
+  worker.subagents, worker.retry, worker.execution (JSON objects)
   catchUp.enabled, catchUp.threshold, auditIntervalMs, retentionDays
 
 Choose the model and reasoning level from crow models.
@@ -552,6 +552,7 @@ async fn configured_command(format: OutputFormat, command: Command, root: &Path)
                 "worker.effort",
                 "worker.subagents",
                 "worker.retry",
+                "worker.execution",
                 "worker.timeoutMs",
                 "catchUp.enabled",
                 "catchUp.threshold",
@@ -595,6 +596,13 @@ async fn configured_command(format: OutputFormat, command: Command, root: &Path)
             } else {
                 operations::admin(&config, "status", &Value::Null).await?
             };
+            let mut result = result;
+            if config["role"] != "service" {
+                let maintenance = crate::worker::runtime_maintenance_status(root);
+                if !maintenance.is_null() {
+                    result["runtimeMaintenance"] = maintenance;
+                }
+            }
             print(format, "status", &result)?;
             let updates = operations::update_availability(root).await?;
             if updates["available"] == true {
@@ -753,15 +761,15 @@ async fn configured_command(format: OutputFormat, command: Command, root: &Path)
             if config["role"] != "service" {
                 let state =
                     crate::worker::worker_request(&config, "maintenance", &json!({})).await?;
-                let mut retention_config = config.clone();
-                retention_config["retentionDays"] = state["retentionDays"].clone();
-                result["worker"] = crate::retention::cleanup(
+                result["worker"] = crate::worker::cleanup_runtime_data(
                     root,
-                    &retention_config,
+                    &config["worker"]["execution"],
                     state["jobs"]
                         .as_array()
                         .context("Missing maintenance jobs")?,
-                )?;
+                    &state["retentionDays"],
+                )
+                .await?;
             }
             print(format, "cleanup", &result)?;
         }

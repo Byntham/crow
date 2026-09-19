@@ -250,6 +250,15 @@ fn job_rows(out: &mut String, jobs: &[&Value], limit: usize) {
         );
     }
 }
+fn maintenance(out: &mut String, value: &Value) {
+    if value["runtimeMaintenance"]["warningCount"]
+        .as_u64()
+        .unwrap_or(0)
+        > 0
+    {
+        out.push_str("\nRuntime cleanup needs attention. See runtime-maintenance.json in Crow's data directory, or run crow status --format json for details. Crow will retry maintenance automatically.\n\n");
+    }
+}
 fn status(v: &Value) -> String {
     if v.get("jobs").is_none() && v.get("repos").is_none() {
         let mut out = "Crow worker\n".to_owned();
@@ -257,6 +266,7 @@ fn status(v: &Value) -> String {
             let _ = writeln!(out, "\n{}", clean(message));
             return out;
         }
+        maintenance(&mut out, v);
         field(&mut out, "Status", state(&v["state"]));
         field(&mut out, "Service connection", state(&v["connection"]));
         field(&mut out, "Last reported", timestamp(&v["updatedAt"]));
@@ -293,6 +303,7 @@ fn status(v: &Value) -> String {
     let workers = list(&v["workers"]);
     let jobs = list(&v["jobs"]);
     let mut out = "Crow status\n".to_owned();
+    maintenance(&mut out, v);
     field(
         &mut out,
         "Service",
@@ -424,12 +435,14 @@ fn diagnostic(out: &mut String, check: &Value, depth: usize) {
         .as_str()
         .and_then(|s| serde_json::from_str::<Value>(s).ok());
     let detail = parsed.as_ref().unwrap_or(detail);
-    if detail["checks"].is_array() {
+    if check["name"] == "runtime experiments" {
+        runtime_diagnostic(out, detail, depth + 1);
+    } else if detail["checks"].is_array() {
         for child in list(&detail["checks"]) {
             diagnostic(out, child, depth + 1);
         }
         warnings(out, detail);
-    } else if detail.get("repositories").is_some() {
+    } else if detail["repositories"].is_number() {
         let _ = writeln!(
             out,
             "  {} repositories, {} workers, {} open reviews",
@@ -458,6 +471,36 @@ fn diagnostic(out: &mut String, check: &Value, depth: usize) {
         out.push_str("  Crow is reachable.\n");
     } else {
         details(out, detail, depth + 1);
+    }
+}
+fn runtime_diagnostic(out: &mut String, detail: &Value, depth: usize) {
+    let indent = "  ".repeat(depth.min(5));
+    if let Some(enabled) = detail["enabled"].as_bool() {
+        let scope = if !enabled {
+            "Disabled by worker configuration.".to_owned()
+        } else if detail["automatic"] == true {
+            "Enabled for all repositories.".to_owned()
+        } else {
+            let repositories = list(&detail["repositories"])
+                .iter()
+                .filter_map(Value::as_str)
+                .map(clean)
+                .collect::<Vec<_>>();
+            if repositories.is_empty() {
+                "Runtime experiments are enabled.".to_owned()
+            } else {
+                format!("Enabled for {}.", repositories.join(", "))
+            }
+        };
+        let _ = writeln!(out, "{indent}{scope}");
+        if let Some(explanation) = detail["detail"].as_str() {
+            let _ = writeln!(out, "{indent}{}", clean(explanation));
+        }
+        warnings(out, detail);
+    } else {
+        // Failed checks carry the runtime error string instead of a ready-state
+        // object. Keep that error visible, including older JSON-encoded errors.
+        details(out, detail, depth);
     }
 }
 fn warnings(out: &mut String, v: &Value) {
@@ -565,6 +608,24 @@ fn configuration(v: &Value) -> String {
         field(&mut out, "Worker ID", scalar(&v["worker"]["id"]));
         field(&mut out, "Service URL", scalar(&v["serviceUrl"]));
         settings(&mut out, &v["worker"]);
+        let repositories = v["worker"]["execution"]["repositories"].as_object();
+        field(
+            &mut out,
+            "Runtime experiments",
+            if v["worker"]["execution"]["automatic"] == true {
+                "Enabled for all repositories".to_owned()
+            } else {
+                repositories.filter(|r| !r.is_empty()).map_or_else(
+                    || "Disabled".to_owned(),
+                    |r| {
+                        format!(
+                            "Enabled for {}",
+                            r.keys().cloned().collect::<Vec<_>>().join(", ")
+                        )
+                    },
+                )
+            },
+        );
     }
     if v["role"] != "worker" {
         section(&mut out, "Scheduling and history");
@@ -807,6 +868,21 @@ fn cleanup(v: &Value) -> String {
             let _ = writeln!(out, "Removed expired files for {}.", counted(n, "review"));
         }
     }
+    if v["skipped"] == true {
+        out.push_str(
+            "Another runtime cleanup is running. Its results will appear in crow status.\n",
+        );
+    }
+    if v["cacheBytesRemoved"].is_number() {
+        let _ = writeln!(
+            out,
+            "Runtime cleanup removed {} containers, {} image tags, {} temporary files and {} cached bytes.",
+            list(&v["runtime"]["containers"]).len(),
+            list(&v["runtime"]["images"]).len(),
+            v["runtime"]["temporaryFiles"].as_u64().unwrap_or(0),
+            v["cacheBytesRemoved"]
+        );
+    }
     warnings(&mut out, v);
     out
 }
@@ -876,6 +952,16 @@ mod tests {
         assert!(output.lines().count() < 35);
     }
     #[test]
+    fn configuration_reports_runtime_authority() {
+        let mut config = crate::config::defaults(std::path::Path::new("/tmp/crow"));
+        assert!(render("config", &config).contains("Disabled"));
+        config["worker"]["execution"] = json!({"automatic":true});
+        assert!(render("config", &config).contains("Enabled for all repositories"));
+        config["worker"]["execution"] = json!({"repositories":{"owner/repo":{}}});
+        assert!(render("config", &config).contains("Enabled for owner/repo"));
+    }
+
+    #[test]
     fn configuration_hides_secrets_and_explains_defaults() {
         let mut config = crate::config::defaults(std::path::Path::new("/tmp/crow"));
         config["worker"]["token"] = json!("do-not-print");
@@ -904,6 +990,41 @@ mod tests {
         assert!(output.contains("[FAIL] Codex version"));
         assert!(output.contains("Upgrade Codex"));
         assert!(!output.contains("{\""));
+    }
+    #[test]
+    fn runtime_doctor_renders_authority_readiness_and_errors_without_service_counts() {
+        let ready = "Local rootless Podman, cgroup v2, seccomp and explicit images are available. Automatic toolchain images are provisioned on first use. Each experiment verifies actual resource limits before running source.";
+        for (detail, expected) in [
+            (json!({"enabled":true,"automatic":true,"repositories":[],"detail":ready}), format!("Enabled for all repositories.\n  {ready}")),
+            (json!({"enabled":true,"automatic":false,"repositories":["owner/one","owner/two"],"detail":ready}), format!("Enabled for owner/one, owner/two.\n  {ready}")),
+            (json!({"enabled":false,"detail":"Runtime experiments are disabled. Configure worker.execution to enable selected repositories."}), "Disabled by worker configuration.\n  Runtime experiments are disabled. Configure worker.execution to enable selected repositories.".to_owned()),
+        ] {
+            let input = json!({"ok":true,"checks":[{"name":"runtime experiments","ok":true,"detail":detail}]});
+            let original = input.clone();
+            let output = render("doctor", &input);
+            assert_eq!(output, format!("Crow health check: all 1 checks passed.\n\n[OK] runtime experiments\n  {expected}"));
+            assert_eq!(input, original, "Human rendering must not modify the JSON payload");
+            assert!(!output.contains("open reviews"));
+            assert!(!output.contains("Not set"));
+        }
+        for detail in [
+            json!("Execution requires local rootless Podman"),
+            json!(json!({"error":"Execution requires cgroup v2 and seccomp"}).to_string()),
+        ] {
+            let output = render(
+                "doctor",
+                &json!({"ok":false,"checks":[{"name":"runtime experiments","ok":false,"detail":detail}]}),
+            );
+            assert!(output.contains("[FAIL] runtime experiments"));
+            assert!(output.contains("Execution requires"));
+            assert!(!output.contains("Enabled"));
+            assert!(!output.contains("open reviews"));
+        }
+        let service = render(
+            "doctor",
+            &json!({"ok":true,"checks":[{"name":"local connection service","ok":true,"detail":{"repositories":2,"workers":1,"activeJobs":3}}]}),
+        );
+        assert!(service.contains("2 repositories, 1 workers, 3 open reviews"));
     }
     #[test]
     fn worker_snapshot_never_claims_live_health() {

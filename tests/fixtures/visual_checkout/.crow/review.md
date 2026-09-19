@@ -1,0 +1,1 @@
+For Crow PR reviews: review the changed checkout experience. Exercise the running application with the provided browser smoke test on base and head. Investigate further as needed. The README describes the environment. Report concrete regressions and be explicit about anything you cannot verify with the available tools.
