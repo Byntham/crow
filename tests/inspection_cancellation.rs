@@ -24,7 +24,15 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().into()
 }
 
-async fn scenario(eof: bool, queued_eof: bool, provider_kill: bool) {
+enum Scenario {
+    Cancellation,
+    Eof,
+    QueuedEof,
+    ProviderKill,
+    QueueOverflow,
+}
+
+async fn scenario(scenario: Scenario) {
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo");
     std::fs::create_dir(&repo).unwrap();
@@ -59,7 +67,7 @@ async fn scenario(eof: bool, queued_eof: bool, provider_kill: bool) {
         .unwrap();
     let mut input = child.stdin.take().unwrap();
     let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
-    if queued_eof {
+    if matches!(scenario, Scenario::QueuedEof) {
         // read_file awaits Git while the following request and EOF are read.
         // The queued runtime must not start after that disconnect.
         input.write_all(format!("{}\n{}\n",
@@ -98,7 +106,91 @@ async fn scenario(eof: bool, queued_eof: bool, provider_kill: bool) {
     })
     .await
     .expect("runtime command never started");
-    if provider_kill {
+    if matches!(scenario, Scenario::QueueOverflow) {
+        let ids: Vec<Value> = (100..120)
+            .map(|id| {
+                if id % 2 == 0 {
+                    json!(id)
+                } else {
+                    json!(format!("request-{id}"))
+                }
+            })
+            .collect();
+        for id in &ids {
+            input
+                .write_all(format!("{}\n", json!({"id":id,"method":"ping"})).as_bytes())
+                .await
+                .unwrap();
+        }
+        for id in &ids[16..] {
+            let response: Value = serde_json::from_str(
+                &tokio::time::timeout(Duration::from_secs(3), output.next_line())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(&response["id"], id);
+            assert_eq!(response["jsonrpc"], "2.0");
+            assert_eq!(response["error"]["code"], -32000, "{response}");
+        }
+        assert!(
+            !root.path().join("removed").exists(),
+            "An excess request must not cancel the active tool"
+        );
+        input
+            .write_all(b"{\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":7}}\n")
+            .await
+            .unwrap();
+        let response: Value = serde_json::from_str(
+            &tokio::time::timeout(Duration::from_secs(10), output.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response["id"], 7);
+        let receipt: Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(receipt["status"], "interrupted");
+        assert!(root.path().join("removed").exists());
+        for id in &ids[..16] {
+            let accepted: Value = serde_json::from_str(
+                &tokio::time::timeout(Duration::from_secs(3), output.next_line())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(&accepted["id"], id);
+            assert_eq!(accepted["result"], json!({}));
+        }
+        input.write_all(b"{\"id\":\"still-here\",\"method\":\"tools/call\",\"params\":{\"name\":\"list_experiments\",\"arguments\":{}}}\n").await.unwrap();
+        let reused: Value = serde_json::from_str(
+            &tokio::time::timeout(Duration::from_secs(3), output.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reused["id"], "still-here");
+        assert_ne!(reused["result"]["isError"], true, "{reused}");
+        drop(input);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        return;
+    }
+    if matches!(scenario, Scenario::ProviderKill) {
         let environments = root.path().join("experiments/environments");
         std::fs::create_dir_all(&environments).unwrap();
         let snapshot = environments.join("prepared.tar");
@@ -185,7 +277,7 @@ async fn scenario(eof: bool, queued_eof: bool, provider_kill: bool) {
         );
         return;
     }
-    if !eof {
+    if !matches!(scenario, Scenario::Eof) {
         // A string request ID must not cancel a request with a numeric ID.
         input.write_all(b"{\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":\"7\"}}\n{\"method\":\"notifications/initialized\"}\n").await.unwrap();
         assert!(
@@ -259,22 +351,22 @@ async fn scenario(eof: bool, queued_eof: bool, provider_kill: bool) {
 
 #[tokio::test]
 async fn mcp_cancellation_matches_request_id_awaits_cleanup_and_preserves_next_requests() {
-    scenario(false, false, false).await;
+    scenario(Scenario::Cancellation).await;
 }
 
 #[tokio::test]
 async fn mcp_stdin_eof_cancels_active_runtime_and_awaits_cleanup() {
-    scenario(true, false, false).await;
+    scenario(Scenario::Eof).await;
 }
 
 #[tokio::test]
 async fn mcp_stdin_eof_during_inspection_does_not_start_queued_runtime() {
-    scenario(false, true, false).await;
+    scenario(Scenario::QueuedEof).await;
 }
 
 #[tokio::test]
 async fn parent_recovers_after_provider_kills_mcp_during_slow_container_removal() {
-    scenario(false, false, true).await;
+    scenario(Scenario::ProviderKill).await;
 }
 
 #[tokio::test]
@@ -384,4 +476,9 @@ async fn discovery_cancellation_stops_git_and_releases_execution_lock() {
                 .success()
         );
     }
+}
+
+#[tokio::test]
+async fn full_mcp_queue_rejects_only_excess_requests_and_preserves_cancellation() {
+    scenario(Scenario::QueueOverflow).await;
 }

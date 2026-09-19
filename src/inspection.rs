@@ -1100,11 +1100,27 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
                                     // Keep calls serial while still accepting cancellation.
                                     // Limit queued requests as well as each input line.
                                     if pending.len() == 16 {
-                                        cancel.cancel();
-                                        let _ = cancelled_tool(name, &mut call).await;
-                                        bail!("Too many queued MCP requests");
+                                        let busy = json!({"jsonrpc":"2.0","id":incoming["id"],"error":{"code":-32000,"message":"MCP request queue is full; retry after pending requests complete"}});
+                                        let write = async {
+                                            stdout.write_all(busy.to_string().as_bytes()).await?;
+                                            stdout.write_all(b"\n").await?;
+                                            stdout.flush().await
+                                        };
+                                        tokio::select! {
+                                            _ = &mut stop => {
+                                                cancel.cancel();
+                                                let _ = cancelled_tool(name, &mut call).await;
+                                                break 'requests;
+                                            },
+                                            result = write => if let Err(error) = result {
+                                                cancel.cancel();
+                                                let _ = cancelled_tool(name, &mut call).await;
+                                                return Err(error.into());
+                                            }
+                                        }
+                                    } else {
+                                        pending.push_back(incoming);
                                     }
-                                    pending.push_back(incoming);
                                 }
                             }
                         }
