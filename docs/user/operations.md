@@ -1,6 +1,8 @@
 # Configuration and operations
 
-Use `crow help` for command syntax. Configuration changes take effect after `crow service-restart`; stopping preserves interrupted work where the provider has saved a usable session.
+Run `crow` or `crow help` to browse commands grouped by task. Use `crow <command> --help` for syntax and examples.
+
+Configuration changes take effect after `crow service-restart`; stopping preserves interrupted work where the provider has saved a usable session.
 
 Commands show readable summaries by default. `crow status` lists repositories, workers, and recent reviews; `crow doctor` shows which checks passed and what needs attention. Review commands show the resulting state and relevant next steps.
 
