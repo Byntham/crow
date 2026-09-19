@@ -32,10 +32,16 @@ async fn call(exec: &Execution, name: &str, args: Value) -> Value {
 
 #[tokio::test]
 #[ignore = "requires rootless Podman, the managed toolchain and public npm registry access"]
-async fn discovered_pinned_pnpm_and_modern_yarn_commands_run_offline() {
+async fn discovered_pinned_managers_and_nested_commands_run_offline() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(".crow-data/autonomous-runtime-test");
     std::fs::create_dir_all(&root).unwrap();
     for (manager, version, lockfile, lock) in [
+        (
+            "npm",
+            "10.9.0",
+            "package-lock.json",
+            r#"{"name":"crow-discovery-fixture","version":"1.0.0","lockfileVersion":3,"requires":true,"packages":{"":{"name":"crow-discovery-fixture","version":"1.0.0","hasInstallScript":true}}}"#,
+        ),
         (
             "pnpm",
             "9.15.4",
@@ -53,9 +59,15 @@ async fn discovered_pinned_pnpm_and_modern_yarn_commands_run_offline() {
         let repo = temp.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
         git(&repo, &["init", "-b", "main"]);
-        std::fs::write(repo.join("package.json"), json!({"name":"crow-discovery-fixture","version":"1.0.0","private":true,"packageManager":format!("{manager}@{version}"),"scripts":{"test":"node test.cjs"}}).to_string()).unwrap();
+        let mut scripts = json!({"test":"node test.cjs", "start":"node test.cjs"});
+        if manager == "npm" {
+            // This checks the installation lifecycle as well as later test/start
+            // shells. An absolute npm entrypoint alone leaves nested npm on PATH.
+            scripts["postinstall"] = json!("node test.cjs");
+        }
+        std::fs::write(repo.join("package.json"), json!({"name":"crow-discovery-fixture","version":"1.0.0","private":true,"packageManager":format!("{manager}@{version}"),"scripts":scripts}).to_string()).unwrap();
         std::fs::write(repo.join(lockfile), lock).unwrap();
-        std::fs::write(repo.join("test.cjs"), format!("const assert=require('node:assert/strict'); assert(process.env.npm_config_user_agent.includes('{manager}/{version}')); console.log('verified {manager}/{version} offline');\n")).unwrap();
+        std::fs::write(repo.join("test.cjs"), format!("const assert=require('node:assert/strict'); const {{execFileSync}}=require('node:child_process'); assert(process.env.npm_config_user_agent.includes('{manager}/{version}')); assert.equal(execFileSync('{manager}', ['--version'], {{encoding:'utf8'}}).trim(), '{version}'); console.log('verified {manager}/{version} including nested command');\n")).unwrap();
         git(&repo, &["add", "."]);
         git(&repo, &["commit", "-m", "package manager fixture"]);
         let commit = git(&repo, &["rev-parse", "HEAD"]);
@@ -73,19 +85,26 @@ async fn discovered_pinned_pnpm_and_modern_yarn_commands_run_offline() {
         )
         .await;
         assert_eq!(setup["status"], "passed", "{manager} preparation: {setup}");
+        if manager == "npm" {
+            assert!(
+                setup["stdout"].as_str().unwrap().contains(&format!(
+                    "verified {manager}/{version} including nested command"
+                )),
+                "npm lifecycle probe did not run: {setup}"
+            );
+        }
         let result = call(
             &exec,
             "run_experiment",
-            json!({"revision":"head","environment":setup["id"],"command":project["test"]}),
+            json!({"revision":"head","environment":setup["id"],"command":format!("{} && {}", project["test"].as_str().unwrap(), project["start"].as_str().unwrap())}),
         )
         .await;
         assert_eq!(result["status"], "passed", "{manager} test: {result}");
-        assert!(
-            result["stdout"]
-                .as_str()
-                .unwrap()
-                .contains(&format!("verified {manager}/{version} offline"))
+        assert!(result["stdout"].as_str().unwrap().contains(&format!(
+            "verified {manager}/{version} including nested command"
+        )));
+        println!(
+            "Discovered {manager}@{version}: setup passed; pinned manager ran test/start and nested commands offline."
         );
-        println!("Discovered {manager}@{version}: setup passed; pinned manager ran test offline.");
     }
 }

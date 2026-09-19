@@ -280,6 +280,120 @@ fn go_zip_checksums_cover_entry_names_and_contents() {
 }
 
 #[test]
+fn go_zip_directory_entries_match_go_dirhash_and_invalidate_old_pins() {
+    // Independently computed with the managed image's real Go implementation:
+    // golang.org/x/mod/sumdb/dirhash.HashZip(path, dirhash.Hash1).
+    const PLAIN: &str = "h1://SsL+qsG2XNW4UV2fUFcFBpYyh+eYSho1uh0pTCTGM=";
+    const WITH_DIRECTORY: &str = "h1:29Kh5CWmDNDUwzyafYH8DQ8rA9DyPcmG15u+tQtiSpA=";
+    assert_eq!(
+        h1("example.org/module@v1.0.0/source.go", b"package module\n"),
+        PLAIN
+    );
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let path = "example.org/module/@v/v1.0.0.zip";
+    let relative = format!("{GO}/{path}");
+    let fullpath = source.path().join(&relative);
+    std::fs::create_dir_all(fullpath.parent().unwrap()).unwrap();
+    let fixture = Command::new("python3")
+        .args([
+            "-I",
+            "-c",
+            concat!(
+                "import sys,zipfile\n",
+                "with zipfile.ZipFile(sys.argv[1], 'w') as z:\n",
+                " z.writestr('example.org/module@v1.0.0/source.go', b'package module\\n')\n",
+                " z.writestr('example.org/module@v1.0.0/empty/', b'')\n",
+            ),
+        ])
+        .arg(&fullpath)
+        .output()
+        .unwrap();
+    assert!(fixture.status.success());
+    let bytes = std::fs::read(&fullpath).unwrap();
+    let stale_pins = json!({"go":{path:PLAIN}});
+    let exported = run("export", source.path(), &stale_pins, &[]);
+    assert!(exported.status.success());
+    assert!(
+        names(&exported.stdout).is_empty(),
+        "Adding a directory must change the Go checksum"
+    );
+    let imported = run(
+        "import",
+        destination.path(),
+        &stale_pins,
+        &archive(&relative, &bytes, false),
+    );
+    assert!(!imported.status.success());
+    assert!(String::from_utf8_lossy(&imported.stderr).contains("integrity mismatch"));
+    assert!(!destination.path().join(&relative).exists());
+    let correct_pins = json!({"go":{path:WITH_DIRECTORY}});
+    let exported = run("export", source.path(), &correct_pins, &[]);
+    assert!(exported.status.success());
+    assert_eq!(names(&exported.stdout), vec![relative.clone()]);
+    let imported = run(
+        "import",
+        destination.path(),
+        &correct_pins,
+        &exported.stdout,
+    );
+    assert!(
+        imported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    assert_eq!(
+        std::fs::read(destination.path().join(&relative)).unwrap(),
+        bytes
+    );
+}
+
+#[test]
+fn malformed_go_zip_directories_cannot_hide_from_checksum_validation() {
+    let root = tempfile::tempdir().unwrap();
+    let path = "example.org/module/@v/v1.0.0.zip";
+    let relative = format!("{GO}/{path}");
+    let fullpath = root.path().join(&relative);
+    std::fs::create_dir_all(fullpath.parent().unwrap()).unwrap();
+    let pins = json!({"go":{path:h1("example.org/module@v1.0.0/source.go", b"package module\n")}});
+    for (directory, content) in [
+        ("example.org/module@v1.0.0/nonempty/", "data"),
+        ("example.org/module@v1.0.0/new\nline/", ""),
+    ] {
+        let fixture = Command::new("python3")
+            .args([
+                "-I",
+                "-c",
+                concat!(
+                    "import sys,zipfile\n",
+                    "with zipfile.ZipFile(sys.argv[1], 'w') as z:\n",
+                    " z.writestr('example.org/module@v1.0.0/source.go', b'package module\\n')\n",
+                    " z.writestr(sys.argv[2], sys.argv[3].encode())\n",
+                ),
+            ])
+            .arg(&fullpath)
+            .arg(directory)
+            .arg(content)
+            .output()
+            .unwrap();
+        assert!(fixture.status.success());
+        let exported = run("export", root.path(), &pins, &[]);
+        assert!(exported.status.success());
+        assert!(names(&exported.stdout).is_empty());
+        let bytes = std::fs::read(&fullpath).unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let imported = run(
+            "import",
+            destination.path(),
+            &pins,
+            &archive(&relative, &bytes, false),
+        );
+        assert!(!imported.status.success());
+        assert!(!destination.path().join(&relative).exists());
+    }
+}
+
+#[test]
 fn cargo_and_go_pins_reject_changed_download_contents() {
     let root = tempfile::tempdir().unwrap();
     let cargo = format!("{CARGO}/example-1.0.0.crate");

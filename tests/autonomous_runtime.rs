@@ -112,11 +112,19 @@ async fn managed_setup_downloads_recovery_cache_and_screenshots() {
     let broken = call(
         &exec,
         "prepare_environment",
-        json!({"revision":"head","setup":"echo deliberate-environment-failure >&2; exit 1"}),
+        json!({"revision":"head","setup":"echo deliberate-environment-failure >&2; curl --fail --silent --show-error https://not-a-package-host.invalid/package; exit 1"}),
     )
     .await;
     assert_eq!(broken["status"], "failed", "{broken}");
     assert_eq!(broken["phase"], "setup");
+    assert!(
+        broken["gatewayErrors"]
+            .as_array()
+            .is_some_and(|errors| errors.iter().any(|error| error
+                .as_str()
+                .is_some_and(|text| text.contains("Package host is not allowed")))),
+        "{broken}"
+    );
     let setup = "npm install --no-audit --no-fund && python3 -m venv /workspace/.venv && /workspace/.venv/bin/pip install -r requirements.txt";
     let before = call(
         &exec,
@@ -291,7 +299,9 @@ checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-m", "toolchains"]);
     let commit = git(&repo, &["rev-parse", "HEAD"]);
-    let context = json!({"root":root,"source":{"dir":repo,"head":commit,"base":commit},"job":{"repo":"fixture/toolchains","settings":{"execution":{"podman":std::env::var("CROW_TEST_PODMAN").unwrap_or("podman".into()),"automatic":true}}}});
+    // Reuse the toolchain image, but require actual downloads on this test's first
+    // preparation rather than silently importing a previous test run's packages.
+    let context = json!({"root":root,"source":{"dir":repo,"head":commit,"base":commit},"job":{"repo":format!("fixture/toolchains-{}",crow::util::id()),"settings":{"execution":{"podman":std::env::var("CROW_TEST_PODMAN").unwrap_or("podman".into()),"automatic":true}}}});
     let exec = Execution::from_context(&context, &dir.path().join("experiments"))
         .unwrap()
         .unwrap();
@@ -302,6 +312,7 @@ checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
     )
     .await;
     assert_eq!(setup["status"], "passed", "{setup}");
+    assert_eq!(setup["packageCacheRestored"], false, "{setup}");
     let tested=call(&exec,"run_experiment",json!({"revision":"head","environment":setup["id"],"command":"cargo test --offline && GOPROXY=off go test ./..."})).await;
     assert_eq!(tested["status"], "passed", "{tested}");
     assert!(setup["cacheSaveError"].is_null(), "{setup}");

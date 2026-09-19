@@ -146,6 +146,15 @@ async fn cleanup_at(
                 return Ok(());
             };
             temporary_files += remove_temporary(&path, ".crow-runtime-")?;
+            // Export writes beside its destination before atomically publishing it.
+            // A killed worker can leave partial snapshots or screenshots here even
+            // when a paused review must retain its completed environments.
+            for child in ["environments", "artifacts"] {
+                let directory = path.join(child);
+                if crate::retention::directory(&directory)? {
+                    temporary_files += remove_temporary(&directory, ".crow-runtime-")?;
+                }
+            }
             if !records.is_empty() && containers.is_none() {
                 let output = podman(
                     executable,
@@ -436,6 +445,93 @@ esac
         assert!(!calls.contains(&format!("rm --ignore crow-experiment-{unrelated}")));
         drop(lock);
     }
+    #[tokio::test]
+    async fn paused_review_export_temporaries_are_removed_without_touching_active_or_foreign_files()
+    {
+        let root = tempfile::tempdir().unwrap();
+        let (program, env) = mock(root.path());
+        for job in ["paused", "locked", "foreign"] {
+            let experiments = root.path().join(format!("reviews/{job}/experiments"));
+            for child in ["", "environments", "artifacts"] {
+                let directory = experiments.join(child);
+                fs::create_dir_all(&directory).unwrap();
+                fs::write(directory.join(".crow-runtime-partial"), "partial export").unwrap();
+                fs::write(directory.join("unrelated.tmp"), "foreign file").unwrap();
+            }
+            fs::write(
+                experiments.join("environments/prepared.tar"),
+                "prepared environment",
+            )
+            .unwrap();
+            fs::write(
+                experiments.join("artifacts/screenshot.png"),
+                "saved screenshot",
+            )
+            .unwrap();
+        }
+        let lock =
+            crate::retention::execution_lock(&root.path().join("reviews/locked/experiments"))
+                .unwrap()
+                .unwrap();
+        let jobs = [
+            json!({"id":"paused","state":"paused"}),
+            json!({"id":"locked","state":"reviewing"}),
+        ];
+        let result = cleanup_at(root.path(), &program, &env, &jobs, &[], 100)
+            .await
+            .unwrap();
+        assert_eq!(result["warnings"], json!([]));
+        assert_eq!(result["temporaryFiles"], 3);
+        assert_eq!(result["deferredJobs"], json!(["locked"]));
+        for job in ["paused", "locked", "foreign"] {
+            let experiments = root.path().join(format!("reviews/{job}/experiments"));
+            for child in ["", "environments", "artifacts"] {
+                let directory = experiments.join(child);
+                assert_eq!(
+                    directory.join(".crow-runtime-partial").exists(),
+                    job != "paused"
+                );
+                assert!(directory.join("unrelated.tmp").exists());
+            }
+            assert!(experiments.join("environments/prepared.tar").exists());
+            assert!(experiments.join("artifacts/screenshot.png").exists());
+        }
+        assert!(!root.path().join("calls").exists());
+        drop(lock);
+    }
+
+    #[tokio::test]
+    async fn export_cleanup_rejects_linked_directories_and_preserves_external_files() {
+        for child in ["environments", "artifacts"] {
+            let root = tempfile::tempdir().unwrap();
+            let (program, env) = mock(root.path());
+            let external = tempfile::tempdir().unwrap();
+            fs::write(
+                external.path().join(".crow-runtime-partial"),
+                "foreign export",
+            )
+            .unwrap();
+            let experiments = root.path().join("reviews/paused/experiments");
+            fs::create_dir_all(&experiments).unwrap();
+            std::os::unix::fs::symlink(external.path(), experiments.join(child)).unwrap();
+            let result = cleanup_at(
+                root.path(),
+                &program,
+                &env,
+                &[json!({"id":"paused","state":"paused"})],
+                &[],
+                100,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result["temporaryFiles"], 0);
+            assert_eq!(result["deferredJobs"], json!(["paused"]));
+            assert!(result["warnings"][0].as_str().unwrap().contains(child));
+            assert!(external.path().join(".crow-runtime-partial").exists());
+            assert!(!root.path().join("calls").exists());
+        }
+    }
+
     #[tokio::test]
     async fn cleanup_failures_identify_review_and_leave_receipt_for_retry() {
         let root = tempfile::tempdir().unwrap();

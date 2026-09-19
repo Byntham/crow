@@ -200,7 +200,9 @@ fn node_setup(
             };
             let package = version.map_or(package.to_owned(), |v| format!("{package}@{v}"));
             (
-                binary,
+                // Lifecycle hooks and nested package scripts invoke the manager by
+                // name. Keep those subprocesses on the selected installation too.
+                format!("PATH=\"/workspace/.crow-tools/node_modules/.bin:$PATH\" {binary}"),
                 format!(
                     "npm install --prefix /workspace/.crow-tools --no-audit --no-fund {package} && "
                 ),
@@ -360,7 +362,8 @@ mod discovery_tests {
                 node_setup(&json!({"packageManager":declaration}), false, false, true);
             assert!(setup.contains(package), "{setup}");
             assert!(setup.contains(flag), "{setup}");
-            assert!(runner.starts_with("/workspace/.crow-tools/"));
+            assert!(runner.starts_with("PATH=\"/workspace/.crow-tools/node_modules/.bin:$PATH\" "));
+            assert!(setup.contains(&runner));
             assert!(warning.is_none());
             assert!(!setup.contains("sha224"));
         }
@@ -435,11 +438,11 @@ mod discovery_tests {
         );
         assert_eq!(
             found["projects"][0]["test"],
-            "/workspace/.crow-tools/node_modules/.bin/yarn test"
+            "PATH=\"/workspace/.crow-tools/node_modules/.bin:$PATH\" /workspace/.crow-tools/node_modules/.bin/yarn test"
         );
         assert_eq!(
             found["projects"][0]["start"],
-            "/workspace/.crow-tools/node_modules/.bin/yarn run dev"
+            "PATH=\"/workspace/.crow-tools/node_modules/.bin:$PATH\" /workspace/.crow-tools/node_modules/.bin/yarn run dev"
         );
     }
 }

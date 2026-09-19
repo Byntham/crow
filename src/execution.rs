@@ -618,7 +618,7 @@ impl Execution {
         ];
         if let Some(gateway) = &gateway {
             args.push(format!(
-                "--volume={}:/run/crow-downloads:ro",
+                "--volume={}:/run/crow-downloads:ro,Z",
                 gateway.directory().display()
             ));
         }
@@ -638,6 +638,39 @@ impl Execution {
             },
         )
         .await?;
+        if gateway.is_some() {
+            trace.set(Stage::GatewayStart)?;
+            // Relabel only this experiment's private socket directory. SELinux
+            // also checks the listening process domain, so a volume label alone
+            // does not prove that the host policy permits this connection.
+            let checked = self
+                .command(
+                    &[
+                        "exec",
+                        name,
+                        "/bin/sh",
+                        "-c",
+                        r#"# Crow package gateway preflight
+command -v python3 >/dev/null && [ -r /opt/crow/proxy.py ] || { echo 'Crow setup requires python3 and /opt/crow/proxy.py in the execution image' >&2; exit 125; }
+python3 -I -c 'import socket,sys
+try:
+ with socket.socket(socket.AF_UNIX) as client:
+  client.settimeout(5)
+  client.connect("/run/crow-downloads/socket")
+except PermissionError:
+ sys.exit("Crow package gateway socket access denied. Check host directory permissions and SELinux policy for container-to-worker Unix socket connections; Crow keeps container labeling enabled.")
+except OSError as error:
+ sys.exit("Crow package gateway socket is unavailable: " + str(error))'"#,
+                    ],
+                    None,
+                    None,
+                )
+                .await?;
+            ensure!(
+                checked["status"] == "passed",
+                "Package gateway connection preflight failed: {checked}"
+            );
+        }
         let restore = if prepared.is_some() {
             "tar --delay-directory-restore -xf - -C /workspace"
         } else {
@@ -780,7 +813,7 @@ impl Execution {
         }
         let command = if gateway.is_some() {
             format!(
-                "command -v python3 >/dev/null && [ -r /opt/crow/proxy.py ] || {{ echo 'Crow setup requires python3 and /opt/crow/proxy.py in the execution image' >&2; exit 125; }}\npython3 -I /opt/crow/proxy.py >/tmp/crow-proxy.log 2>&1 &\nproxy=$!\ntrap 'kill $proxy 2>/dev/null || true' EXIT\nexport HTTPS_PROXY=http://127.0.0.1:3128 HTTP_PROXY=http://127.0.0.1:3128 https_proxy=http://127.0.0.1:3128 http_proxy=http://127.0.0.1:3128 NO_PROXY=127.0.0.1,localhost\nexport PIP_INDEX_URL=https://pypi.org/simple\nmkdir -p \"$HOME\"\npython3 -I -c 'import socket,time
+                "python3 -I /opt/crow/proxy.py >/tmp/crow-proxy.log 2>&1 &\nproxy=$!\ntrap 'kill $proxy 2>/dev/null || true' EXIT\nexport HTTPS_PROXY=http://127.0.0.1:3128 HTTP_PROXY=http://127.0.0.1:3128 https_proxy=http://127.0.0.1:3128 http_proxy=http://127.0.0.1:3128 NO_PROXY=127.0.0.1,localhost\nexport PIP_INDEX_URL=https://pypi.org/simple\nmkdir -p \"$HOME\"\npython3 -I -c 'import socket,time
 for attempt in range(100):
  try:
   socket.create_connection((\"127.0.0.1\",3128),timeout=.1).close(); break
@@ -804,7 +837,10 @@ else: raise SystemExit(\"Crow dependency proxy did not start\")' || {{ cat /tmp/
             output["failureStage"] = json!(command_stage);
         }
         if let Some(gateway) = gateway {
-            gateway.close().await;
+            let errors = gateway.close().await;
+            if !errors.is_empty() {
+                output["gatewayErrors"] = json!(errors);
+            }
         }
         if let Some(snapshot) = snapshot
             && output["status"] == "passed"
@@ -1178,15 +1214,7 @@ pub fn append_summary(report: &mut Value, dir: &Path) -> Result<()> {
     if !dir.exists() {
         return Ok(());
     }
-    ensure!(
-        report["summary"]
-            .as_str()
-            .unwrap_or("")
-            .encode_utf16()
-            .count()
-            <= 8000,
-        "Shorten the review summary to 8000 UTF-16 units to leave room for experiment receipts"
-    );
+    crate::report::validate_report(report)?;
     let mut rows = Vec::new();
     let mut counts = BTreeMap::<String, usize>::new();
     for entry in std::fs::read_dir(dir)? {
@@ -1249,10 +1277,12 @@ pub fn append_summary(report: &mut Value, dir: &Path) -> Result<()> {
         ));
     }
     if rows.is_empty() {
-        report["summary"] = json!(format!(
-            "{}\n\nRuntime experiments were enabled, but none were run.",
-            report["summary"].as_str().unwrap_or("")
-        ));
+        if !append_report_suffix(
+            report,
+            "\n\nRuntime experiments were enabled, but none were run.",
+        ) {
+            append_report_suffix(report, "\n\nRuntime tests: not attempted.");
+        }
         return Ok(());
     }
     rows.sort();
@@ -1263,20 +1293,39 @@ pub fn append_summary(report: &mut Value, dir: &Path) -> Result<()> {
         .map(|(status, count)| format!("{count} {status}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let summary = loop {
+    while !rows.is_empty() {
         let rendered = format!(
-            "{}\n\n### Runtime experiments\n\nIsolated setup and offline tests. {counts}. Showing {} of {total} experiments. Outcomes include setup attempts; passing setup does not verify application behavior. Results describe these commands only; failures may reflect environment limits. Full receipts are retained on the worker.\n\n| Commit | Result | Failure location | Warnings | Exit | Command excerpt |\n| --- | --- | --- | --- | --- | --- |\n{}",
-            report["summary"].as_str().unwrap_or(""),
+            "\n\n### Runtime experiments\n\nIsolated setup and offline tests. {counts}. Showing {} of {total} experiments. Outcomes include setup attempts; passing setup does not verify application behavior. Results describe these commands only; failures may reflect environment limits. Full receipts are retained on the worker.\n\n| Commit | Result | Failure location | Warnings | Exit | Command excerpt |\n| --- | --- | --- | --- | --- | --- |\n{}",
             rows.len(),
             rows.join("\n")
         );
-        if rendered.encode_utf16().count() <= 16000 || rows.is_empty() {
-            break rendered;
+        if append_report_suffix(report, &rendered) {
+            return Ok(());
         }
         rows.pop();
-    };
-    report["summary"] = json!(summary);
+    }
+    // Preserve the model's report even when findings consume the entire publication
+    // allowance. Runtime counters also remain in the main status and worker receipts.
+    append_report_suffix(
+        report,
+        &format!("\n\nRuntime setup and test attempts: {counts}."),
+    );
     Ok(())
+}
+
+fn append_report_suffix(report: &mut Value, suffix: &str) -> bool {
+    let mut candidate = report.clone();
+    candidate["summary"] = json!(format!(
+        "{}{suffix}",
+        report["summary"].as_str().unwrap_or("")
+    ));
+    // Check serialized UTF-8 bytes, summary UTF-16 units and rendered findings
+    // together, using the same validation as the final publication path.
+    if crate::report::validate_report(&candidate).is_err() {
+        return false;
+    }
+    report["summary"] = candidate["summary"].take();
+    true
 }
 
 pub async fn diagnostics(settings: &Value) -> Result<Value> {
@@ -1440,6 +1489,102 @@ mod tests {
         assert!(summary.contains("screenshot collection"));
         assert!(summary.contains("container cleanup"));
         assert!(!summary.contains("private"));
+    }
+
+    fn unicode_report_with_serialized_size(bytes: usize) -> Value {
+        let findings = (0..10)
+            .map(|index| {
+                json!({
+                    "title":format!("Finding {index}"), "body":"🦀".repeat(900),
+                    "path":format!("src/file{index}.rs"), "line":1, "severity":"medium"
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut report = crate::report::validate_report(
+            &json!({"summary":"Review summary.","findings":findings}),
+        )
+        .unwrap();
+        let padding = bytes
+            .checked_sub(serde_json::to_vec(&report).unwrap().len())
+            .unwrap();
+        report["summary"] = json!(format!("Review summary.{}", "s".repeat(padding)));
+        let report = crate::report::validate_report(&report).unwrap();
+        assert_eq!(serde_json::to_vec(&report).unwrap().len(), bytes);
+        report
+    }
+
+    #[test]
+    fn receipt_appendix_respects_whole_report_bytes_and_preserves_unicode_findings() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..12 {
+            crate::util::atomic(
+                &dir.path().join(format!("{index}.json")),
+                &json!({
+                    "commit":"a".repeat(40), "phase":"test", "status":"failed", "exitCode":1,
+                    "command":"🦀\\\"".repeat(80)
+                }),
+            )
+            .unwrap();
+        }
+        for bytes in [43_000, 44_750, 45_000] {
+            let original = unicode_report_with_serialized_size(bytes);
+            let mut report = original.clone();
+            append_summary(&mut report, dir.path()).unwrap();
+            let checked = crate::report::validate_report(&report).unwrap();
+            assert_eq!(checked["findings"], original["findings"]);
+            let summary = checked["summary"].as_str().unwrap();
+            assert!(summary.starts_with(original["summary"].as_str().unwrap()));
+            if bytes == 45_000 {
+                assert_eq!(checked, original);
+            } else {
+                assert!(summary.contains("12 failed"));
+                if bytes == 44_750 {
+                    assert!(summary.contains("Runtime setup and test attempts"));
+                    assert!(!summary.contains("| Commit |"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_attempt_note_cannot_overflow_a_valid_report() {
+        let dir = tempfile::tempdir().unwrap();
+        for bytes in [44_960, 45_000] {
+            let original = unicode_report_with_serialized_size(bytes);
+            let mut report = original.clone();
+            append_summary(&mut report, dir.path()).unwrap();
+            let checked = crate::report::validate_report(&report).unwrap();
+            assert_eq!(checked["findings"], original["findings"]);
+            if bytes == 45_000 {
+                assert_eq!(checked, original);
+            } else {
+                assert!(
+                    checked["summary"]
+                        .as_str()
+                        .unwrap()
+                        .ends_with("Runtime tests: not attempted.")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn full_utf16_summary_is_preserved_with_or_without_runtime_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let original =
+            crate::report::validate_report(&json!({"summary":"🦀".repeat(8000),"findings":[]}))
+                .unwrap();
+        let mut report = original.clone();
+        append_summary(&mut report, dir.path()).unwrap();
+        assert_eq!(report, original);
+        crate::util::atomic(
+            &dir.path().join("one.json"),
+            &json!({"status":"passed","phase":"test","command":"true"}),
+        )
+        .unwrap();
+        append_summary(&mut report, dir.path()).unwrap();
+        assert_eq!(report, original);
+        crate::report::validate_report(&report).unwrap();
     }
 
     #[test]

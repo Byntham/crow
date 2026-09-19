@@ -31,17 +31,23 @@ def digest_h1(data, is_zip):
     else:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             entries = archive.infolist()
-            files = [entry for entry in entries if not entry.is_dir()]
-            if (len(entries) > COUNT_LIMIT or sum(entry.file_size for entry in files) > LIMIT
-                    or len({entry.filename for entry in files}) != len(files)):
+            if (len(entries) > COUNT_LIMIT or sum(entry.file_size for entry in entries) > LIMIT
+                    or len({entry.filename for entry in entries}) != len(entries)):
                 raise ValueError('Invalid or oversized module zip')
-            for entry in sorted(files, key=lambda entry: entry.filename):
+            # Go dirhash.HashZip hashes every ZIP entry, including empty directory
+            # entries. Omitting directories would accept bytes Go rejects for a pin.
+            for entry in sorted(entries, key=lambda entry: entry.filename):
                 if '\n' in entry.filename:
                     raise ValueError('Invalid module zip filename')
                 content_hash = hashlib.sha256()
-                with archive.open(entry) as source:
-                    while chunk := source.read(65536):
-                        content_hash.update(chunk)
+                if entry.is_dir():
+                    # archive/zip.File.Open rejects directories with nonzero data.
+                    if entry.file_size != 0:
+                        raise ValueError('Invalid module zip directory')
+                else:
+                    with archive.open(entry) as source:
+                        while chunk := source.read(65536):
+                            content_hash.update(chunk)
                 digest.update((content_hash.hexdigest() + '  ' + entry.filename + '\n').encode())
     return 'h1:' + base64.b64encode(digest.digest()).decode()
 

@@ -129,7 +129,12 @@ args = sys.argv[1:]
 if args[0] == 'info':
     print(json.dumps({{'host': {{'security': {{'rootless': True, 'seccompEnabled': True}}, 'serviceIsRemote': False, 'cgroupVersion': 'v2'}}}}))
     sys.exit(0)
-if args[0] in ['run', 'rm']:
+if args[0] == 'run':
+    mounts = [arg for arg in args if arg.startswith('--volume=')]
+    assert all(arg.endswith(':/run/crow-downloads:ro,Z') for arg in mounts), mounts
+    assert '--security-opt=label=disable' not in args, args
+    sys.exit(0)
+if args[0] == 'rm':
     sys.exit(0)
 assert args[0] == 'exec', args
 if args[1] == '--interactive':
@@ -154,6 +159,12 @@ if args[2] == 'cat':
     time.sleep(60)
     sys.exit(0)
 assert args[2:4] == ['/bin/sh', '-c'], args
+if args[4].startswith('# Crow package gateway preflight'):
+    if mode == 'gateway_denied':
+        print('Crow package gateway socket access denied. Check host directory permissions and SELinux policy.', file=sys.stderr)
+        sys.exit(125)
+    sys.exit(0)
+assert mode != 'gateway_denied', 'Setup must not run after gateway preflight failure'
 if args[4].startswith('read memory '):
     sys.exit(0)
 print('fixture command completed', flush=True)
@@ -220,6 +231,26 @@ sys.exit(7 if mode in ['artifact_timeout', 'setup_failed'] else 0)
         .unwrap();
         assert_eq!(persisted, *result);
     }
+}
+
+#[tokio::test]
+async fn denied_gateway_is_reported_before_repository_setup() {
+    let fixture = PostCommandFixture::new("gateway_denied");
+    let result = fixture
+        .execution
+        .call(
+            "prepare_environment",
+            &json!({"revision":"head","setup":fixture.command()}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["status"], "error", "{result}");
+    assert_eq!(result["failureStage"], "gateway_start", "{result}");
+    assert_eq!(result["containerStarted"], true);
+    assert!(result["error"].as_str().unwrap().contains("SELinux policy"));
+    assert!(!fixture.snapshot(&result).exists());
+    fixture.check_clean(&result);
 }
 
 #[tokio::test]
