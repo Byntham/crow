@@ -277,7 +277,7 @@ async fn cleanup_images(
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok((vec![], 0)),
         Err(error) => return Err(error.into()),
     }
-    let count = remove_temporary(&cache, ".crow-build-")?;
+    let mut count = remove_temporary(&cache, ".crow-build-")?;
     let registry = cache.join("images");
     if !crate::retention::directory(&registry)? {
         return Ok((vec![], count));
@@ -286,6 +286,28 @@ async fn cleanup_images(
     let mut removed = vec![];
     for entry in fs::read_dir(registry)? {
         let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // Image registration uses util::atomic while holding image.lock. A
+        // killed writer can leave a partial temporary file, never a record.
+        if name
+            .strip_prefix(".crow-")
+            .and_then(|name| name.strip_suffix(".tmp"))
+            .is_some_and(|random| {
+                !random.is_empty() && random.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            })
+        {
+            let kind = entry.file_type()?;
+            if kind.is_file() || kind.is_symlink() {
+                fs::remove_file(entry.path())?;
+                count += 1;
+            }
+            continue;
+        }
+        if !name.strip_suffix(".json").is_some_and(|hash| {
+            hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) {
+            continue;
+        }
         let record = read_record(&entry.path())?;
         let tag = record["tag"]
             .as_str()
@@ -575,6 +597,7 @@ mod tests {
         let image = format!("sha256:{}", "a".repeat(64));
         let protected = format!("sha256:{}", "b".repeat(64));
         let old_tag = format!("localhost/crow-runtime:{}", "a".repeat(20));
+        let mut records = BTreeMap::new();
         for (name, tag, id, last_used) in [
             ("old", old_tag.clone(), image.clone(), 0),
             ("current", current.clone(), image.clone(), 0),
@@ -597,10 +620,11 @@ mod tests {
                 0,
             ),
         ] {
-            file(
-                &cache.join(format!("images/{name}.json")),
-                &json!({"tag":tag,"image":id,"lastUsedAt":last_used}),
-            );
+            let path = cache
+                .join("images")
+                .join(format!("{}.json", crate::runtime::fingerprint(&[&tag])));
+            file(&path, &json!({"tag":tag,"image":id,"lastUsedAt":last_used}));
+            records.insert(name, path);
         }
         file(&root.path().join("images.json"), &json!([{"Id":image}]));
         file(&root.path().join("containers.json"), &json!([]));
@@ -619,9 +643,9 @@ mod tests {
         assert_eq!(result["warnings"], json!([]));
         assert_eq!(result["images"], json!([old_tag]));
         assert_eq!(result["temporaryFiles"], 1);
-        assert!(!cache.join("images/old.json").exists());
+        assert!(!records["old"].exists());
         for name in ["current", "recent", "paused", "retagged"] {
-            assert!(cache.join(format!("images/{name}.json")).exists());
+            assert!(records[name].exists());
         }
         let calls = fs::read_to_string(root.path().join("calls")).unwrap();
         assert_eq!(
@@ -633,6 +657,65 @@ mod tests {
         );
         assert!(!calls.contains("prune"));
         assert!(!calls.contains("--force"));
+    }
+    #[tokio::test]
+    async fn abandoned_image_record_writes_do_not_block_expiration() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let (program, env) = mock(root.path());
+        let cache = root.path().join("runtime-cache");
+        let registry = cache.join("images");
+        fs::create_dir_all(&registry).unwrap();
+        let tag = format!("localhost/crow-runtime:{}", "a".repeat(20));
+        let image = format!("sha256:{}", "b".repeat(64));
+        let record = registry.join(format!("{}.json", crate::runtime::fingerprint(&[&tag])));
+        file(&record, &json!({"tag":tag,"image":image,"lastUsedAt":0}));
+        file(&root.path().join("images.json"), &json!([{"Id":image}]));
+        let partial = registry.join(".crow-Ab1234.tmp");
+        fs::write(&partial, "{\"tag\":").unwrap();
+        fs::write(registry.join("notes.json"), "not a registry record").unwrap();
+        fs::write(registry.join(".crow-user-note"), "unrelated").unwrap();
+        let outside = root.path().join("keep.txt");
+        fs::write(&outside, "keep").unwrap();
+        symlink(&outside, registry.join(".crow-Cd5678.tmp")).unwrap();
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(cache.join("image.lock"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&file).unwrap();
+        let lock = crate::retention::Lock(file);
+        let now = 30 * 86_400_000;
+        let protected = HashSet::new();
+        let result = cleanup_images(root.path(), &program, &env, &protected, now)
+            .await
+            .unwrap();
+        assert_eq!(result, (vec![], 0));
+        assert!(
+            partial.exists(),
+            "A live image writer owns its temporary file"
+        );
+        assert!(record.exists());
+        assert!(!root.path().join("calls").exists());
+        drop(lock);
+        let (removed, count) = cleanup_images(root.path(), &program, &env, &protected, now)
+            .await
+            .unwrap();
+        assert_eq!(removed, vec![tag]);
+        assert_eq!(count, 2);
+        assert!(!partial.exists());
+        assert!(fs::symlink_metadata(registry.join(".crow-Cd5678.tmp")).is_err());
+        assert!(!record.exists());
+        assert!(registry.join("notes.json").exists());
+        assert!(registry.join(".crow-user-note").exists());
+        assert_eq!(fs::read_to_string(outside).unwrap(), "keep");
+        assert_eq!(
+            cleanup_images(root.path(), &program, &env, &protected, now)
+                .await
+                .unwrap(),
+            (vec![], 0)
+        );
     }
     #[test]
     fn separate_worker_roots_have_separate_image_tags() {
@@ -729,9 +812,11 @@ mod tests {
                 &json!({"id":id,"status":"running"}),
             );
         }
-        for (name, tag) in [("old", &old), ("current", &current)] {
+        for tag in [&old, &current] {
             file(
-                &cache.join(format!("images/{name}.json")),
+                &cache
+                    .join("images")
+                    .join(format!("{}.json", crate::runtime::fingerprint(&[tag]))),
                 &json!({"tag":tag,"image":image,"lastUsedAt":0}),
             );
         }

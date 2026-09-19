@@ -31,6 +31,12 @@ def digest_h1(data, is_zip):
     else:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             entries = archive.infolist()
+            # Go archive/zip supports Store and Deflate, unlike Python's additional
+            # BZIP2/LZMA codecs. Unsupported encoding must never become a cache hit.
+            if any(entry.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)
+                   or entry.flag_bits & (0x1 | 0x20 | 0x40 | 0x2000)
+                   for entry in entries):
+                raise ValueError('Unsupported module zip encoding')
             # Go hashes raw ZIP filename bytes. Python truncates NUL names, can
             # honor Unicode Path extra fields, and decodes legacy names as CP437.
             # Cache only names whose UTF-8 encoding preserves the original bytes.
@@ -52,10 +58,10 @@ def digest_h1(data, is_zip):
                     # archive/zip.File.Open rejects directories with nonzero data.
                     if entry.file_size != 0:
                         raise ValueError('Invalid module zip directory')
-                else:
-                    with archive.open(entry) as source:
-                        while chunk := source.read(65536):
-                            content_hash.update(chunk)
+                # Opening directories also checks their local header, as Go does.
+                with archive.open(entry) as source:
+                    while chunk := source.read(65536):
+                        content_hash.update(chunk)
                 digest.update((content_hash.hexdigest() + '  ' + entry.filename + '\n').encode())
     return 'h1:' + base64.b64encode(digest.digest()).decode()
 

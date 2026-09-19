@@ -346,6 +346,34 @@ fn go_zip_directory_entries_match_go_dirhash_and_invalidate_old_pins() {
         std::fs::read(destination.path().join(&relative)).unwrap(),
         bytes
     );
+    // An empty directory still needs a valid local ZIP header. Go validates it
+    // before returning the empty stream; hashing only central metadata misses it.
+    let corrupted = Command::new("python3")
+        .args(["-I", "-c", concat!(
+            "import pathlib,sys,zipfile\n",
+            "path=pathlib.Path(sys.argv[1])\n",
+            "with zipfile.ZipFile(path) as z: offset=next(entry.header_offset for entry in z.infolist() if entry.is_dir())\n",
+            "data=bytearray(path.read_bytes()); data[offset:offset+4]=b'BAD!'; path.write_bytes(data)\n",
+        )])
+        .arg(&fullpath)
+        .output()
+        .unwrap();
+    assert!(corrupted.status.success());
+    let exported = run("export", source.path(), &correct_pins, &[]);
+    assert!(exported.status.success());
+    assert!(names(&exported.stdout).is_empty());
+    let corrupted_bytes = std::fs::read(&fullpath).unwrap();
+    let imported = run(
+        "import",
+        destination.path(),
+        &correct_pins,
+        &archive(&relative, &corrupted_bytes, false),
+    );
+    assert!(!imported.status.success());
+    assert_eq!(
+        std::fs::read(destination.path().join(&relative)).unwrap(),
+        bytes
+    );
 }
 
 #[test]
@@ -471,6 +499,82 @@ fn go_zip_parser_filename_normalization_cannot_match_an_unrelated_pin() {
             destination.path().join(&relative).exists(),
             accepted,
             "{kind}"
+        );
+        if accepted {
+            assert_eq!(
+                std::fs::read(destination.path().join(&relative)).unwrap(),
+                bytes
+            );
+        }
+    }
+}
+
+#[test]
+fn go_zip_cache_accepts_only_supported_compression_and_unencrypted_entries() {
+    let source = tempfile::tempdir().unwrap();
+    let path = "example.org/module/@v/v1.0.0.zip";
+    let relative = format!("{GO}/{path}");
+    let fullpath = source.path().join(&relative);
+    std::fs::create_dir_all(fullpath.parent().unwrap()).unwrap();
+    // Independently verified with Go HashZip: Store and Deflate share this
+    // checksum; BZIP2 and LZMA return "unsupported compression algorithm".
+    let pins = json!({"go":{path:"h1://SsL+qsG2XNW4UV2fUFcFBpYyh+eYSho1uh0pTCTGM="}});
+    for (method, flags, accepted) in [
+        ("stored", 0, true),
+        ("deflated", 0, true),
+        ("bzip2", 0, false),
+        ("lzma", 0, false),
+        ("stored", 0x1, false),
+        ("stored", 0x20, false),
+        ("stored", 0x40, false),
+        ("stored", 0x2000, false),
+    ] {
+        let fixture = Command::new("python3").args(["-I", "-c", concat!(
+            "import pathlib,struct,sys,zipfile\n",
+            "path=pathlib.Path(sys.argv[1]); method=sys.argv[2]; flags=int(sys.argv[3])\n",
+            "compression={'stored':zipfile.ZIP_STORED,'deflated':zipfile.ZIP_DEFLATED,'bzip2':zipfile.ZIP_BZIP2,'lzma':zipfile.ZIP_LZMA}[method]\n",
+            "with zipfile.ZipFile(path,'w',compression=compression) as z: z.writestr('example.org/module@v1.0.0/source.go',b'package module\\n')\n",
+            "data=bytearray(path.read_bytes())\n",
+            "for signature,offset in [(b'PK\\x03\\x04',6),(b'PK\\x01\\x02',8)]:\n",
+            " position=data.index(signature)+offset\n",
+            " struct.pack_into('<H',data,position,struct.unpack_from('<H',data,position)[0]|flags)\n",
+            "path.write_bytes(data)\n",
+        )]).arg(&fullpath).arg(method).arg(flags.to_string()).output().unwrap();
+        assert!(
+            fixture.status.success(),
+            "{}",
+            String::from_utf8_lossy(&fixture.stderr)
+        );
+        let exported = run("export", source.path(), &pins, &[]);
+        // One unsupported archive is skipped rather than aborting cache export.
+        assert!(
+            exported.status.success(),
+            "{method}/{flags}: {}",
+            String::from_utf8_lossy(&exported.stderr)
+        );
+        assert_eq!(
+            !names(&exported.stdout).is_empty(),
+            accepted,
+            "{method}/{flags}"
+        );
+        let destination = tempfile::tempdir().unwrap();
+        let bytes = std::fs::read(&fullpath).unwrap();
+        let imported = run(
+            "import",
+            destination.path(),
+            &pins,
+            &archive(&relative, &bytes, false),
+        );
+        assert_eq!(
+            imported.status.success(),
+            accepted,
+            "{method}/{flags}: {}",
+            String::from_utf8_lossy(&imported.stderr)
+        );
+        assert_eq!(
+            destination.path().join(&relative).exists(),
+            accepted,
+            "{method}/{flags}"
         );
         if accepted {
             assert_eq!(

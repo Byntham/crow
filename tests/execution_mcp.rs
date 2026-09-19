@@ -86,12 +86,85 @@ impl Mcp {
     }
 }
 
+async fn wait_for_test_container(podman: &str, experiments: &Path, command: &str) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            for entry in std::fs::read_dir(experiments).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().is_none_or(|extension| extension != "json") {
+                    continue;
+                }
+                let receipt: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+                if receipt["command"] != command
+                    || receipt["status"] != "running"
+                    || receipt["stage"] != "test_command"
+                {
+                    continue;
+                }
+                let name = format!("crow-experiment-{}", receipt["id"].as_str().unwrap());
+                let out = Command::new(podman)
+                    .args([
+                        "ps",
+                        "--format={{.Names}}",
+                        "--filter",
+                        &format!("name={name}"),
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(out.status.success());
+                if String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .any(|line| line == name)
+                {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("This test's experiment did not reach its running container");
+}
+
 #[tokio::test]
 #[ignore = "requires local rootless Podman and a preloaded Alpine image"]
 async fn real_mcp_regression_isolation_deadline_recovery_and_publication() {
     let podman = std::env::var("CROW_TEST_PODMAN").unwrap_or("podman".into());
     let image = std::env::var("CROW_TEST_IMAGE")
         .expect("Set CROW_TEST_IMAGE to the local Alpine sha256 image ID");
+    // Keep an unrelated review active throughout this test. Both interruption
+    // synchronization and leak assertions must use this review's own receipts.
+    struct UnrelatedContainer(String, String);
+    impl Drop for UnrelatedContainer {
+        fn drop(&mut self) {
+            let _ = Command::new(&self.0)
+                .args(["rm", "--force", "--ignore", &self.1])
+                .output();
+        }
+    }
+    let unrelated = UnrelatedContainer(
+        podman.clone(),
+        format!("crow-experiment-{}", crow::util::id()),
+    );
+    let started = Command::new(&podman)
+        .args([
+            "run",
+            "--detach",
+            "--pull=never",
+            "--network=none",
+            "--name",
+            &unrelated.1,
+            &image,
+            "sleep",
+            "300",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
     std::fs::create_dir(&repo).unwrap();
@@ -257,7 +330,12 @@ exit 1
     );
     // Signal while a container and its descendant are active.
     mcp.input.write_all(format!("{}\n", json!({"id":1,"method":"tools/call","params":{"name":"run_experiment","arguments":{"revision":"head","command":"echo active; sleep 60 & wait"}}})).as_bytes()).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    wait_for_test_container(
+        &podman,
+        &dir.path().join("experiments"),
+        "echo active; sleep 60 & wait",
+    )
+    .await;
     assert_eq!(
         unsafe { libc::kill(mcp.child.id().unwrap() as i32, libc::SIGTERM) },
         0
@@ -282,26 +360,7 @@ exit 1
     // Abrupt loss must recover a running receipt and remove its container.
     let mut mcp = Mcp::new(&source, &context);
     mcp.input.write_all(format!("{}\n", json!({"id":1,"method":"tools/call","params":{"name":"run_experiment","arguments":{"revision":"head","command":"sleep 60"}}})).as_bytes()).await.unwrap();
-    let active = async {
-        loop {
-            let out = Command::new(&podman)
-                .args([
-                    "ps",
-                    "--format={{.Names}}",
-                    "--filter",
-                    "name=crow-experiment-",
-                ])
-                .output()
-                .unwrap();
-            if !out.stdout.is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), active)
-        .await
-        .unwrap();
+    wait_for_test_container(&podman, &dir.path().join("experiments"), "sleep 60").await;
     mcp.child.kill().await.unwrap();
     mcp.child.wait().await.unwrap();
     let mut mcp = Mcp::new(&source, &context);
@@ -359,6 +418,7 @@ exit 1
     // Other reviews may share the engine. Only this test's receipt-owned
     // containers must be gone, including interrupted attempts recovered above.
     let remaining = String::from_utf8(output.stdout).unwrap();
+    assert!(remaining.lines().any(|line| line == unrelated.1));
     for entry in std::fs::read_dir(dir.path().join("experiments")).unwrap() {
         let path = entry.unwrap().path();
         if path

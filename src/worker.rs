@@ -1374,8 +1374,12 @@ esac
     async fn configured_immutable_images_are_protected_without_active_reviews() {
         let root = tempfile::tempdir().unwrap();
         let image = format!("sha256:{}", "a".repeat(64));
-        let record = root.path().join("runtime-cache/images/old.json");
-        util::atomic(&record, &json!({"tag":format!("localhost/crow-runtime:{}", "a".repeat(20)),"image":image,"lastUsedAt":0})).unwrap();
+        let tag = format!("localhost/crow-runtime:{}", "a".repeat(20));
+        let record = root
+            .path()
+            .join("runtime-cache/images")
+            .join(format!("{}.json", crate::runtime::fingerprint(&[&tag])));
+        util::atomic(&record, &json!({"tag":tag,"image":image,"lastUsedAt":0})).unwrap();
         // A protected image must be skipped before invoking Podman at all.
         let config =
             json!({"podman":"/missing-podman","repositories":{"owner/project":{"image":image}}});
