@@ -473,6 +473,82 @@ __metadata:
     println!(
         "Yarn fetched is-number@7.0.0 with an immutable lock. Direct, nested, and outer-recursive workspaces used remote and local PnP dependencies offline; nested Yarn commands passed and setup proxy settings were absent."
     );
+    // Repeating the root's pin or adding a nested lockfile does not make a
+    // selected Yarn member independent. Cover own and intermediate settings.
+    for directory in ["packages/app", "packages/app/tools/helper"] {
+        let path = repo.join(directory).join("package.json");
+        let mut package: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        package["packageManager"] = json!("yarn@4.9.2");
+        std::fs::write(path, package.to_string()).unwrap();
+    }
+    std::fs::write(repo.join("packages/app/yarn.lock"), "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\"app@workspace:.\":\n  version: 0.0.0-use.local\n  resolution: \"app@workspace:.\"\n  languageName: unknown\n  linkType: soft\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(
+        &repo,
+        &["commit", "-m", "repeat root pin and add nested lockfile"],
+    );
+    let pinned_commit = git(&repo, &["rev-parse", "HEAD"]);
+    let mut pinned_context = context.clone();
+    pinned_context["source"]["head"] = json!(pinned_commit);
+    let pinned_exec =
+        Execution::from_context(&pinned_context, &temp.path().join("pinned-experiments"))
+            .unwrap()
+            .unwrap();
+    let pinned_found = call(
+        &pinned_exec,
+        "discover_environment",
+        json!({"revision":"head"}),
+    )
+    .await;
+    for directory in [
+        "packages/app",
+        "packages/app/plugins/foo",
+        "packages/app/tools/helper",
+    ] {
+        let project = pinned_found["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|project| project["directory"] == directory)
+            .unwrap();
+        assert!(
+            project["warning"]
+                .as_str()
+                .unwrap()
+                .contains("Nested pins or lockfiles"),
+            "{project}"
+        );
+        for command in ["setup", "test", "start"] {
+            assert_eq!(project[command], "", "{project}");
+        }
+    }
+    let root_project = pinned_found["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|project| project["directory"] == ".")
+        .unwrap();
+    let runner = child["test"]
+        .as_str()
+        .unwrap()
+        .strip_suffix(" test")
+        .unwrap();
+    let actual = call(&pinned_exec, "prepare_environment", json!({"revision":"head","setup":format!("{} && {runner} workspaces list --json",root_project["setup"].as_str().unwrap())})).await;
+    assert_eq!(actual["status"], "passed", "{actual}");
+    for directory in ["packages/app/plugins/foo", "packages/app/tools/helper"] {
+        assert!(
+            actual["stdout"]
+                .as_str()
+                .unwrap()
+                .lines()
+                .any(|line| serde_json::from_str::<Value>(line)
+                    .is_ok_and(|workspace| workspace["location"] == directory)),
+            "Yarn must still own {directory}: {actual}"
+        );
+    }
+    println!(
+        "Yarn still selected members beneath repeated pins; Crow withheld ambiguous setup/test commands and gave an inspection warning."
+    );
 }
 
 #[tokio::test]

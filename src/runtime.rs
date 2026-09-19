@@ -218,40 +218,64 @@ fn workspace_member(patterns: &Value, path: &str) -> Option<bool> {
     Some(matched)
 }
 
+fn node_lockfile(files: &[&str], directory: &str) -> bool {
+    [
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+    ]
+    .iter()
+    .any(|name| project_file(files, directory, name))
+}
+
+fn nested_workspace_ambiguity(
+    directory: &str,
+    files: &[&str],
+    packages: &BTreeMap<String, Value>,
+) -> Option<String> {
+    let mut ancestor = directory;
+    while ancestor != "." {
+        ancestor = ancestor.rsplit_once('/').map_or(".", |(parent, _)| parent);
+        if packages
+            .get(ancestor)
+            .is_some_and(|package| package.get("workspaces").is_some())
+            || project_file(files, ancestor, "pnpm-workspace.yaml")
+        {
+            return Some(format!(
+                "Inspect package-manager pins and lockfiles in {directory} and workspace configuration in {ancestor} before choosing setup or test commands. Nested pins or lockfiles do not establish an independent workspace; command candidates are withheld."
+            ));
+        }
+    }
+    None
+}
+
 fn node_workspace_owner(
     directory: &str,
     package: &Value,
     files: &[&str],
     packages: &BTreeMap<String, Value>,
 ) -> std::result::Result<Option<String>, String> {
-    if directory == "."
-        || package.get("packageManager").is_some()
-        || [
-            "package-lock.json",
-            "npm-shrinkwrap.json",
-            "pnpm-lock.yaml",
-            "yarn.lock",
-        ]
-        .iter()
-        .any(|name| project_file(files, directory, name))
-    {
+    if directory == "." {
         return Ok(None);
+    }
+    if package.get("packageManager").is_some() || node_lockfile(files, directory) {
+        return nested_workspace_ambiguity(directory, files, packages).map_or(Ok(None), Err);
     }
     let mut ancestor = directory;
     let mut fallback = None;
     loop {
         ancestor = ancestor.rsplit_once('/').map_or(".", |(parent, _)| parent);
-        let independent = packages
+        let pinned = packages
             .get(ancestor)
-            .is_some_and(|package| package.get("packageManager").is_some())
-            || [
-                "package-lock.json",
-                "npm-shrinkwrap.json",
-                "pnpm-lock.yaml",
-                "yarn.lock",
-            ]
-            .iter()
-            .any(|name| project_file(files, ancestor, name));
+            .is_some_and(|package| package.get("packageManager").is_some());
+        let locked = node_lockfile(files, ancestor);
+        if (pinned || locked)
+            && let Some(warning) = nested_workspace_ambiguity(ancestor, files, packages)
+        {
+            return Err(warning);
+        }
+        let independent = pinned || locked;
         if project_file(files, ancestor, "pnpm-workspace.yaml") {
             return Err(format!(
                 "Inspect {ancestor}/pnpm-workspace.yaml and its root package.json before choosing setup or test commands. Workspace membership has not been resolved, so no npm fallback is suggested."
@@ -598,22 +622,20 @@ mod discovery_tests {
             node_workspace_owner("packages/app", &json!({}), &files, &packages),
             Ok(Some(".".into()))
         );
-        assert_eq!(
-            node_workspace_owner("nested/apps/api", &json!({}), &files, &packages),
-            Ok(Some("nested".into()))
-        );
+        assert!(node_workspace_owner("nested/apps/api", &json!({}), &files, &packages).is_err());
         assert_eq!(
             node_workspace_owner("examples/independent", &json!({}), &files, &packages),
             Ok(None)
         );
-        assert_eq!(
+        assert!(
             node_workspace_owner(
                 "packages/app",
                 &json!({"packageManager":"npm@10.9.1"}),
                 &files,
                 &packages
-            ),
-            Ok(None)
+            )
+            .unwrap_err()
+            .contains("Nested pins or lockfiles")
         );
         for lock in [
             "package-lock.json",
@@ -624,10 +646,7 @@ mod discovery_tests {
             let path = format!("packages/app/{lock}");
             let mut files = files.to_vec();
             files.push(&path);
-            assert_eq!(
-                node_workspace_owner("packages/app", &json!({}), &files, &packages),
-                Ok(None)
-            );
+            assert!(node_workspace_owner("packages/app", &json!({}), &files, &packages).is_err());
         }
         assert!(
             node_workspace_owner(
@@ -666,24 +685,24 @@ mod discovery_tests {
             "yarn.lock",
             "packages/tool/package-lock.json",
         ];
-        assert_eq!(
+        assert!(
             node_workspace_owner(
                 "packages/tool/examples/demo",
                 &json!({}),
                 &nested_files,
                 &nested
-            ),
-            Ok(None)
+            )
+            .is_err()
         );
         nested.get_mut("packages/tool").unwrap()["workspaces"] = json!(["examples/*"]);
-        assert_eq!(
+        assert!(
             node_workspace_owner(
                 "packages/tool/examples/demo",
                 &json!({}),
                 &nested_files,
                 &nested
-            ),
-            Ok(Some("packages/tool".into()))
+            )
+            .is_err()
         );
     }
 
@@ -718,9 +737,10 @@ mod discovery_tests {
         }
         packages.get_mut(".").unwrap()["packageManager"] = json!("yarn@4.9.2");
         packages.get_mut("packages/app").unwrap()["packageManager"] = json!("npm@10.9.0");
-        assert_eq!(
-            node_workspace_owner("packages/app/plugins/foo", &json!({}), &files, &packages),
-            Ok(Some("packages/app".into()))
+        assert!(
+            node_workspace_owner("packages/app/plugins/foo", &json!({}), &files, &packages)
+                .unwrap_err()
+                .contains("Nested pins or lockfiles")
         );
         packages
             .get_mut("packages/app")
@@ -730,9 +750,9 @@ mod discovery_tests {
             .remove("packageManager");
         let mut files = files.to_vec();
         files.push("packages/app/package-lock.json");
-        assert_eq!(
-            node_workspace_owner("packages/app/plugins/foo", &json!({}), &files, &packages),
-            Ok(Some("packages/app".into()))
+        assert!(
+            node_workspace_owner("packages/app/plugins/foo", &json!({}), &files, &packages)
+                .is_err()
         );
     }
 
@@ -754,12 +774,12 @@ mod discovery_tests {
             node_workspace_owner(helper, &json!({}), &files, &packages),
             Ok(Some(".".into()))
         );
-        // A nonmatching declaration is not a boundary, but an explicit pin
-        // or lockfile still makes the intermediate project independent.
+        // Both pins and lockfiles require inspection under an outer workspace.
         packages.get_mut("packages/app").unwrap()["packageManager"] = json!("npm@10.9.0");
-        assert_eq!(
-            node_workspace_owner(helper, &json!({}), &files, &packages),
-            Ok(None)
+        assert!(
+            node_workspace_owner(helper, &json!({}), &files, &packages)
+                .unwrap_err()
+                .contains("Nested pins or lockfiles")
         );
         packages
             .get_mut("packages/app")
@@ -776,10 +796,9 @@ mod discovery_tests {
             let path = format!("packages/app/{lock}");
             let mut files = files.to_vec();
             files.push(&path);
-            assert_eq!(
-                node_workspace_owner(helper, &json!({}), &files, &packages),
-                Ok(None),
-                "{lock} must stop inheritance"
+            assert!(
+                node_workspace_owner(helper, &json!({}), &files, &packages).is_err(),
+                "{lock} requires inspection"
             );
         }
     }
@@ -816,9 +835,10 @@ mod discovery_tests {
                 assert!(owner.unwrap_err().contains("nested workspaces"));
             }
             packages.get_mut("packages/app").unwrap()["packageManager"] = json!("npm@10.9.0");
-            assert_eq!(
-                node_workspace_owner(plugin, &json!({}), &files, &packages),
-                Ok(Some("packages/app".into()))
+            assert!(
+                node_workspace_owner(plugin, &json!({}), &files, &packages)
+                    .unwrap_err()
+                    .contains("Nested pins or lockfiles")
             );
             packages
                 .get_mut("packages/app")
@@ -835,13 +855,86 @@ mod discovery_tests {
                 let path = format!("packages/app/{lock}");
                 let mut files = files.to_vec();
                 files.push(&path);
-                assert_eq!(
-                    node_workspace_owner(plugin, &json!({}), &files, &packages),
-                    Ok(Some("packages/app".into())),
+                assert!(
+                    node_workspace_owner(plugin, &json!({}), &files, &packages).is_err(),
                     "{lock}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn nested_pins_and_lockfiles_require_inspection_under_workspaces() {
+        let pinned = json!({"packageManager":"yarn@4.9.2"});
+        let mut packages = BTreeMap::from([
+            (
+                ".".into(),
+                json!({"packageManager":"yarn@4.9.2","workspaces":["packages/**"]}),
+            ),
+            ("packages/app".into(), pinned.clone()),
+        ]);
+        let files = ["package.json", "yarn.lock"];
+        for (directory, package) in [
+            ("packages/app", pinned.clone()),
+            ("packages/app/tools/helper", json!({})),
+            ("packages/direct", pinned.clone()),
+        ] {
+            assert!(
+                node_workspace_owner(directory, &package, &files, &packages)
+                    .unwrap_err()
+                    .contains("Nested pins or lockfiles")
+            );
+        }
+        assert_eq!(
+            node_workspace_owner(".", &pinned, &files, &packages),
+            Ok(None)
+        );
+        packages
+            .get_mut(".")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("workspaces");
+        assert_eq!(
+            node_workspace_owner("packages/app", &pinned, &files, &packages),
+            Ok(None)
+        );
+        assert_eq!(
+            node_workspace_owner("packages/app/tools/helper", &json!({}), &files, &packages),
+            Ok(None)
+        );
+        assert!(
+            node_workspace_owner("packages/app", &pinned, &["pnpm-workspace.yaml"], &packages)
+                .unwrap_err()
+                .contains("Nested pins or lockfiles")
+        );
+        // Intervening locks cannot establish independence from a farther root.
+        packages.get_mut(".").unwrap()["workspaces"] = json!(["packages/**"]);
+        assert!(
+            node_workspace_owner(
+                "packages/app/tools/helper",
+                &pinned,
+                &["packages/app/yarn.lock"],
+                &packages
+            )
+            .is_err()
+        );
+        packages
+            .get_mut(".")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("workspaces");
+        packages.get_mut("packages/app").unwrap()["workspaces"] = json!(["tools/*"]);
+        assert_eq!(
+            node_workspace_owner(
+                "packages/app/tools/helper",
+                &json!({}),
+                &["packages/app/yarn.lock"],
+                &packages
+            ),
+            Ok(Some("packages/app".into()))
+        );
     }
 
     #[test]
