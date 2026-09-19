@@ -219,7 +219,7 @@ async fn real_mcp_regression_isolation_deadline_recovery_and_publication() {
     std::fs::write(&source, source_value.to_string()).unwrap();
     // Container start, archive restore and exec are separate bounded operations.
     // Leave startup allowance while still forcing the 60-second command to time out.
-    let config = json!({"podman":podman,"repositories":{"owner/repo":{"image":image,"timeoutSeconds":20,"memoryMiB":128,"workspaceMiB":32,"pids":32,"cpus":1,"maxRuns":10}}});
+    let config = json!({"podman":podman,"repositories":{"owner/repo":{"image":image,"timeoutSeconds":20,"memoryMiB":128,"workspaceMiB":32,"pids":32,"cpus":1,"maxRuns":11}}});
     std::fs::write(
         &context,
         json!({"source":source_value,"job":{"repo":"owner/repo","settings":{"execution":config}}})
@@ -374,6 +374,53 @@ exit 1
             .filter(|r| r["status"] == "interrupted")
             .count(),
         2
+    );
+    // MCP cancellation must interrupt the container without restarting the MCP
+    // server. Keep the same connection for the successful next experiment.
+    mcp.input.write_all(format!("{}\n", json!({"id":72,"method":"tools/call","params":{"name":"run_experiment","arguments":{"revision":"head","command":"echo notification-active; sleep 60 & wait"}}})).as_bytes()).await.unwrap();
+    wait_for_test_container(
+        &podman,
+        &dir.path().join("experiments"),
+        "echo notification-active; sleep 60 & wait",
+    )
+    .await;
+    mcp.input
+        .write_all(b"{\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":\"72\"}}\n")
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), mcp.output.next_line())
+            .await
+            .is_err()
+    );
+    mcp.input
+        .write_all(b"{\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":72}}\n")
+        .await
+        .unwrap();
+    let response: Value = serde_json::from_str(
+        &tokio::time::timeout(Duration::from_secs(10), mcp.output.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(response["id"], 72);
+    let interrupted: Value =
+        serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(interrupted["status"], "interrupted", "{interrupted}");
+    let removed = Command::new(&podman)
+        .args([
+            "container",
+            "exists",
+            &format!("crow-experiment-{}", interrupted["id"].as_str().unwrap()),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        removed.status.code(),
+        Some(1),
+        "Cancellation returned before container removal"
     );
     let last = mcp
         .call(

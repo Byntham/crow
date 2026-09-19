@@ -4,7 +4,7 @@ use base64::Engine;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     path::Path,
     process::Stdio,
     time::Duration,
@@ -859,6 +859,41 @@ pub fn tools() -> Value {
     ])
 }
 
+// The buffer survives cancellation of this future when an active tool finishes.
+// fill_buf and consume keep partial JSON lines intact across select! iterations.
+async fn mcp_request<R: tokio::io::AsyncBufRead + Unpin>(
+    stdin: &mut R,
+    line: &mut Vec<u8>,
+) -> Result<Option<Value>> {
+    loop {
+        let chunk = stdin.fill_buf().await?;
+        if chunk.is_empty() && line.is_empty() {
+            return Ok(None);
+        }
+        let eof = chunk.is_empty();
+        let n = chunk
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(chunk.len(), |n| n + 1);
+        ensure!(
+            line.len() + n <= 4 * 1024 * 1024,
+            "MCP request exceeds 4 MiB"
+        );
+        let complete = eof || chunk[n - 1] == b'\n';
+        line.extend_from_slice(&chunk[..n]);
+        stdin.consume(n);
+        if complete {
+            let request = serde_json::from_slice::<Value>(line);
+            line.clear();
+            if let Ok(request) = request
+                && request.is_object()
+            {
+                return Ok(Some(request));
+            }
+        }
+    }
+}
+
 pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) -> Result<()> {
     let source: Value = serde_json::from_slice(&tokio::fs::read(source_path).await?)?;
     let context: Option<Value> = if let Some(path) = context_path {
@@ -932,14 +967,22 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
     };
     tokio::pin!(stop);
     let result=async {
-        loop {
-            // A bounded line reader prevents malformed MCP input from exhausting memory.
-            let mut line=Vec::new();
-            let read=async {loop {let chunk=stdin.fill_buf().await?; if chunk.is_empty(){break;} let n=chunk.iter().position(|b|*b==b'\n').map_or(chunk.len(),|n|n+1); ensure!(line.len()+n<=4*1024*1024,"MCP request exceeds 4 MiB"); let done=chunk[n-1]==b'\n'; line.extend_from_slice(&chunk[..n]); stdin.consume(n); if done {break;} } Ok::<_,anyhow::Error>(())};
-            tokio::select!{_=&mut stop=>break,result=read=>result?}
-            if line.is_empty(){break;}
-            let request: Value=match serde_json::from_slice(&line){Ok(v)=>v,Err(_)=>continue};
-            if !request.is_object() || request.get("id").is_none(){continue;}
+        let mut line = Vec::new();
+        let mut pending = VecDeque::new();
+        let mut input_closed = false;
+        'requests: loop {
+            let request = match pending.pop_front() {
+                Some(request) => request,
+                None if input_closed => break,
+                None => tokio::select! {
+                    _ = &mut stop => break,
+                    request = mcp_request(&mut stdin, &mut line) => match request? {
+                        Some(request) => request,
+                        None => break,
+                    }
+                },
+            };
+            if request.get("id").is_none(){continue;}
             let id=request["id"].clone();
             let response=match request["method"].as_str(){
                 Some("initialize")=>json!({"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"crow-inspection","version":"1.0.0"}}}),
@@ -954,8 +997,56 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
                         inspection_tool(&source,name,args).await
                     };
                     let experiment = execution.is_some() && request["params"]["name"].as_str().is_some_and(|name| crate::execution::TOOL_NAMES.contains(&name));
+                    let running_container = experiment && matches!(request["params"]["name"].as_str(), Some("run_experiment" | "prepare_environment"));
+                    // A preceding read-only call may have drained stdin to EOF
+                    // while this runtime request was waiting in the queue.
+                    if input_closed && running_container { break 'requests; }
                     tokio::pin!(call);
-                    let output=tokio::select!{_=&mut stop=>{ cancel.cancel(); if experiment { let _ = call.await; } break; },result=&mut call=>result};
+                    let output = loop {
+                        tokio::select! {
+                            _ = &mut stop => {
+                                cancel.cancel();
+                                if experiment { let _ = call.await; }
+                                break 'requests;
+                            },
+                            result = &mut call => break result,
+                            incoming = mcp_request(&mut stdin, &mut line), if !input_closed => {
+                                let incoming = match incoming {
+                                    Ok(Some(incoming)) => incoming,
+                                    Ok(None) if !running_container => {
+                                        input_closed = true;
+                                        continue;
+                                    },
+                                    closed => {
+                                        cancel.cancel();
+                                        if experiment { let _ = call.await; }
+                                        closed?;
+                                        break 'requests;
+                                    }
+                                };
+                                if incoming.get("id").is_none() {
+                                    if incoming["method"] == "notifications/cancelled"
+                                        && let Some(cancelled_id) = incoming["params"].get("requestId") {
+                                        if cancelled_id == &id {
+                                            cancel.cancel();
+                                            if !experiment { break Err(anyhow!("Tool request cancelled")); }
+                                        } else {
+                                            pending.retain(|request: &Value| request.get("id") != Some(cancelled_id));
+                                        }
+                                    }
+                                } else {
+                                    // Keep calls serial while still accepting cancellation.
+                                    // Limit queued requests as well as each input line.
+                                    if pending.len() == 16 {
+                                        cancel.cancel();
+                                        if experiment { let _ = call.await; }
+                                        bail!("Too many queued MCP requests");
+                                    }
+                                    pending.push_back(incoming);
+                                }
+                            }
+                        }
+                    };
                     match output {Ok(value) if experiment && request["params"]["name"] == "read_artifact" => json!({"result":value}),Ok(value)=>json!({"result":{"content":[{"type":"text","text":value.as_str().map(str::to_owned).unwrap_or_else(||value.to_string())}]}}),Err(e)=>json!({"result":{"isError":true,"content":[{"type":"text","text":e.to_string()}]}})}
                 }
                 _=>json!({"error":{"code":-32601,"message":"Unsupported method"}}),

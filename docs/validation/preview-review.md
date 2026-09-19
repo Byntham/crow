@@ -65,4 +65,12 @@ The same preview reproduced a Cargo cache substitution across registries. Two lo
 
 The regression suite covers conflicting sources, conflicting checksums, invalid identities, repeated identical pins, conflicting nested locks and incomplete lockfile inspection. An independent audit found no remaining blocker in this fix. An offline container replay with real `itoa` excluded the malicious export and rejected direct import, then restored the genuine crate and passed `cargo check --offline`.
 
-After these fixes, 317 ordinary tests, formatting and all-target clippy with warnings denied pass. The managed Rust/Go scenario also passes fresh public downloads, offline tests and verified reuse.
+After these fixes, 315 ordinary tests, formatting and all-target clippy with warnings denied pass. The managed Rust/Go scenario also passes fresh public downloads, offline tests and verified reuse.
+
+A further inspection review found that setup-generated lockfiles could introduce a registry absent from the committed pin scan. Cargo sharing now requires both the canonical crates.io source and its verified sparse-cache directory, as well as the content checksum. Other registry directories and unknown layouts skip this optional cache. The review also identified MCP cancellation messages waiting unread while tests ran. The server now reads cancellation notifications during active commands, matches request IDs without coercion, awaits cleanup and retains bounded queued requests. Client disconnects cancel active runtime commands.
+
+A loopback sparse-registry reproduction generated registry B's lockfile during setup. The previous helper imported one substituted archive and Cargo compiled its marker, failing with exit 101. The corrected helper imported no archive for that directory; Cargo then built the genuine registry B dependency successfully. A separate real `itoa` control verified that ordinary crates.io sharing still restores and builds.
+
+The real MCP lifecycle test now sends a nonmatching cancellation ID and then the matching ID while a Podman container is running. It verifies that the container has been removed before the response, then runs a successful experiment over the same connection. This suite and fresh Rust/Go downloads followed by verified reuse both pass. An independent audit found no remaining issue in the source/directory binding or the cancellation-safe input reader.
+
+The final local run passes 320 ordinary tests, formatting and all-target clippy with warnings denied. This count excludes nested subprocess test summaries. The disconnect regression also verifies that queued runtime work cannot start after EOF was observed during an inspection request.

@@ -117,9 +117,9 @@ pub async fn plan(
                     continue;
                 }
                 let key = format!("{name}-{version}.crate");
-                // Cache directories encode registry identity using Cargo's own
-                // hash. Without reproducing that mapping, only an unambiguous
-                // source/checksum pair may authorize a filename anywhere.
+                // Preserve registry identity as well as checksum. The sandbox
+                // supports only the known crates.io sparse-cache directory;
+                // alternate or unknown layouts remain uncached.
                 let identity = package
                     .get("source")
                     .and_then(toml::Value::as_str)
@@ -184,8 +184,10 @@ pub async fn plan(
     }
     if cargo_complete {
         for (key, identity) in cargo_candidates {
-            if let Some((_, checksum)) = identity {
-                pins["cargo"][key] = json!([checksum]);
+            if let Some((source, checksum)) = identity
+                && source == "registry+https://github.com/rust-lang/crates.io-index"
+            {
+                pins["cargo"][key] = json!({"source":source,"checksum":checksum});
             }
         }
     }
@@ -205,7 +207,7 @@ pub async fn plan(
         revision,
         image,
         &fingerprints.join("\0"),
-        "verified-downloads-v2",
+        "verified-downloads-v3",
     ]);
     Ok(Some(Plan { key, pins }))
 }
@@ -571,7 +573,7 @@ version = "1.0.0"
         .unwrap();
         assert_eq!(
             plan.pins["cargo"],
-            json!({"safe-crate-1.2.3.crate":[checksum.to_lowercase()]})
+            json!({"safe-crate-1.2.3.crate":{"source":"registry+https://github.com/rust-lang/crates.io-index","checksum":checksum.to_lowercase()}})
         );
         assert_eq!(
             plan.pins["go"],
@@ -683,7 +685,7 @@ version = "1.0.0"
     #[tokio::test]
     async fn cargo_cache_excludes_ambiguous_sources_checksums_and_missing_identity() {
         let repo = repository();
-        let registry_a = "registry+https://registry-a.example/index";
+        let registry_a = "registry+https://github.com/rust-lang/crates.io-index";
         let registry_b = "registry+sparse+https://registry-b.example/index/";
         let good = "a".repeat(64);
         let different = "b".repeat(64);
@@ -722,7 +724,10 @@ version = "1.0.0"
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(plan.pins["cargo"], json!({"same-1.0.0.crate":[good]}));
+        assert_eq!(
+            plan.pins["cargo"],
+            json!({"same-1.0.0.crate":{"source":registry_a,"checksum":good}})
+        );
     }
 
     #[tokio::test]
@@ -832,5 +837,32 @@ version = "1.0.0"
             .unwrap();
             assert_eq!(plan.pins["go"], json!({}), "{missing}");
         }
+    }
+
+    #[tokio::test]
+    async fn alternate_cargo_registries_are_not_shared_even_without_conflicts() {
+        let repo = repository();
+        fs::write(repo.path().join("package-lock.json"), "{}").unwrap();
+        fs::write(
+            repo.path().join("Cargo.lock"),
+            cargo_package(
+                "other",
+                "registry+sparse+https://other.example/index/",
+                &"a".repeat(64),
+            ),
+        )
+        .unwrap();
+        let revision = commit(repo.path());
+        let plan = plan(
+            &source(repo.path(), &revision),
+            "head",
+            "owner/repo",
+            "pr:1",
+            "image",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(plan.pins["cargo"], json!({}));
     }
 }

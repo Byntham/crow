@@ -74,13 +74,16 @@ def permitted(parts, pins):
             return ('npm', ''.join(suffix))
     if parts[:len(CARGO)] == CARGO:
         suffix = parts[len(CARGO):]
-        checksums = pins.get('cargo', {}).get(suffix[-1]) if len(suffix) == 2 else None
-        # Older plans combined registry checksums by filename. Never accept such
-        # an ambiguous plan, even when one of its checksums matches these bytes.
-        if (isinstance(checksums, list) and len(checksums) == 1
-                and isinstance(checksums[0], str)
-                and re.fullmatch('[0-9a-f]{64}', checksums[0])):
-            return ('cargo', checksums)
+        pin = pins.get('cargo', {}).get(suffix[-1]) if len(suffix) == 2 else None
+        # Cargo can trust existing archives without rechecking the index checksum.
+        # A filename pin therefore authorizes only its known registry directory.
+        # Unknown layouts and alternate registries still install without sharing.
+        if (len(suffix) == 2 and suffix[0] == 'index.crates.io-1949cf8c6b5b557f'
+                and isinstance(pin, dict)
+                and pin.get('source') == 'registry+https://github.com/rust-lang/crates.io-index'
+                and isinstance(pin.get('checksum'), str)
+                and re.fullmatch('[0-9a-f]{64}', pin['checksum'])):
+            return ('cargo', pin['checksum'])
     if parts[:len(GO)] == GO:
         name = '/'.join(parts[len(GO):])
         if name in pins.get('go', {}) and name.endswith(('.zip', '.mod')):
@@ -93,7 +96,7 @@ def verified(data, specification):
     if kind == 'npm':
         return hashlib.sha512(data).hexdigest() == expected
     if kind == 'cargo':
-        return hashlib.sha256(data).hexdigest() in expected
+        return hashlib.sha256(data).hexdigest() == expected
     return digest_h1(data, kind == 'gozip') == expected
 
 

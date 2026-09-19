@@ -11,7 +11,7 @@ use std::{
 
 const HELPER: &str = include_str!("../src/runtime/packages.py");
 const NPM: &str = ".crow-home/.npm/_cacache/content-v2/sha512";
-const CARGO: &str = ".crow-home/.cargo/registry/cache/registry";
+const CARGO: &str = ".crow-home/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f";
 const GO: &str = ".crow-home/go/pkg/mod/cache/download";
 
 fn run(mode: &str, root: &Path, pins: &Value, input: &[u8]) -> std::process::Output {
@@ -143,7 +143,7 @@ fn verified_downloads_roundtrip_without_metadata_installed_sources_or_outputs() 
     let cargo = format!("{CARGO}/example-1.0.0.crate");
     let gomod = format!("{GO}/example.org/module/@v/v1.0.0.mod");
     let module = b"module example.org/module\n";
-    let pins = json!({"npm":true,"cargo":{"example-1.0.0.crate":[hex::encode(Sha256::digest(b"crate download"))]},"go":{"example.org/module/@v/v1.0.0.mod":h1("go.mod", module)}});
+    let pins = json!({"npm":true,"cargo":{"example-1.0.0.crate":{"source":"registry+https://github.com/rust-lang/crates.io-index","checksum":hex::encode(Sha256::digest(b"crate download"))}},"go":{"example.org/module/@v/v1.0.0.mod":h1("go.mod", module)}});
     for (path, data) in [
         (&npm, b"registry package".as_slice()),
         (&cargo, b"crate download"),
@@ -767,7 +767,7 @@ fn cargo_and_go_pins_reject_changed_download_contents() {
     let root = tempfile::tempdir().unwrap();
     let cargo = format!("{CARGO}/example-1.0.0.crate");
     let gomod = format!("{GO}/example.org/module/@v/v1.0.0.mod");
-    let pins = json!({"cargo":{"example-1.0.0.crate":[hex::encode(Sha256::digest(b"approved"))]},"go":{"example.org/module/@v/v1.0.0.mod":h1("go.mod", b"approved")}});
+    let pins = json!({"cargo":{"example-1.0.0.crate":{"source":"registry+https://github.com/rust-lang/crates.io-index","checksum":hex::encode(Sha256::digest(b"approved"))}},"go":{"example.org/module/@v/v1.0.0.mod":h1("go.mod", b"approved")}});
     for path in [&cargo, &gomod] {
         write(root.path(), path, b"poison");
         let imported = run(
@@ -872,7 +872,7 @@ fn cargo_cache_rejects_legacy_ambiguous_checksum_lists() {
     );
     assert!(!imported.status.success());
     assert!(!destination.path().join(&path).exists());
-    let precise = json!({"cargo":{"same-1.0.0.crate":[hex::encode(Sha256::digest(original))]}});
+    let precise = json!({"cargo":{"same-1.0.0.crate":{"source":"registry+https://github.com/rust-lang/crates.io-index","checksum":hex::encode(Sha256::digest(original))}}});
     let imported = run(
         "import",
         destination.path(),
@@ -894,5 +894,66 @@ fn cargo_cache_rejects_legacy_ambiguous_checksum_lists() {
     assert_eq!(
         std::fs::read(destination.path().join(&path)).unwrap(),
         original
+    );
+}
+
+#[test]
+fn cargo_archive_pins_cannot_cross_registry_directories_or_sources() {
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let content = b"archive from a pinned registry";
+    let checksum = hex::encode(Sha256::digest(content));
+    let canonical = "registry+https://github.com/rust-lang/crates.io-index";
+    let alternate = "registry+sparse+https://generated.example/index/";
+    // Setup can create alternate-registry lockfiles that are absent from pinned
+    // Git. Even matching bytes cannot cross an unauthorized registry directory.
+    for (directory, registry, accepted) in [
+        ("index.crates.io-1949cf8c6b5b557f", canonical, true),
+        ("generated.example-aabbccdd", canonical, false),
+        ("index.crates.io-1949cf8c6b5b557f", alternate, false),
+        ("generated.example-aabbccdd", alternate, false),
+        ("github.com-1ecc6299db9ec823", canonical, false),
+    ] {
+        let relative = format!(".crow-home/.cargo/registry/cache/{directory}/example-1.0.0.crate");
+        let pins = json!({"cargo":{"example-1.0.0.crate":{"source":registry,"checksum":checksum}}});
+        write(source.path(), &relative, content);
+        let exported = run("export", source.path(), &pins, &[]);
+        assert!(exported.status.success());
+        assert_eq!(
+            names(&exported.stdout).contains(&relative),
+            accepted,
+            "{directory} {registry}"
+        );
+        let imported = run(
+            "import",
+            destination.path(),
+            &pins,
+            &archive(&relative, content, false),
+        );
+        assert_eq!(
+            imported.status.success(),
+            accepted,
+            "{directory} {registry}"
+        );
+        if accepted {
+            assert_eq!(
+                std::fs::read(destination.path().join(&relative)).unwrap(),
+                content
+            );
+        }
+        std::fs::remove_file(source.path().join(&relative)).unwrap();
+    }
+    // Legacy filename-only pins fail closed even with a single valid checksum.
+    let relative = format!("{CARGO}/example-1.0.0.crate");
+    let legacy = json!({"cargo":{"example-1.0.0.crate":[checksum]}});
+    assert!(
+        !run(
+            "import",
+            destination.path(),
+            &legacy,
+            &archive(&relative, content, false)
+        )
+        .status
+        .success()
     );
 }
