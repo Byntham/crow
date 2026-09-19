@@ -92,7 +92,7 @@ async fn managed_setup_downloads_recovery_cache_and_screenshots() {
     std::fs::create_dir(&repo).unwrap();
     git(&repo, &["init", "-b", "main"]);
     std::fs::write(repo.join("package.json"),r#"{"name":"crow-autonomous-fixture","version":"1.0.0","private":true,"scripts":{"test":"node test.cjs"},"dependencies":{"is-number":"7.0.0"}}"#).unwrap();
-    std::fs::write(repo.join("test.cjs"),"const assert=require('node:assert/strict'); const isNumber=require('is-number'); assert(isNumber('42')); assert.equal(require('./calculate.cjs')(2,3),5); console.log('node regression test passed');\n").unwrap();
+    std::fs::write(repo.join("test.cjs"),"const assert=require('node:assert/strict'); const isNumber=require('is-number'); assert(isNumber('42')); assert.equal(require('./calculate.cjs')(2,3),5,'APPLICATION_REGRESSION: calculate(2,3) must equal 5'); console.log('node regression test passed');\n").unwrap();
     std::fs::write(repo.join("calculate.cjs"), "module.exports=(a,b)=>a+b;\n").unwrap();
     std::fs::write(repo.join("requirements.txt"), "packaging==24.2\n").unwrap();
     git(&repo, &["add", "."]);
@@ -156,15 +156,59 @@ async fn managed_setup_downloads_recovery_cache_and_screenshots() {
         .await
         .is_err()
     );
-    let command = "test ! -e /run/crow-downloads/socket && test -z \"${HTTPS_PROXY:-}\" && .venv/bin/python -c 'import packaging; print(packaging.__version__)' && npm test";
+    let prerequisites = "test ! -e /run/crow-downloads/socket && test -z \"${HTTPS_PROXY:-}\" && .venv/bin/python -c 'import packaging; assert packaging.__version__ == \"24.2\"' && node -e 'require(\"node:assert/strict\")(require(\"is-number\")(\"42\"))' && echo RUNTIME_PREREQUISITES_PASSED";
+    let mut prerequisites_results = Vec::new();
+    let mut application_results = Vec::new();
     for (rev, environment, status) in [("base", &before, "passed"), ("head", &after, "failed")] {
+        // An isolation or dependency failure must never satisfy the expected
+        // application regression on head. Verify prerequisites independently.
+        let checked = call(
+            &exec,
+            "run_experiment",
+            json!({"revision":rev,"environment":environment["id"],"command":prerequisites}),
+        )
+        .await;
+        assert_eq!(
+            checked["status"], "passed",
+            "{rev} prerequisites: {checked}"
+        );
+        assert_eq!(checked["exitCode"], 0, "{checked}");
+        assert!(
+            checked["stdout"]
+                .as_str()
+                .unwrap()
+                .contains("RUNTIME_PREREQUISITES_PASSED"),
+            "{checked}"
+        );
+        prerequisites_results.push(checked);
         let result = call(
             &exec,
             "run_experiment",
-            json!({"revision":rev,"environment":environment["id"],"command":command}),
+            json!({"revision":rev,"environment":environment["id"],"command":"npm test"}),
         )
         .await;
         assert_eq!(result["status"], status, "{result}");
+        if rev == "base" {
+            assert_eq!(result["exitCode"], 0, "{result}");
+            assert!(
+                result["stdout"]
+                    .as_str()
+                    .unwrap()
+                    .contains("node regression test passed"),
+                "{result}"
+            );
+        } else {
+            assert_eq!(result["exitCode"], 1, "{result}");
+            let stderr = result["stderr"].as_str().unwrap();
+            assert!(
+                stderr.contains("APPLICATION_REGRESSION: calculate(2,3) must equal 5")
+                    && stderr.contains("ERR_ASSERTION")
+                    && stderr.contains("actual: -1")
+                    && stderr.contains("expected: 5"),
+                "The application assertion must cause the head failure: {result}"
+            );
+        }
+        application_results.push(result);
     }
     let changed_source = call(
         &exec,
@@ -208,7 +252,7 @@ JS"#;
     .unwrap();
     std::fs::write(
         root.join("result.json"),
-        json!({"setupBase":before,"setupHead":after,"cached":cached,"screenshot":shot}).to_string(),
+        json!({"setupBase":before,"setupHead":after,"cached":cached,"runtimePrerequisites":prerequisites_results,"applicationTests":application_results,"screenshot":shot}).to_string(),
     )
     .unwrap();
     println!(
