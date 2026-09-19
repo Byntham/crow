@@ -851,3 +851,48 @@ fn oversized_members_are_rejected_before_reading_their_contents() {
         String::from_utf8_lossy(&imported.stderr).contains("Invalid package cache import budget")
     );
 }
+
+#[test]
+fn cargo_cache_rejects_legacy_ambiguous_checksum_lists() {
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let path = format!("{CARGO}/same-1.0.0.crate");
+    let original = b"registry A package";
+    let substituted = b"registry B package";
+    write(source.path(), &path, substituted);
+    let pins = json!({"cargo":{"same-1.0.0.crate":[hex::encode(Sha256::digest(original)),hex::encode(Sha256::digest(substituted))]}});
+    let exported = run("export", source.path(), &pins, &[]);
+    assert!(exported.status.success());
+    assert!(names(&exported.stdout).is_empty());
+    let imported = run(
+        "import",
+        destination.path(),
+        &pins,
+        &archive(&path, substituted, false),
+    );
+    assert!(!imported.status.success());
+    assert!(!destination.path().join(&path).exists());
+    let precise = json!({"cargo":{"same-1.0.0.crate":[hex::encode(Sha256::digest(original))]}});
+    let imported = run(
+        "import",
+        destination.path(),
+        &precise,
+        &archive(&path, original, false),
+    );
+    assert!(imported.status.success());
+    assert_eq!(
+        std::fs::read(destination.path().join(&path)).unwrap(),
+        original
+    );
+    let imported = run(
+        "import",
+        destination.path(),
+        &precise,
+        &archive(&path, substituted, false),
+    );
+    assert!(!imported.status.success());
+    assert_eq!(
+        std::fs::read(destination.path().join(&path)).unwrap(),
+        original
+    );
+}

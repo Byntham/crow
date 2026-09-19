@@ -74,8 +74,13 @@ def permitted(parts, pins):
             return ('npm', ''.join(suffix))
     if parts[:len(CARGO)] == CARGO:
         suffix = parts[len(CARGO):]
-        if len(suffix) == 2 and suffix[1] in pins.get('cargo', {}):
-            return ('cargo', pins['cargo'][suffix[1]])
+        checksums = pins.get('cargo', {}).get(suffix[-1]) if len(suffix) == 2 else None
+        # Older plans combined registry checksums by filename. Never accept such
+        # an ambiguous plan, even when one of its checksums matches these bytes.
+        if (isinstance(checksums, list) and len(checksums) == 1
+                and isinstance(checksums[0], str)
+                and re.fullmatch('[0-9a-f]{64}', checksums[0])):
+            return ('cargo', checksums)
     if parts[:len(GO)] == GO:
         name = '/'.join(parts[len(GO):])
         if name in pins.get('go', {}) and name.endswith(('.zip', '.mod')):

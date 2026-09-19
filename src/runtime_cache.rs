@@ -2,6 +2,7 @@
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
@@ -34,6 +35,10 @@ pub async fn plan(
     let mut fingerprints = Vec::new();
     let mut pins = json!({"npm":false,"cargo":{},"go":{}});
     let mut locks = Vec::new();
+    let mut cargo_candidates: BTreeMap<String, Option<(String, String)>> = BTreeMap::new();
+    let mut cargo_complete = true;
+    let mut go_complete = true;
+    let mut go_conflicts = BTreeSet::new();
     for item in tree.split('\0') {
         let Some((meta, path)) = item.split_once('\t') else {
             continue;
@@ -43,10 +48,15 @@ pub async fn plan(
         if path == ".crow-home" || path.starts_with(".crow-home/") {
             return Ok(None);
         }
+        let name = path.rsplit('/').next().unwrap_or(path);
         if !meta.starts_with("100644 blob ") && !meta.starts_with("100755 blob ") {
+            if name == "Cargo.lock" {
+                cargo_complete = false;
+            } else if name == "go.sum" {
+                go_complete = false;
+            }
             continue;
         }
-        let name = path.rsplit('/').next().unwrap_or(path);
         if [
             "package.json",
             "package-lock.json",
@@ -68,49 +78,74 @@ pub async fn plan(
         }
     }
     // Large or unreadable lockfiles simply disable caching for that ecosystem.
-    for (name, path) in locks.into_iter().take(256) {
+    for (index, (name, path)) in locks.into_iter().enumerate() {
+        if index >= 256 {
+            if name == "Cargo.lock" {
+                cargo_complete = false;
+            } else if name == "go.sum" {
+                go_complete = false;
+            }
+            continue;
+        }
         let Ok(body) = crate::inspection::read_blob(source, path, Some(commit)).await else {
+            if name == "Cargo.lock" {
+                cargo_complete = false;
+            } else if name == "go.sum" {
+                go_complete = false;
+            }
             continue;
         };
         if name == "Cargo.lock" {
             let Ok(lock) = toml::from_str::<toml::Value>(&body) else {
+                cargo_complete = false;
                 continue;
             };
-            for package in lock
-                .get("package")
-                .and_then(toml::Value::as_array)
-                .into_iter()
-                .flatten()
-            {
+            let Some(packages) = lock.get("package").and_then(toml::Value::as_array) else {
+                cargo_complete = false;
+                continue;
+            };
+            for package in packages {
                 let Some(name) = package.get("name").and_then(toml::Value::as_str) else {
+                    cargo_complete = false;
                     continue;
                 };
                 let Some(version) = package.get("version").and_then(toml::Value::as_str) else {
+                    cargo_complete = false;
                     continue;
                 };
-                let Some(checksum) = package.get("checksum").and_then(toml::Value::as_str) else {
-                    continue;
-                };
-                if !safe_component(name)
-                    || !safe_component(version)
-                    || checksum.len() != 64
-                    || !checksum.bytes().all(|b| b.is_ascii_hexdigit())
-                {
+                if !safe_component(name) || !safe_component(version) {
                     continue;
                 }
                 let key = format!("{name}-{version}.crate");
-                if pins["cargo"].get(&key).is_none() {
-                    pins["cargo"][&key] = json!([]);
-                }
-                pins["cargo"][&key]
-                    .as_array_mut()
-                    .unwrap()
-                    .push(json!(checksum.to_lowercase()));
+                // Cache directories encode registry identity using Cargo's own
+                // hash. Without reproducing that mapping, only an unambiguous
+                // source/checksum pair may authorize a filename anywhere.
+                let identity = package
+                    .get("source")
+                    .and_then(toml::Value::as_str)
+                    .filter(|source| valid_cargo_source(source))
+                    .zip(package.get("checksum").and_then(toml::Value::as_str))
+                    .filter(|(_, checksum)| {
+                        checksum.len() == 64 && checksum.bytes().all(|b| b.is_ascii_hexdigit())
+                    })
+                    .map(|(source, checksum)| (source.to_owned(), checksum.to_lowercase()));
+                cargo_candidates
+                    .entry(key)
+                    .and_modify(|previous| {
+                        if *previous != identity {
+                            *previous = None;
+                        }
+                    })
+                    .or_insert(identity);
             }
         } else {
             for line in body.lines() {
                 let parts: Vec<_> = line.split_whitespace().collect();
+                if parts.is_empty() {
+                    continue;
+                }
                 if parts.len() != 3 || !parts[2].starts_with("h1:") {
+                    go_complete = false;
                     continue;
                 }
                 let module = parts[0];
@@ -131,8 +166,26 @@ pub async fn plan(
                         })
                         .collect::<String>()
                 };
-                pins["go"][format!("{}/@v/{}.{}", escaped(module), escaped(version), extension)] =
-                    json!(parts[2]);
+                let key = format!("{}/@v/{}.{}", escaped(module), escaped(version), extension);
+                if go_conflicts.contains(&key) {
+                    continue;
+                }
+                if pins["go"].get(&key).is_some_and(|pin| pin != parts[2]) {
+                    pins["go"].as_object_mut().unwrap().remove(&key);
+                    go_conflicts.insert(key);
+                } else {
+                    pins["go"][key] = json!(parts[2]);
+                }
+            }
+        }
+    }
+    if !go_complete {
+        pins["go"] = json!({});
+    }
+    if cargo_complete {
+        for (key, identity) in cargo_candidates {
+            if let Some((_, checksum)) = identity {
+                pins["cargo"][key] = json!([checksum]);
             }
         }
     }
@@ -152,10 +205,23 @@ pub async fn plan(
         revision,
         image,
         &fingerprints.join("\0"),
-        "verified-downloads-v1",
+        "verified-downloads-v2",
     ]);
     Ok(Some(Plan { key, pins }))
 }
+
+fn valid_cargo_source(source: &str) -> bool {
+    source.strip_prefix("registry+").is_some_and(|registry| {
+        let registry = registry.strip_prefix("sparse+").unwrap_or(registry);
+        url::Url::parse(registry).is_ok_and(|url| {
+            matches!(url.scheme(), "https" | "http")
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+        })
+    })
+}
+
 fn safe_component(s: &str) -> bool {
     !s.is_empty()
         && s != "."
@@ -470,6 +536,7 @@ version = 3
 [[package]]
 name = "safe-crate"
 version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "{checksum}"
 [[package]]
 name = "../escape"
@@ -488,7 +555,6 @@ version = "1.0.0"
                 "github.com/Example/Module v1.2.3 h1:zipchecksum\n",
                 "github.com/Example/Module v1.2.3/go.mod h1:modchecksum\n",
                 "../escape v1.0.0 h1:invalid\n",
-                "example.org/unsigned v1.0.0 nope\n",
             ),
         )
         .unwrap();
@@ -606,5 +672,165 @@ version = "1.0.0"
             .unwrap()
             .is_none()
         );
+    }
+
+    fn cargo_package(name: &str, source: &str, checksum: &str) -> String {
+        format!(
+            "[[package]]\nname = {name:?}\nversion = \"1.0.0\"\nsource = {source:?}\nchecksum = {checksum:?}\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn cargo_cache_excludes_ambiguous_sources_checksums_and_missing_identity() {
+        let repo = repository();
+        let registry_a = "registry+https://registry-a.example/index";
+        let registry_b = "registry+sparse+https://registry-b.example/index/";
+        let good = "a".repeat(64);
+        let different = "b".repeat(64);
+        let mut first = String::new();
+        let mut second = String::new();
+        for name in [
+            "same",
+            "registry-conflict",
+            "checksum-conflict",
+            "missing-source",
+            "bad-source",
+        ] {
+            first += &cargo_package(name, registry_a, &good);
+            let (source, checksum) = match name {
+                "registry-conflict" => (registry_b, &good),
+                "checksum-conflict" => (registry_a, &different),
+                "missing-source" => ("", &good),
+                "bad-source" => ("registry+not-a-url", &good),
+                _ => (registry_a, &good),
+            };
+            second += &cargo_package(name, source, checksum);
+        }
+        // A third matching occurrence must never restore an excluded filename.
+        second += &cargo_package("registry-conflict", registry_a, &good);
+        fs::write(repo.path().join("Cargo.lock"), first).unwrap();
+        fs::create_dir(repo.path().join("nested")).unwrap();
+        fs::write(repo.path().join("nested/Cargo.lock"), second).unwrap();
+        let revision = commit(repo.path());
+        let plan = plan(
+            &source(repo.path(), &revision),
+            "head",
+            "owner/repo",
+            "pr:1",
+            "image",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(plan.pins["cargo"], json!({"same-1.0.0.crate":[good]}));
+    }
+
+    #[tokio::test]
+    async fn cargo_cache_requires_complete_readable_lockfile_visibility() {
+        for missing in ["malformed", "oversized", "beyond-limit"] {
+            let repo = repository();
+            fs::write(repo.path().join("package-lock.json"), "{}").unwrap();
+            fs::write(
+                repo.path().join("Cargo.lock"),
+                cargo_package(
+                    "safe",
+                    "registry+https://example.org/index",
+                    &"a".repeat(64),
+                ),
+            )
+            .unwrap();
+            fs::create_dir(repo.path().join("nested")).unwrap();
+            let body = if missing == "oversized" {
+                "#".repeat(3 * 1024 * 1024)
+            } else {
+                "not valid TOML".into()
+            };
+            fs::write(repo.path().join("nested/Cargo.lock"), body).unwrap();
+            if missing == "beyond-limit" {
+                for index in 0..256 {
+                    let directory = repo.path().join(format!("a{index:03}"));
+                    fs::create_dir(&directory).unwrap();
+                    fs::write(directory.join("go.sum"), "").unwrap();
+                }
+            }
+            let revision = commit(repo.path());
+            let plan = plan(
+                &source(repo.path(), &revision),
+                "head",
+                "owner/repo",
+                "pr:1",
+                "image",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(plan.pins["cargo"], json!({}), "{missing}");
+        }
+    }
+
+    #[tokio::test]
+    async fn go_cache_excludes_conflicting_checksums_across_lockfiles() {
+        let repo = repository();
+        fs::write(
+            repo.path().join("go.sum"),
+            "example.org/module v1.0.0 h1:first\nexample.org/module v1.0.0/go.mod h1:same\n",
+        )
+        .unwrap();
+        fs::create_dir(repo.path().join("nested")).unwrap();
+        fs::write(repo.path().join("nested/go.sum"), "example.org/module v1.0.0 h1:second\nexample.org/module v1.0.0 h1:first\nexample.org/module v1.0.0/go.mod h1:same\n").unwrap();
+        let revision = commit(repo.path());
+        let plan = plan(
+            &source(repo.path(), &revision),
+            "head",
+            "owner/repo",
+            "pr:1",
+            "image",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            plan.pins["go"],
+            json!({"example.org/module/@v/v1.0.0.mod":"h1:same"})
+        );
+    }
+
+    #[tokio::test]
+    async fn go_cache_requires_complete_readable_lockfile_visibility() {
+        for missing in ["malformed", "oversized", "beyond-limit"] {
+            let repo = repository();
+            fs::write(repo.path().join("package-lock.json"), "{}").unwrap();
+            fs::write(
+                repo.path().join("go.sum"),
+                "example.org/module v1.0.0 h1:pin\n",
+            )
+            .unwrap();
+            fs::create_dir(repo.path().join("nested")).unwrap();
+            let body = if missing == "oversized" {
+                "#".repeat(3 * 1024 * 1024)
+            } else {
+                "malformed line".into()
+            };
+            fs::write(repo.path().join("nested/go.sum"), body).unwrap();
+            if missing == "beyond-limit" {
+                for index in 0..256 {
+                    let directory = repo.path().join(format!("a{index:03}"));
+                    fs::create_dir(&directory).unwrap();
+                    fs::write(directory.join("go.sum"), "").unwrap();
+                }
+            }
+            let revision = commit(repo.path());
+            let plan = plan(
+                &source(repo.path(), &revision),
+                "head",
+                "owner/repo",
+                "pr:1",
+                "image",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(plan.pins["go"], json!({}), "{missing}");
+        }
     }
 }
