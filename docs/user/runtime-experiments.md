@@ -14,7 +14,7 @@ crow doctor --runtime
 crow service-restart
 ```
 
-No image IDs, test commands, or new budget settings are required. Crow provisions a shared toolchain image itself. It currently contains Node/npm, Python/pip, Rust/Cargo, Go, C/C++ build tools, Chromium/Playwright, SQLite and PostgreSQL tools. These are stock Linux toolchains; projects requiring other versions or platforms may still need a custom image. Repository Dockerfiles are evidence for setup, never instructions to execute on the host.
+No image IDs, test commands, or new budget settings are required. Crow provisions a shared toolchain image itself. It currently contains Node/npm, Python/pip, Rust/Cargo, Go, C/C++ build tools, Chromium/Playwright, SQLite and PostgreSQL tools. The image is based on Alpine 3.23, whose stock packages provide Rust 1.91 and Node 24 while retaining Python 3.12. Package patch versions can change when the image is rebuilt. Projects requiring other versions or platforms may still need a custom image. Repository Dockerfiles are evidence for setup, never instructions to execute on the host.
 
 Alternatively, enable selected repositories with automatic images:
 
@@ -27,6 +27,8 @@ An entry without `image` uses `"image":"auto"`. Existing entries specifying a lo
 ## What Crow does
 
 The reviewer discovers manifests and relevant CI/documentation, then selects setup commands. Discovery offers candidates for Node, Python, Rust and Go projects, including nested projects. These candidates are not promises that a particular command is correct. The reviewer inspects the project and adapts them. Discovery prioritizes root and shallow manifests, reports omitted projects in very large repositories, and honors exact npm/pnpm/Yarn versions declared by `packageManager`, including modern Yarn.
+
+Rust discovery includes `rust-toolchain` and `rust-toolchain.toml` files from the project and its ancestors. The stock Alpine `rustc` and `cargo` binaries do not enforce those files' version pins. The reviewer must check the installed compiler against the manifest's minimum Rust version and any exact toolchain requirement. Testing with a compatible stock compiler does not verify the exact pinned compiler. If an exact version is unavailable, an operator-provided image containing it is required; Crow does not automatically download replacement Rust toolchains.
 
 `prepare_environment` runs installation in a fresh sandbox at a pinned revision. It saves the resulting workspace only after successful preparation. Dependencies and caches must stay under `/workspace`; `HOME` is `/workspace/.crow-home`. Environment variables exported in one setup shell do not persist into later test shells, so test commands must activate a virtual environment or use explicit tool paths when needed.
 

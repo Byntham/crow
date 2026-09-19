@@ -6,6 +6,24 @@ use serde_json::{Value, json};
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
+async fn until_shutdown<T>(
+    review: impl std::future::Future<Output = T>,
+    cancel: CancellationToken,
+) -> Result<T> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    tokio::pin!(review);
+    tokio::select! {
+        result = &mut review => return Ok(result),
+        _ = interrupt.recv() => {},
+        _ = terminate.recv() => {},
+    }
+    cancel.cancel();
+    // Keep polling so provider and MCP process groups finish their cleanup.
+    Ok(review.await)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -37,15 +55,19 @@ async fn main() -> Result<()> {
     settings["execution"] = json!({"podman":args[4],"repositories":{repo:{"image":args[3],"timeoutSeconds":120,"memoryMiB":1536,"workspaceMiB":512,"cpus":2,"pids":256,"maxRuns":12}}});
     let job = json!({"id":job_id,"repo":repo,"number":number,"comparison":source,"settings":settings,"prContext":source.get("prContext").cloned().unwrap_or_else(||json!({"title":"Refresh the checkout button finish asset","body":"Refresh the checkout button artwork. The checkout flow and displayed price should remain unchanged."}))});
     let guidance = crow::inspection::guidance(&source).await?;
-    let result = crow::provider::run_review(
-        &job,
-        &source,
-        &guidance,
-        root,
-        crow::provider::Callbacks::default(),
-        CancellationToken::new(),
+    let cancel = CancellationToken::new();
+    let result = until_shutdown(
+        crow::provider::run_review(
+            &job,
+            &source,
+            &guidance,
+            root,
+            crow::provider::Callbacks::default(),
+            cancel.clone(),
+        ),
+        cancel,
     )
-    .await;
+    .await?;
     match result {
         Ok(report) => {
             crow::util::atomic(&root.join("result.json"), &report)?;
@@ -58,4 +80,69 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn signals_wait_for_detached_process_cleanup() {
+        const CHILD: &str = "CROW_LOCAL_REVIEW_SIGNAL_CHILD";
+        if let Some(dir) = std::env::var_os(CHILD) {
+            let cancel = CancellationToken::new();
+            let result = until_shutdown(
+                crow::process::run(
+                    "sh",
+                    &["-c".into(), "echo $$ > child.pid; exec sleep 30".into()],
+                    crow::process::RunOptions {
+                        cwd: Some(dir.into()),
+                        cancel: cancel.clone(),
+                        ..Default::default()
+                    },
+                ),
+                cancel,
+            )
+            .await
+            .unwrap();
+            assert!(result.unwrap_err().to_string().contains("Interrupted"));
+            return;
+        }
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::signals_wait_for_detached_process_cleanup",
+                ])
+                .env(CHILD, dir.path())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let pid = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Ok(text) = std::fs::read_to_string(dir.path().join("child.pid"))
+                        && let Ok(pid) = text.trim().parse::<i32>()
+                    {
+                        break pid;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(unsafe { libc::kill(child.id().unwrap() as i32, signal) }, 0);
+            let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+                .await
+                .expect("Runner did not finish process cleanup")
+                .unwrap();
+            assert!(status.success(), "Signal {signal}: {status}");
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+        }
+    }
 }

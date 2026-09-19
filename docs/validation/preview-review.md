@@ -32,3 +32,13 @@ Generated screenshots and raw reports remain outside the current source tree. Th
 ## Follow-up verification
 
 The corrected implementation passes 300 ordinary tests, including whole-report Unicode/byte limits, nested export cleanup, socket permission failures, exact Go directory-entry checksums, and bounded TLS parsing and diagnostics. Formatting and clippy with warnings denied also pass. All eight real-container tests passed. The Rust/Go scenario additionally passed with a fresh package-cache namespace, followed by verified reuse. The discovery scenario verified pinned npm 10.9.0, pnpm 9.15.4 and Yarn 4.9.2 during nested test/start commands, plus npm during an install lifecycle hook. A denied-host setup retained the exact gateway rejection reason in its receipt.
+
+## Second review
+
+The [next runtime preview](https://github.com/Byntham/crow/pull/12#pullrequestreview-5254990359), built from `dee35f6`, performed eleven experiments. It reproduced a Go cache bug by constructing a ZIP with a NUL in an entry name. Python truncated that name during verification, so Crow accepted a package that Go subsequently rejected with a checksum mismatch. The same probe at base confirmed that this cache path was introduced by the PR. Eight commands passed and three failed, including the repeated Rust version limitation. Both browser screenshots were inspected; completed-review cleanup again reported no warnings.
+
+The cache verifier now rejects ambiguous ZIP names, including NUL truncation, legacy filename decoding and Unicode Path overrides. Tests cover both export and import and retain valid UTF-8 filenames as a positive control. Expected checksums were independently checked with Go.
+
+The inspection-only reviewer also identified mixed-case repository policies losing their overrides, snapshots being removed when report submission was canceled, local replays ignoring termination signals, and historical replays reading guidance from the merge base instead of the target tip. Regression tests cover each corrected path. An ARM CI failure also exposed a freshly written mock executable racing parallel subprocess forks; the mock is now an immutable checked-in fixture.
+
+The default managed image now uses Alpine 3.23, with Rust 1.91 and Node 24. The Rust/Go integration fixture requires Rust 1.88 and exercises edition-2024 let chains, so the obsolete compiler cannot silently return. Discovery exposes Rust toolchain pins and warns that stock compilers do not enforce them. Exact pinned versions remain distinct from minimum-version compatibility; replacement compiler downloads are not enabled.

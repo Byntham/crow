@@ -268,10 +268,23 @@ async fn managed_rust_and_go_dependencies_run_offline() {
     let repo = dir.path().join("repo");
     std::fs::create_dir_all(repo.join("src")).unwrap();
     git(&repo, &["init", "-b", "main"]);
-    std::fs::write(repo.join("Cargo.toml"),"[package]\nname='crow-runtime-probe'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nitoa='=1.0.15'\n").unwrap();
+    std::fs::write(repo.join("Cargo.toml"),"[package]\nname='crow-runtime-probe'\nversion='0.1.0'\nedition='2024'\nrust-version='1.88'\n[dependencies]\nitoa='=1.0.15'\n").unwrap();
     std::fs::write(
         repo.join("src/lib.rs"),
-        "#[test] fn formats_number() { assert_eq!(itoa::Buffer::new().format(42), \"42\"); }\n",
+        r#"fn format_positive(value: Option<i32>) -> Option<String> {
+    if let Some(value) = value && value > 0 {
+        Some(itoa::Buffer::new().format(value).to_owned())
+    } else {
+        None
+    }
+}
+#[test]
+fn let_chain_handles_present_absent_and_rejected_values() {
+    assert_eq!(format_positive(Some(42)).as_deref(), Some("42"));
+    assert_eq!(format_positive(Some(-1)), None);
+    assert_eq!(format_positive(None), None);
+}
+"#,
     )
     .unwrap();
     std::fs::write(
@@ -313,8 +326,20 @@ checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
     .await;
     assert_eq!(setup["status"], "passed", "{setup}");
     assert_eq!(setup["packageCacheRestored"], false, "{setup}");
-    let tested=call(&exec,"run_experiment",json!({"revision":"head","environment":setup["id"],"command":"cargo test --offline && GOPROXY=off go test ./..."})).await;
+    let tested=call(&exec,"run_experiment",json!({"revision":"head","environment":setup["id"],"command":"rustc --version && cargo --version && node --version && python3 --version && node -e \"require('node:assert/strict').ok(Number(process.versions.node.split('.')[0]) >= 24)\" && cargo test --offline && GOPROXY=off go test ./..."})).await;
     assert_eq!(tested["status"], "passed", "{tested}");
+    let output = tested["stdout"].as_str().unwrap();
+    for marker in [
+        "rustc ",
+        "cargo ",
+        "Python 3.",
+        "let_chain_handles_present_absent_and_rejected_values",
+    ] {
+        assert!(
+            output.contains(marker),
+            "Missing toolchain evidence {marker}: {tested}"
+        );
+    }
     assert!(setup["cacheSaveError"].is_null(), "{setup}");
     let second = Execution::from_context(&context, &dir.path().join("next-review"))
         .unwrap()

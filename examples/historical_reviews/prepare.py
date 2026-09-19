@@ -50,7 +50,8 @@ for case in cases:
     if case.get('reverse'):
         base, head = head, base
         context = {'title': 'Adjust byte-range suffix handling', 'body': 'Review the change to HTTP Range parsing.'}
-    source = {'dir': str(bare), 'base': base, 'head': head, 'target': pr['base']['ref'], 'targetSha': base,
+    # Guidance always comes from the fetched target branch, including reverse controls.
+    source = {'dir': str(bare), 'base': base, 'head': head, 'target': pr['base']['ref'], 'targetSha': base_tip,
               'repo': repo, 'number': number, 'jobId': case['id'], 'prContext': context}
     (directory / 'source.json').write_text(json.dumps(source, indent=2) + '\n')
     (directory / 'case.json').write_text(json.dumps(dict(case, url=pr['html_url'], base=base, head=head), indent=2) + '\n')

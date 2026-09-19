@@ -31,6 +31,14 @@ def digest_h1(data, is_zip):
     else:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             entries = archive.infolist()
+            # Go hashes raw ZIP filename bytes. Python truncates NUL names, can
+            # honor Unicode Path extra fields, and decodes legacy names as CP437.
+            # Cache only names whose UTF-8 encoding preserves the original bytes.
+            if any(entry.orig_filename != entry.filename
+                   or '\0' in entry.orig_filename
+                   or (not entry.flag_bits & 0x800 and not entry.orig_filename.isascii())
+                   for entry in entries):
+                raise ValueError('Ambiguous module zip filename')
             if (len(entries) > COUNT_LIMIT or sum(entry.file_size for entry in entries) > LIMIT
                     or len({entry.filename for entry in entries}) != len(entries)):
                 raise ValueError('Invalid or oversized module zip')

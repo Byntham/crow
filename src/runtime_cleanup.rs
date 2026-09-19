@@ -356,23 +356,10 @@ mod tests {
         fs::write(path, serde_json::to_vec(value).unwrap()).unwrap();
     }
     fn mock(root: &Path) -> (String, BTreeMap<String, String>) {
-        use std::os::unix::fs::PermissionsExt;
-        let program = root.join("podman");
-        fs::write(
-            &program,
-            r#"#!/bin/sh
-printf '%s\n' "$*" >> "$MOCK_DIR/calls"
-case "$1" in
- ps) cat "$MOCK_DIR/containers.json" ;;
- images) cat "$MOCK_DIR/images.json" ;;
- rm) test ! -e "$MOCK_DIR/fail-remove" ;;
- image) test ! -e "$MOCK_DIR/fail-remove" ;;
- *) exit 7 ;;
-esac
-"#,
-        )
-        .unwrap();
-        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        // Keep the executable immutable: parallel subprocess forks can briefly
+        // inherit a just-written script's descriptor and cause ETXTBSY on exec.
+        let program =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/runtime-podman.sh");
         let mut env: BTreeMap<String, String> = crate::util::host_env().into_iter().collect();
         env.insert("MOCK_DIR".into(), root.to_string_lossy().into_owned());
         (program.to_string_lossy().into_owned(), env)

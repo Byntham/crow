@@ -394,6 +394,94 @@ fn malformed_go_zip_directories_cannot_hide_from_checksum_validation() {
 }
 
 #[test]
+fn go_zip_parser_filename_normalization_cannot_match_an_unrelated_pin() {
+    let source = tempfile::tempdir().unwrap();
+    let path = "example.org/module/@v/v1.0.0.zip";
+    let relative = format!("{GO}/{path}");
+    let fullpath = source.path().join(&relative);
+    std::fs::create_dir_all(fullpath.parent().unwrap()).unwrap();
+    // All three archives previously hash a different filename in Python than
+    // Go's raw ZIP name. Keep valid UTF-8 names as a positive control.
+    for (kind, expected_name, accepted) in [
+        ("nul", "source.go", false),
+        ("cp437", "café.go", false),
+        ("unicode-extra", "source.go", false),
+        ("utf8", "café.go", true),
+    ] {
+        let fixture = Command::new("python3").args(["-I", "-c", concat!(
+            "import pathlib,struct,sys,zipfile,zlib\n",
+            "path=pathlib.Path(sys.argv[1]); kind=sys.argv[2]\n",
+            "name='example.org/module@v1.0.0/'+{'nul':'source.goXsuffix','cp437':'cafX.go','unicode-extra':'different.go','utf8':'café.go'}[kind]\n",
+            "info=zipfile.ZipInfo(name)\n",
+            "if kind=='unicode-extra':\n",
+            " extra=struct.pack('<BL',1,zlib.crc32(name.encode()))+b'example.org/module@v1.0.0/source.go'\n",
+            " info.extra=struct.pack('<HH',0x7075,len(extra))+extra\n",
+            "with zipfile.ZipFile(path,'w') as z: z.writestr(info,b'package module\\n')\n",
+            "data=path.read_bytes()\n",
+            "if kind=='nul': data=data.replace(b'source.goXsuffix',b'source.go\\0suffix')\n",
+            "if kind=='cp437': data=data.replace(b'cafX.go',b'caf\\x82.go')\n",
+            "path.write_bytes(data)\n",
+        )]).arg(&fullpath).arg(kind).output().unwrap();
+        assert!(
+            fixture.status.success(),
+            "{}",
+            String::from_utf8_lossy(&fixture.stderr)
+        );
+        let pin = h1(
+            &format!("example.org/module@v1.0.0/{expected_name}"),
+            b"package module\n",
+        );
+        // Actual HashZip results from the managed Go toolchain for these bytes.
+        let go_checksum = match kind {
+            "nul" => "h1:53GCxKW8aE9GoadhkD/+TMgCI1ew4Qac1EFAurIK7ZA=",
+            "cp437" => "h1:i95QzR5fr/jaO44Iuh2b7rJOqDfgLfQlbzSQ6YMBoys=",
+            "unicode-extra" => "h1:KzAbHc7OOrHukSjkRMRoFfSuCf//KMlLS4UwdKs83CM=",
+            "utf8" => "h1:afHd4iduSgXHkM9J80TcYnbSVeRHHWH01YFfYqgNA2I=",
+            _ => unreachable!(),
+        };
+        assert_eq!(pin == go_checksum, accepted, "{kind}");
+        if kind == "nul" || kind == "unicode-extra" {
+            // Same known answer independently checked with Go dirhash.HashZip
+            // for the plain source.go fixture in the directory-entry regression.
+            assert_eq!(pin, "h1://SsL+qsG2XNW4UV2fUFcFBpYyh+eYSho1uh0pTCTGM=");
+        }
+        let pins = json!({"go":{path:pin}});
+        let exported = run("export", source.path(), &pins, &[]);
+        assert!(
+            exported.status.success(),
+            "{kind}: {}",
+            String::from_utf8_lossy(&exported.stderr)
+        );
+        assert_eq!(!names(&exported.stdout).is_empty(), accepted, "{kind}");
+        let destination = tempfile::tempdir().unwrap();
+        let bytes = std::fs::read(&fullpath).unwrap();
+        let imported = run(
+            "import",
+            destination.path(),
+            &pins,
+            &archive(&relative, &bytes, false),
+        );
+        assert_eq!(
+            imported.status.success(),
+            accepted,
+            "{kind}: {}",
+            String::from_utf8_lossy(&imported.stderr)
+        );
+        assert_eq!(
+            destination.path().join(&relative).exists(),
+            accepted,
+            "{kind}"
+        );
+        if accepted {
+            assert_eq!(
+                std::fs::read(destination.path().join(&relative)).unwrap(),
+                bytes
+            );
+        }
+    }
+}
+
+#[test]
 fn cargo_and_go_pins_reject_changed_download_contents() {
     let root = tempfile::tempdir().unwrap();
     let cargo = format!("{CARGO}/example-1.0.0.crate");

@@ -71,7 +71,7 @@ fn podman() -> String {
     "podman".into()
 }
 fn config(value: &Value) -> Result<Config> {
-    let config: Config = if value.is_null() {
+    let mut config: Config = if value.is_null() {
         Config {
             podman: podman(),
             ..Default::default()
@@ -83,14 +83,8 @@ fn config(value: &Value) -> Result<Config> {
         !config.podman.is_empty(),
         "execution.podman must name the Podman executable"
     );
-    for (repo, policy) in &config.repositories {
-        ensure!(
-            repo.split('/').count() == 2
-                && repo.split('/').all(|p| !p.is_empty()
-                    && p.bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))),
-            "Invalid execution repository name"
-        );
+    for (repo, policy) in std::mem::take(&mut config.repositories) {
+        let repo = crate::util::repo_name(&repo).context("Invalid execution repository name")?;
         ensure!(
             policy.image == "auto"
                 || policy
@@ -121,6 +115,10 @@ fn config(value: &Value) -> Result<Config> {
             (1..=50).contains(&policy.max_runs),
             "Execution maxRuns must be 1–50"
         );
+        ensure!(
+            config.repositories.insert(repo.clone(), policy).is_none(),
+            "Duplicate execution repository policy after case normalization: {repo}"
+        );
     }
     Ok(config)
 }
@@ -129,7 +127,7 @@ pub fn validate(value: &Value) -> Result<()> {
 }
 pub fn enabled(settings: &Value, repo: &str) -> Result<bool> {
     let cfg = config(&settings["execution"])?;
-    Ok(cfg.automatic || cfg.repositories.contains_key(repo))
+    Ok(cfg.automatic || cfg.repositories.contains_key(&repo.to_ascii_lowercase()))
 }
 
 pub const TOOL_NAMES: &[&str] = &[
@@ -167,8 +165,11 @@ fn environment() -> BTreeMap<String, String> {
 impl Execution {
     pub fn from_context(context: &Value, dir: &Path) -> Result<Option<Self>> {
         let cfg = config(&context["job"]["settings"]["execution"])?;
-        let repo = context["job"]["repo"].as_str().unwrap_or("");
-        let policy = match cfg.repositories.get(repo).cloned() {
+        let repo = context["job"]["repo"]
+            .as_str()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let policy = match cfg.repositories.get(&repo).cloned() {
             Some(policy) => policy,
             None if cfg.automatic => serde_json::from_value(json!({}))?,
             None => return Ok(None),
@@ -181,7 +182,7 @@ impl Execution {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| dir.to_owned())
                 .join("runtime-cache"),
-            repository: crate::util::repo_name(repo)?,
+            repository: crate::util::repo_name(&repo)?,
             cache_scope: context["job"]["number"]
                 .as_u64()
                 .map_or_else(|| "local".to_owned(), |number| format!("pr:{number}")),
@@ -1380,6 +1381,46 @@ mod tests {
             assert!(validate(&cfg).is_err(), "{key}");
         }
     }
+    #[test]
+    fn repository_policy_case_matches_enrollment_and_preserves_custom_limits() {
+        let root = tempfile::tempdir().unwrap();
+        let policy = json!({
+            "image":format!("sha256:{}", "b".repeat(64)),
+            "timeoutSeconds":75,"memoryMiB":256,"workspaceMiB":128,
+            "cpus":1,"pids":32,"maxRuns":4
+        });
+        for automatic in [false, true] {
+            let settings = json!({"execution":{
+                "automatic":automatic,"repositories":{"Byntham/Crow":policy}
+            }});
+            for repo in ["byntham/crow", "Byntham/Crow", "BYNTHAM/CROW"] {
+                assert!(enabled(&settings, repo).unwrap());
+                let context = json!({"job":{"repo":repo,"settings":settings},"source":{}});
+                let execution = Execution::from_context(&context, root.path())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(execution.repository, "byntham/crow");
+                assert_eq!(serde_json::to_value(execution.policy).unwrap(), policy);
+            }
+            assert_eq!(enabled(&settings, "byntham/other").unwrap(), automatic);
+        }
+    }
+
+    #[test]
+    fn conflicting_repository_spellings_are_rejected_instead_of_selecting_a_policy() {
+        let cfg = json!({"automatic":true,"repositories":{
+            "Byntham/Crow":{"maxRuns":1},
+            "byntham/crow":{"maxRuns":20}
+        }});
+        let error = validate(&cfg).unwrap_err().to_string();
+        assert!(
+            error.contains("Duplicate execution repository policy"),
+            "{error}"
+        );
+        assert!(error.contains("byntham/crow"), "{error}");
+        assert!(enabled(&json!({"execution":cfg}), "byntham/crow").is_err());
+    }
+
     #[test]
     fn automatic_mode_needs_no_repository_images_or_new_limits() {
         let settings = json!({"execution":{"automatic":true}});

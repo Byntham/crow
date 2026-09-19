@@ -580,7 +580,11 @@ async fn execute(shared: Arc<Shared>, work: Value, cancel: CancellationToken) {
         let patch=shared.backend.patch(&source,&report["findings"],cancel.clone()).await?;
         cancelled(&cancel)?;
         let runtime=crate::runtime_status::Progress::read(&shared.root,&job).ok();
-        shared.send(&job,"report",json!({"report":report,"patch":patch,"runtime":runtime})).await?;
+        let acknowledgement=shared.send(&job,"report",json!({"report":report,"patch":patch,"runtime":runtime})).await?;
+        // A successful RPC may reject this lease because the review was paused
+        // or its lease changed while the report was in flight. Preserve resumable work.
+        if acknowledgement["cancel"]==true {cancel.cancel();return Ok(());}
+        ensure!(acknowledgement["ok"]==true,"The service did not confirm report acceptance");
         // The validated report is durable locally and accepted by the service.
         // Publishing retries need evidence, not the large prepared workspaces.
         let root = shared.root.clone(); let mut finished = job.clone(); finished["state"] = json!("completed");
@@ -1084,6 +1088,7 @@ mod tests {
         events: Mutex<Vec<(String, Value)>>,
         reviews: AtomicUsize,
         fail_report: AtomicBool,
+        report_response: Option<Value>,
         fail_session: AtomicBool,
         fail_heartbeat: bool,
         fail_maintenance: bool,
@@ -1106,6 +1111,7 @@ mod tests {
                 events: Mutex::new(vec![]),
                 reviews: AtomicUsize::new(0),
                 fail_report: AtomicBool::new(false),
+                report_response: None,
                 fail_session: AtomicBool::new(false),
                 fail_heartbeat: false,
                 fail_maintenance: false,
@@ -1164,11 +1170,24 @@ mod tests {
                     if self.fail_maintenance {
                         bail!("Service unavailable");
                     }
+                    if self
+                        .report_response
+                        .as_ref()
+                        .is_some_and(|response| response["cancel"] == true)
+                        && self.count("report").await > 0
+                    {
+                        return Ok(
+                            json!({"jobs":[{"id":"job1","state":"paused","updatedAt":util::now(),"session":SESSION}],"retentionDays":7}),
+                        );
+                    }
                     Ok(json!({"jobs":[],"retentionDays":7}))
                 }
                 "heartbeat" if self.fail_heartbeat => bail!("Connection lost"),
                 "report" if self.fail_report.swap(false, Ordering::SeqCst) => {
                     bail!("Lost response")
+                }
+                "report" if self.report_response.is_some() => {
+                    Ok(self.report_response.clone().unwrap())
                 }
                 "session" if self.fail_session.swap(false, Ordering::SeqCst) => {
                     bail!("Lost session acknowledgment")
@@ -1495,6 +1514,69 @@ esac
         assert_eq!(f.reviews.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn only_accepted_reports_release_prepared_snapshots() {
+        for acknowledgement in [
+            json!({"ok":true}),
+            json!({"cancel":true}),
+            json!({"ok":true,"cancel":true}),
+            json!({"ok":false}),
+            json!({}),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let experiments = root.path().join("reviews/job1/experiments");
+            fs::create_dir_all(experiments.join("environments")).unwrap();
+            let snapshot = experiments.join("environments/prepared.tar");
+            fs::write(&snapshot, "dependencies needed to resume the paused review").unwrap();
+            let id = "a".repeat(32);
+            let receipt = experiments.join(format!("{id}.json"));
+            util::atomic(
+                &receipt,
+                &json!({"id":id,"phase":"setup","status":"passed","containerStarted":false}),
+            )
+            .unwrap();
+            let fake = Arc::new(Fake {
+                report_response: Some(acknowledgement.clone()),
+                ..Fake::new()
+            });
+            let worker = start(root.path(), fake.clone()).await;
+            fake.until("report", 1).await;
+            worker.drain().await.unwrap();
+            worker.close().await.unwrap();
+            let accepted = acknowledgement["ok"] == true && acknowledgement["cancel"] != true;
+            assert_eq!(snapshot.exists(), !accepted, "{acknowledgement}");
+            assert!(
+                receipt.exists(),
+                "Runtime evidence must survive {acknowledgement}"
+            );
+            assert_eq!(
+                root.path()
+                    .join("reviews/job1/runtime-cleanup.json")
+                    .exists(),
+                accepted,
+                "{acknowledgement}"
+            );
+            assert_eq!(
+                util::read_json(&root.path().join("reports/job1.json"))
+                    .unwrap()
+                    .unwrap()["report"],
+                report()
+            );
+            if acknowledgement["cancel"] == true {
+                assert_eq!(
+                    fake.count("failed").await,
+                    0,
+                    "A rejected lease must not be retried by this execution"
+                );
+            } else if !accepted {
+                assert_eq!(
+                    fake.count("failed").await,
+                    1,
+                    "Missing acknowledgement must be reported for retry"
+                );
+            }
+        }
+    }
     #[tokio::test]
     async fn lost_publication_response_reuses_durable_report() {
         let dir = tempfile::tempdir().unwrap();

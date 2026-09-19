@@ -45,6 +45,8 @@ pub async fn discover(source: &Value, revision: &str) -> Result<Value> {
                 "docker-compose.yml",
                 "Makefile",
                 "README.md",
+                "rust-toolchain",
+                "rust-toolchain.toml",
             ]
             .contains(&name)
         {
@@ -75,6 +77,7 @@ pub async fn discover(source: &Value, revision: &str) -> Result<Value> {
         let blob = crate::inspection::read_blob(source, path, Some(commit)).await;
         let mut package_manager = Value::Null;
         let mut warning = Value::Null;
+        let mut toolchain_files = Vec::new();
         let (setup, tests, start) = match language {
             "node" => {
                 let package: Value = blob
@@ -118,16 +121,43 @@ pub async fn discover(source: &Value, revision: &str) -> Result<Value> {
                 "/workspace/.venv/bin/python -m pytest".to_owned(),
                 String::new(),
             ),
-            "rust" => ("cargo fetch --locked".into(), "cargo test --offline --locked".into(), String::new()),
+            "rust" => {
+                toolchain_files = rust_toolchains(&files, directory);
+                if !toolchain_files.is_empty() {
+                    warning = json!("Inspect the toolchain files and Cargo.toml rust-version. The managed image uses stock Alpine rustc/cargo, which do not enforce rust-toolchain pins. Check rustc --version and cargo --version before testing. If the required exact version is unavailable, report the mismatch; an operator-provided image is needed for that version.");
+                }
+                ("cargo fetch --locked".into(), "cargo test --offline --locked".into(), String::new())
+            },
             "go" => ("go mod download".into(), "GOPROXY=off go test ./...".into(), String::new()),
             _ => unreachable!(),
         };
-        projects.push(json!({"directory":directory,"manifest":path,"language":language,"setup":setup,"test":tests,"start":start,"packageManager":package_manager,"warning":warning}));
+        projects.push(json!({"directory":directory,"manifest":path,"language":language,"setup":setup,"test":tests,"start":start,"packageManager":package_manager,"toolchainFiles":toolchain_files,"warning":warning}));
     }
     evidence.truncate(100);
     Ok(
         json!({"revision":revision,"commit":commit,"projects":projects,"projectCount":project_count,"projectsTruncated":project_count > projects.len(),"instructionsToInspect":evidence,"browser":{"module":"/opt/browser/node_modules/playwright-core/index.mjs","executable":"/usr/bin/chromium","args":["--no-sandbox","--disable-dev-shm-usage"]},"note":"These are setup candidates, not verified commands. Read CI and manifests, respect runtime versions, select affected projects, and repair failed setup using logs. Do not change application code to make a test pass. Static sites and standard-library projects need no dependency installation."}),
     )
+}
+
+fn rust_toolchains(files: &[&str], directory: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut ancestors: Vec<_> = directory.split('/').filter(|part| *part != ".").collect();
+    loop {
+        for name in ["rust-toolchain", "rust-toolchain.toml"] {
+            let path = if ancestors.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{}/{name}", ancestors.join("/"))
+            };
+            if files.contains(&path.as_str()) {
+                result.push(path);
+            }
+        }
+        if ancestors.pop().is_none() {
+            break;
+        }
+    }
+    result
 }
 
 /// Accept exact registry versions only. Never interpolate repository strings as
@@ -344,6 +374,26 @@ fn image_id(output: &str) -> Result<String> {
 #[cfg(test)]
 mod discovery_tests {
     use super::*;
+
+    #[test]
+    fn rust_toolchain_discovery_checks_project_and_ancestor_pins() {
+        let files = [
+            "rust-toolchain.toml",
+            "crates/rust-toolchain",
+            "crates/api/rust-toolchain.toml",
+            "other/rust-toolchain.toml",
+        ];
+        assert_eq!(
+            rust_toolchains(&files, "crates/api"),
+            [
+                "crates/api/rust-toolchain.toml",
+                "crates/rust-toolchain",
+                "rust-toolchain.toml"
+            ]
+        );
+        assert_eq!(rust_toolchains(&files, "."), ["rust-toolchain.toml"]);
+        assert!(rust_toolchains(&["other/rust-toolchain"], "crates/api").is_empty());
+    }
 
     #[test]
     fn package_manager_candidates_respect_exact_versions_and_yarn_generations() {
