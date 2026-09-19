@@ -36,7 +36,15 @@ The package hosts currently cover npm/Yarn, PyPI, crates.io, the Go module proxy
 
 `run_experiment` restores the selected prepared workspace into a fresh, offline container. It verifies that the environment belongs to the exact requested commit and current image, then restores tracked source from that commit over the dependency snapshot. Setup hooks cannot silently replace the tracked source under test. The download socket is absent. Crow can run existing tests, write temporary reproductions, start services and exercise them through loopback. It compares equivalent experiments on base and head before attributing failures to the change.
 
-Successful preparations are reused when the repository location, exact commit, image and setup command match. A new commit always invalidates that snapshot. This also permits reuse across reviews when one PR's head becomes a later comparison base. Shared snapshots are pruned by age and an approximately 4 GiB size cap; each snapshot is limited to 512 MiB. Cache entries are archived with owner-write permission so unprivileged restoration can populate read-only module directories. Original tracked-file permissions are restored from Git before testing. Crow never extracts archives on the host. The cache is an optimization, not evidence that an application passed tests.
+Successful preparations are reused when the repository identity, exact commit, image and setup command match. A new commit always invalidates that snapshot. This also permits reuse across reviews when one PR's head becomes a later comparison base. Shared snapshots are pruned by age and an approximately 4 GiB size cap; each snapshot is limited to 512 MiB. Cache entries are archived with owner-write permission so unprivileged restoration can populate read-only module directories. Original tracked-file permissions are restored from Git before testing. Crow never extracts archives on the host. The cache is an optimization, not evidence that an application passed tests.
+
+## Status in the main comment
+
+Runtime tests are selective. The worker operator must enable execution, and the reviewer chooses useful checks based on the diff, project manifests, CI and available dependencies. Crow instructs the reviewer to investigate changed behavior autonomously, but does not require a test command on every review. Documentation-only changes can need no runtime check; unsupported platforms or private dependencies can prevent one.
+
+The main Crow status comment shows runtime testing separately from review progress. It reports disabled execution, a pending testing decision, environment setup, running tests, and final command counts. Setup attempts have their own counts. If the reviewer finishes without running a test command, the comment says so. If setup fails before any tests run, it reports that testing was blocked. Interrupted jobs never leave a command labelled as still running.
+
+Counts come from saved execution receipts, not the model's description of its work. Workers send updates on their ten-second heartbeat; very short experiments may appear only as completed counts. The service updates the existing comment when those counts change. Counts include both base and head commands and unsuccessful investigation attempts, so a failed command does not itself mean the PR introduced a bug. The review explains the evidence and coverage gaps. See [comment examples](../validation/runtime-status.md).
 
 ## Visual investigations
 
@@ -49,6 +57,8 @@ Artifacts and receipts remain in the worker's review directory and follow normal
 ## Limits and failures
 
 Existing experiment limits still apply. Defaults are 120 seconds per setup/test command, 1 GiB of RAM, 512 MiB for each writable filesystem, two CPUs, 128 PIDs, and 12 attempts per review. Existing overrides still work; no new budget configuration is needed. First-time toolchain provisioning has a separate internal 30-minute ceiling and remains subject to review cancellation and the existing review timeout. It is recorded separately as `provisionMs` so a cold image build does not consume the command's runtime deadline.
+
+Captured output retains a bounded beginning and end with an omission marker, so lengthy logs retain their final diagnostics.
 
 Every attempted setup or experiment counts toward the existing attempt limit, including cache hits and failures. Discovery and reading saved evidence do not. The main reviewer executes serially; delegated reviewers remain inspection-only. Resumes retain receipts and successful preparations.
 

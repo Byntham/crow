@@ -569,15 +569,19 @@ fn configuration(v: &Value) -> String {
         field(
             &mut out,
             "Runtime experiments",
-            repositories.filter(|r| !r.is_empty()).map_or_else(
-                || "Disabled".to_owned(),
-                |r| {
-                    format!(
-                        "Enabled for {}",
-                        r.keys().cloned().collect::<Vec<_>>().join(", ")
-                    )
-                },
-            ),
+            if v["worker"]["execution"]["automatic"] == true {
+                "Enabled for all repositories".to_owned()
+            } else {
+                repositories.filter(|r| !r.is_empty()).map_or_else(
+                    || "Disabled".to_owned(),
+                    |r| {
+                        format!(
+                            "Enabled for {}",
+                            r.keys().cloned().collect::<Vec<_>>().join(", ")
+                        )
+                    },
+                )
+            },
         );
     }
     if v["role"] != "worker" {
@@ -889,6 +893,16 @@ mod tests {
         assert!(!output.contains("private-session"));
         assert!(output.lines().count() < 35);
     }
+    #[test]
+    fn configuration_reports_runtime_authority() {
+        let mut config = crate::config::defaults(std::path::Path::new("/tmp/crow"));
+        assert!(render("config", &config).contains("Disabled"));
+        config["worker"]["execution"] = json!({"automatic":true});
+        assert!(render("config", &config).contains("Enabled for all repositories"));
+        config["worker"]["execution"] = json!({"repositories":{"owner/repo":{}}});
+        assert!(render("config", &config).contains("Enabled for owner/repo"));
+    }
+
     #[test]
     fn configuration_hides_secrets_and_explains_defaults() {
         let mut config = crate::config::defaults(std::path::Path::new("/tmp/crow"));

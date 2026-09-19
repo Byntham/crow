@@ -14,6 +14,7 @@ pub mod provider;
 pub mod report;
 pub mod retention;
 mod runtime;
+pub mod runtime_status;
 pub mod service;
 pub mod setup;
 pub mod store;

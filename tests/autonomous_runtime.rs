@@ -289,3 +289,96 @@ async fn managed_rust_and_go_dependencies_run_offline() {
     let tested=call(&exec,"run_experiment",json!({"revision":"head","environment":setup["id"],"command":"cargo test --offline && GOPROXY=off go test ./..."})).await;
     assert_eq!(tested["status"], "passed", "{tested}");
 }
+
+#[tokio::test]
+#[ignore = "requires rootless Podman and the managed Python image"]
+async fn restore_ignores_repository_imports_and_user_site_hooks_and_cache_crosses_checkouts() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(".crow-data/autonomous-runtime-test");
+    std::fs::create_dir_all(&root).unwrap();
+    let temp = tempfile::tempdir_in(&root).unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-b", "main"]);
+    std::fs::write(repo.join("tracked.txt"), "original pinned source\n").unwrap();
+    std::fs::write(
+        repo.join("tarfile.py"),
+        "print('REPOSITORY MODULE EXECUTED'); raise SystemExit(0)\n",
+    )
+    .unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "hostile imports"]);
+    let commit = git(&repo, &["rev-parse", "HEAD"]);
+    let mut context = json!({"root":temp.path(),"source":{"dir":repo,"base":commit,"head":commit},"job":{"repo":"fixture/restore","settings":{"execution":{"automatic":true,"podman":std::env::var("CROW_TEST_PODMAN").unwrap_or("podman".into())}}}});
+    // Reuse the managed image from the suite, but keep dependency snapshots local to this test.
+    // The managed image tag is deterministic and local to Podman.
+    let exec = Execution::from_context(&context, &temp.path().join("experiments"))
+        .unwrap()
+        .unwrap();
+    let setup = "printf 'tampered by setup\\n' > tracked.txt";
+    let prepared = call(
+        &exec,
+        "prepare_environment",
+        json!({"revision":"head","setup":setup}),
+    )
+    .await;
+    assert_eq!(prepared["status"], "passed", "{prepared}");
+    let result = call(&exec, "run_experiment", json!({"revision":"head","environment":prepared["id"],"command":"test \"$(cat tracked.txt)\" = 'original pinned source'"})).await;
+    assert_eq!(result["status"], "passed", "{result}");
+    let hook = r#"set -e
+printf 'tampered by setup\n' > tracked.txt
+rm tarfile.py
+python3 -I - <<'PYTHON'
+import site
+from pathlib import Path
+path = Path(site.getusersitepackages())
+path.mkdir(parents=True, exist_ok=True)
+(path / 'crow_attack.pth').write_text('import os; os._exit(0)\n')
+PYTHON"#;
+    let poisoned = call(
+        &exec,
+        "prepare_environment",
+        json!({"revision":"head","setup":hook}),
+    )
+    .await;
+    assert_eq!(poisoned["status"], "passed", "{poisoned}");
+    let result = call(&exec, "run_experiment", json!({"revision":"head","environment":poisoned["id"],"command":"test \"$(cat tracked.txt)\" = 'original pinned source' && test -f tarfile.py && test -n \"$(find .crow-home -name crow_attack.pth)\""})).await;
+    assert_eq!(result["status"], "passed", "{result}");
+
+    let checkout = temp.path().join("another-job-checkout");
+    git(
+        temp.path(),
+        &["clone", repo.to_str().unwrap(), checkout.to_str().unwrap()],
+    );
+    context["source"]["dir"] = json!(checkout);
+    let other = Execution::from_context(&context, &temp.path().join("other-experiments"))
+        .unwrap()
+        .unwrap();
+    let cached = call(
+        &other,
+        "prepare_environment",
+        json!({"revision":"head","setup":setup}),
+    )
+    .await;
+    assert_eq!(cached["cached"], true, "{cached}");
+    context["job"]["repo"] = json!("fixture/different-repository");
+    let different = Execution::from_context(&context, &temp.path().join("different-experiments"))
+        .unwrap()
+        .unwrap();
+    let uncached = call(
+        &different,
+        "prepare_environment",
+        json!({"revision":"head","setup":setup}),
+    )
+    .await;
+    assert_eq!(uncached["status"], "passed", "{uncached}");
+    assert_ne!(uncached["cached"], true, "{uncached}");
+    let output = call(&exec, "run_experiment", json!({"revision":"head","command":"printf 'BEGIN\\n'; head -c 40000 /dev/zero | tr '\\000' '.'; printf '\\nFINAL_FAILURE_DIAGNOSIS\\n'; exit 1"})).await;
+    assert_eq!(output["status"], "failed");
+    assert_eq!(output["outputTruncated"], true);
+    let stdout = output["stdout"].as_str().unwrap();
+    assert!(
+        stdout.starts_with("BEGIN")
+            && stdout.contains("output omitted")
+            && stdout.ends_with("FINAL_FAILURE_DIAGNOSIS\n")
+    );
+}

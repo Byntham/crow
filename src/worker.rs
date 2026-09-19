@@ -515,7 +515,11 @@ async fn execute(shared: Arc<Shared>, work: Value, cancel: CancellationToken) {
                 if cancel.is_cancelled() {
                     continue;
                 }
-                match shared.send(&job, "heartbeat", json!({})).await {
+                let mut body = json!({});
+                if let Ok(progress) = crate::runtime_status::Progress::read(&shared.root, &job) {
+                    body["runtime"] = json!(progress);
+                }
+                match shared.send(&job, "heartbeat", body).await {
                     Ok(v) if v["cancel"] != true => (),
                     _ => {
                         cancel.cancel();
@@ -574,7 +578,8 @@ async fn execute(shared: Arc<Shared>, work: Value, cancel: CancellationToken) {
         cancelled(&cancel)?;
         let patch=shared.backend.patch(&source,&report["findings"],cancel.clone()).await?;
         cancelled(&cancel)?;
-        shared.send(&job,"report",json!({"report":report,"patch":patch})).await?;
+        let runtime=crate::runtime_status::Progress::read(&shared.root,&job).ok();
+        shared.send(&job,"report",json!({"report":report,"patch":patch,"runtime":runtime})).await?;
         Ok(())
     }.await;
     if let Err(error) = result {
@@ -611,6 +616,9 @@ async fn execute(shared: Arc<Shared>, work: Value, cancel: CancellationToken) {
             .filter(|s| valid_session(s))
         {
             body["session"] = json!(id);
+        }
+        if let Ok(progress) = crate::runtime_status::Progress::read(&shared.root, &job) {
+            body["runtime"] = json!(progress);
         }
         let _ = shared.send(&job, "failed", body).await;
     }
@@ -889,6 +897,7 @@ mod tests {
         fail_report: AtomicBool,
         fail_session: AtomicBool,
         fail_heartbeat: bool,
+        execution_enabled: bool,
         retry: bool,
         wait_cancel: bool,
         cancel_session: bool,
@@ -908,6 +917,7 @@ mod tests {
                 fail_report: AtomicBool::new(false),
                 fail_session: AtomicBool::new(false),
                 fail_heartbeat: false,
+                execution_enabled: false,
                 retry: false,
                 wait_cancel: false,
                 cancel_session: false,
@@ -1008,7 +1018,7 @@ mod tests {
             assert!(job["settings"].get("codexHome").is_some());
             assert!(job["settings"].get("token").is_none());
             assert!(
-                job["settings"]["execution"].is_null(),
+                job["settings"]["execution"].is_null() != self.execution_enabled,
                 "Job-supplied execution settings must not grant authority"
             );
             if let Some(callback) = callbacks.on_session {
@@ -1045,6 +1055,48 @@ mod tests {
             .await
             .unwrap()
     }
+    #[tokio::test]
+    async fn worker_reports_live_receipts_and_final_runtime_without_provider_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = Arc::new(Semaphore::new(0));
+        let f = Arc::new(Fake {
+            execution_enabled: true,
+            review_gate: Some(gate.clone()),
+            ..Fake::new()
+        });
+        let mut config = crate::config::defaults(dir.path());
+        config["worker"]["execution"] = json!({"automatic":true});
+        let worker = start_worker_with(config, dir.path().to_owned(), f.clone(), options())
+            .await
+            .unwrap();
+        f.review_started.acquire().await.unwrap().forget();
+        let receipt = dir.path().join("reviews/job1/experiments/one.json");
+        util::atomic(&receipt, &json!({"phase":"test","status":"running"})).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if f.events.lock().await.iter().any(|(action, body)| {
+                    action == "heartbeat" && body["runtime"]["tests"]["running"] == 1
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        util::atomic(&receipt, &json!({"phase":"test","status":"failed"})).unwrap();
+        gate.add_permits(1);
+        f.until("report", 1).await;
+        worker.close().await.unwrap();
+        let events = f.events.lock().await;
+        let (_, body) = events
+            .iter()
+            .find(|(action, _)| action == "report")
+            .unwrap();
+        assert_eq!(body["runtime"]["tests"]["failed"], 1);
+        assert_eq!(body["runtime"]["tests"]["running"], 0);
+    }
+
     #[tokio::test]
     async fn service_job_cannot_enable_execution_on_worker() {
         let dir = tempfile::tempdir().unwrap();

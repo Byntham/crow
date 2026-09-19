@@ -42,8 +42,10 @@ jobs:
           export XDG_RUNTIME_DIR="/run/user/$(id -u)"
           export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
           podman pull docker.io/library/alpine:3.22
-          export CROW_TEST_IMAGE=$(podman image inspect --format '{{.Id}}' docker.io/library/alpine:3.22)
-          systemd-run --user --scope -p Delegate=yes -- cargo test --locked --test execution_mcp -- --ignored --nocapture
+          crow_image_id=$(podman image inspect --format '{{.Id}}' docker.io/library/alpine:3.22)
+          export CROW_TEST_IMAGE="sha256:${crow_image_id#sha256:}"
+          systemd-run --user --scope -p Delegate=yes -- cargo test --locked --test execution_mcp -- --ignored --nocapture --test-threads=1
+          systemd-run --user --scope -p Delegate=yes -- cargo test --locked --test autonomous_runtime -- --ignored --nocapture --test-threads=1
       - name: Install native musl compiler
         run: sudo apt-get update && sudo apt-get install --yes musl-tools binutils
       - name: Build and package portable native executable

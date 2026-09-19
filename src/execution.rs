@@ -155,6 +155,7 @@ pub struct Execution {
     dir: PathBuf,
     env: BTreeMap<String, String>,
     cache: PathBuf,
+    repository: String,
 }
 fn environment() -> BTreeMap<String, String> {
     // Podman needs the user's runtime directory and session bus for cgroups.
@@ -178,6 +179,7 @@ impl Execution {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| dir.to_owned())
                 .join("runtime-cache"),
+            repository: crate::util::repo_name(repo)?,
             executable: cfg.podman,
             policy,
             source: context["source"].clone(),
@@ -317,11 +319,11 @@ impl Execution {
             let image = image?;
             record["image"] = json!(image);
             let cache_key = crate::runtime::fingerprint(&[
-                self.source["dir"].as_str().unwrap_or(""),
+                &self.repository,
                 commit,
                 &image,
                 script,
-                "owner-writable-snapshot-v1",
+                "isolated-restore-v2",
             ]);
             let cached = self.cache.join(format!("{cache_key}.tar"));
             crate::util::private_dir(&self.dir.join("environments"))?;
@@ -597,6 +599,7 @@ impl Execution {
                         "--interactive",
                         name,
                         "python3",
+                        "-I",
                         "-c",
                         include_str!("runtime/restore.py"),
                     ],
@@ -611,7 +614,7 @@ impl Execution {
         }
         let command = if gateway.is_some() {
             format!(
-                "python3 /opt/crow/proxy.py >/tmp/crow-proxy.log 2>&1 &\nproxy=$!\ntrap 'kill $proxy 2>/dev/null || true' EXIT\nexport HTTPS_PROXY=http://127.0.0.1:3128 HTTP_PROXY=http://127.0.0.1:3128 https_proxy=http://127.0.0.1:3128 http_proxy=http://127.0.0.1:3128 NO_PROXY=127.0.0.1,localhost\nexport PIP_INDEX_URL=https://pypi.org/simple\nmkdir -p \"$HOME\"\npython3 -c 'import socket,time
+                "python3 -I /opt/crow/proxy.py >/tmp/crow-proxy.log 2>&1 &\nproxy=$!\ntrap 'kill $proxy 2>/dev/null || true' EXIT\nexport HTTPS_PROXY=http://127.0.0.1:3128 HTTP_PROXY=http://127.0.0.1:3128 https_proxy=http://127.0.0.1:3128 http_proxy=http://127.0.0.1:3128 NO_PROXY=127.0.0.1,localhost\nexport PIP_INDEX_URL=https://pypi.org/simple\nmkdir -p \"$HOME\"\npython3 -I -c 'import socket,time
 for attempt in range(100):
  try:
   socket.create_connection((\"127.0.0.1\",3128),timeout=.1).close(); break
@@ -817,7 +820,7 @@ impl LiveOutput {
     fn value(&self) -> Value {
         let stdout = self.stdout.lock().unwrap();
         let stderr = self.stderr.lock().unwrap();
-        json!({"stdout":String::from_utf8_lossy(&stdout.bytes),"stderr":String::from_utf8_lossy(&stderr.bytes),"outputTruncated":stdout.truncated||stderr.truncated})
+        json!({"stdout":stdout.text(),"stderr":stderr.text(),"outputTruncated":stdout.truncated||stderr.truncated})
     }
 }
 async fn capture_shared(
@@ -840,11 +843,35 @@ struct Captured {
 }
 impl Captured {
     fn append(&mut self, bytes: &[u8]) {
-        let keep = bytes
-            .len()
-            .min(OUTPUT_LIMIT.saturating_sub(self.bytes.len()));
-        self.bytes.extend_from_slice(&bytes[..keep]);
-        self.truncated |= keep < bytes.len();
+        const HALF: usize = OUTPUT_LIMIT / 2;
+        if !self.truncated && self.bytes.len() + bytes.len() <= OUTPUT_LIMIT {
+            self.bytes.extend_from_slice(bytes);
+            return;
+        }
+        // Keep the beginning and the most recent diagnostics, regardless of chunk size.
+        let head_missing = HALF.saturating_sub(self.bytes.len());
+        self.bytes
+            .extend_from_slice(&bytes[..head_missing.min(bytes.len())]);
+        if bytes.len() >= HALF {
+            self.bytes.truncate(HALF);
+            self.bytes.extend_from_slice(&bytes[bytes.len() - HALF..]);
+        } else {
+            let remove = (self.bytes.len() + bytes.len()).saturating_sub(OUTPUT_LIMIT);
+            self.bytes.drain(HALF..HALF + remove);
+            self.bytes.extend_from_slice(bytes);
+        }
+        self.truncated = true;
+    }
+    fn text(&self) -> String {
+        if self.truncated {
+            format!(
+                "{}\n[... output omitted ...]\n{}",
+                String::from_utf8_lossy(&self.bytes[..OUTPUT_LIMIT / 2]),
+                String::from_utf8_lossy(&self.bytes[OUTPUT_LIMIT / 2..])
+            )
+        } else {
+            String::from_utf8_lossy(&self.bytes).into_owned()
+        }
     }
 }
 #[cfg(test)]
@@ -1146,6 +1173,31 @@ mod tests {
         let summary = report["summary"].as_str().unwrap();
         assert!(summary.contains("50 failed") && summary.contains("Showing 12 of 50"));
         assert!(summary.contains("&#124;"));
+    }
+
+    #[test]
+    fn output_capture_keeps_head_and_tail_across_chunk_boundaries() {
+        for chunk_size in [1, 17, 8192, OUTPUT_LIMIT, OUTPUT_LIMIT * 3] {
+            let bytes = [
+                b"FIRST_DIAGNOSTIC\n".as_slice(),
+                &vec![b'x'; OUTPUT_LIMIT * 2],
+                b"\nFINAL_FAILURE_DIAGNOSIS",
+            ]
+            .concat();
+            let mut captured = Captured::default();
+            for chunk in bytes.chunks(chunk_size) {
+                captured.append(chunk);
+            }
+            assert_eq!(captured.bytes.len(), OUTPUT_LIMIT);
+            let text = captured.text();
+            assert!(text.starts_with("FIRST_DIAGNOSTIC"));
+            assert!(text.contains("[... output omitted ...]"));
+            assert!(text.ends_with("FINAL_FAILURE_DIAGNOSIS"));
+        }
+        let mut captured = Captured::default();
+        captured.append("small UTF-8: café".as_bytes());
+        assert_eq!(captured.text(), "small UTF-8: café");
+        assert!(!captured.truncated);
     }
 
     #[tokio::test]

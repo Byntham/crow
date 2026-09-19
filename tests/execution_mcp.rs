@@ -146,7 +146,7 @@ async fn real_mcp_regression_isolation_deadline_recovery_and_publication() {
     std::fs::write(&source, source_value.to_string()).unwrap();
     // Container start, archive restore and exec are separate bounded operations.
     // Leave startup allowance while still forcing the 60-second command to time out.
-    let config = json!({"podman":podman,"repositories":{"owner/repo":{"image":image,"timeoutSeconds":8,"memoryMiB":128,"workspaceMiB":32,"pids":32,"cpus":1,"maxRuns":10}}});
+    let config = json!({"podman":podman,"repositories":{"owner/repo":{"image":image,"timeoutSeconds":20,"memoryMiB":128,"workspaceMiB":32,"pids":32,"cpus":1,"maxRuns":10}}});
     std::fs::write(
         &context,
         json!({"source":source_value,"job":{"repo":"owner/repo","settings":{"execution":config}}})
@@ -223,7 +223,9 @@ exit 1
     let limit = mcp.call("run_experiment", json!({"revision":"head","command":"yes output | head -c 100000; echo error-output >&2; exit 7"})).await;
     assert_eq!(limit["exitCode"], 7, "{limit}");
     assert_eq!(limit["outputTruncated"], true);
-    assert_eq!(limit["stdout"].as_str().unwrap().len(), 32768);
+    let captured = limit["stdout"].as_str().unwrap();
+    assert!(captured.len() <= 32768 + 64);
+    assert!(captured.contains("[... output omitted ...]"));
     let timeout = mcp
         .call(
             "run_experiment",

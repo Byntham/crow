@@ -392,6 +392,10 @@ impl Service {
             head.get(..8).unwrap_or(head),
             s(j, "repo")
         );
+        body.push_str(&format!(
+            "\n\n**Runtime testing:** {}",
+            crate::runtime_status::render(&j["runtime"], state)
+        ));
         if !s(j, "reason").is_empty() {
             body.push_str(&format!("\n\n{}", s(j, "reason")));
         }
@@ -408,6 +412,7 @@ impl Service {
                 || (p["state"] == j["state"]
                     && p["trigger"] == j["trigger"]
                     && p["head"] == j["head"]
+                    && p["runtime"] == j["runtime"]
                     && now() - n(p, "updatedAt") < 60000)
         }) {
             return Ok(());
@@ -424,7 +429,7 @@ impl Service {
                 prev.as_ref().and_then(|p| p["id"].as_i64()),
             )
             .await?;
-        self.db(|db|db.put("status",key,&json!({"id":result["id"],"body":body,"state":j["state"],"trigger":j["trigger"],"head":j["head"],"updatedAt":now()})))
+        self.db(|db|db.put("status",key,&json!({"id":result["id"],"body":body,"state":j["state"],"trigger":j["trigger"],"head":j["head"],"runtime":j["runtime"],"updatedAt":now()})))
     }
     async fn publish(&self, j: &Value) -> Result<()> {
         let (pr, token) = self
@@ -950,9 +955,15 @@ impl Service {
         if j["worker"] != worker["id"] || s(&j, "lease") != lease || s(&j, "state") != "reviewing" {
             return Ok(json!({"cancel":true}));
         }
+        let runtime =
+            if matches!(action, "heartbeat" | "report" | "failed") && !a["runtime"].is_null() {
+                serde_json::to_value(crate::runtime_status::Progress::validate(&a["runtime"])?)?
+            } else {
+                j["runtime"].clone()
+            };
         match action {
             "heartbeat" => {
-                self.update(id, json!({}), Some(lease))?;
+                self.update(id, json!({"runtime":runtime}), Some(lease))?;
                 Ok(json!({"cancel":false}))
             }
             "session" => {
@@ -1051,12 +1062,13 @@ impl Service {
                 let patch = s(a, "patch").chars().take(1000000).collect::<String>();
                 self.update(
                     id,
-                    json!({"report":report,"patch":patch,"state":"publishing","reason":null}),
+                    json!({"report":report,"patch":patch,"state":"publishing","reason":null,"runtime":runtime}),
                     Some(lease),
                 )?;
                 Ok(json!({"ok":true}))
             }
             "failed" => {
+                self.update(id, json!({"runtime":runtime}), Some(lease))?;
                 if j["session"].is_null() && valid_session(&a["session"]) {
                     j["session"] = a["session"].clone();
                     self.update(id, json!({"session":a["session"]}), Some(lease))?;
@@ -1698,6 +1710,7 @@ mod tests {
         prs: Mutex<Vec<Value>>,
         reviews: Mutex<Vec<Value>>,
         published: Mutex<Vec<Value>>,
+        statuses: Mutex<Vec<String>>,
         pr_gate: Mutex<Option<Arc<Gate>>>,
         prs_gate: Mutex<Option<Arc<Gate>>>,
         publish_gate: Mutex<Option<Arc<Gate>>>,
@@ -1769,10 +1782,11 @@ mod tests {
             _: &Value,
             _: i64,
             _: &str,
-            _: &str,
+            body: &str,
             _: i64,
             _: Option<i64>,
         ) -> Result<Value> {
+            self.statuses.lock().unwrap().push(body.to_owned());
             Ok(json!({"id":1}))
         }
         async fn publish(
@@ -1915,6 +1929,91 @@ mod tests {
             drop(self.root);
         }
     }
+    #[tokio::test]
+    async fn runtime_heartbeat_updates_main_comment_and_final_report_is_durable() {
+        let f = Fixture::new().await;
+        let job = f.prepared().await;
+        let mut runtime = crate::runtime_status::Progress {
+            enabled: true,
+            ..Default::default()
+        };
+        runtime.setup.running = 1;
+        for (phase, expected) in [(0, "Setting up the test environment"), (1, "Running tests")] {
+            if phase == 1 {
+                runtime.setup.running = 0;
+                runtime.setup.passed = 1;
+                runtime.tests.running = 1;
+            }
+            f.worker(
+                "heartbeat",
+                json!({"id":job["id"],"lease":job["lease"],"runtime":runtime}),
+            )
+            .await
+            .unwrap();
+            let service = f.handle.service.clone();
+            let id = s(&job, "id").to_owned();
+            f.handle
+                .execute(async move { service.status(&service.get("jobs", &id)?.unwrap()).await })
+                .await
+                .unwrap();
+            assert!(
+                f.github
+                    .statuses
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .contains(expected)
+            );
+        }
+        let before = f.job(s(&job, "id"))["runtime"].clone();
+        assert_eq!(
+            f.worker(
+                "heartbeat",
+                json!({"id":job["id"],"lease":"stale-lease","runtime":{}})
+            )
+            .await
+            .unwrap()["cancel"],
+            true
+        );
+        assert_eq!(f.job(s(&job, "id"))["runtime"], before);
+        let mut invalid = json!(runtime);
+        invalid["tests"]["running"] = json!(1000);
+        assert!(
+            f.worker(
+                "heartbeat",
+                json!({"id":job["id"],"lease":job["lease"],"runtime":invalid})
+            )
+            .await
+            .is_err()
+        );
+        runtime.tests.running = 0;
+        runtime.tests.failed = 1;
+        f.worker("report",json!({"id":job["id"],"lease":job["lease"],"runtime":runtime,"report":{"summary":"A test failed on base and head.","findings":[]}})).await.unwrap();
+        // A late heartbeat cannot replace the final counters after publication starts.
+        assert_eq!(
+            f.worker(
+                "heartbeat",
+                json!({"id":job["id"],"lease":job["lease"],"runtime":before})
+            )
+            .await
+            .unwrap()["cancel"],
+            true
+        );
+        assert_eq!(f.job(s(&job, "id"))["runtime"], json!(runtime));
+        f.publish_tick().await;
+        let service = f.handle.service.clone();
+        let id = s(&job, "id").to_owned();
+        f.handle
+            .execute(async move { service.status(&service.get("jobs", &id)?.unwrap()).await })
+            .await
+            .unwrap();
+        let body = f.github.statuses.lock().unwrap().last().unwrap().clone();
+        assert!(body.contains("Finished. Test commands: 1 failed."));
+        assert!(body.contains("base failures"));
+        f.close().await;
+    }
+
     #[tokio::test]
     async fn workers_receive_only_their_assigned_jobs_and_checkout_tokens() {
         let f = Fixture::new().await;
