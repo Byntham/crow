@@ -4,7 +4,9 @@ On 18 September 2026, Crow reviewed seven real public PRs and one deliberately r
 
 Each review used immutable commits and the original PR title/body. The preparation script checked the local changed paths against GitHub's PR file list. Crow selected its own dependencies, commands, reproductions and browser checks through the production MCP tools. We did not give it testing recipes beyond what the original authors had written. No upstream reviews or comments were posted.
 
-The [raw reports and command receipts](historical-reviews.json) preserve failed setup, timeouts, retries and partial coverage. The [replay scripts](../../examples/historical_reviews/README.md) reproduce the process. This is a selected evaluation, not a representative benchmark or a claim that clean reviews prove the absence of bugs.
+The [raw reports and command receipts](https://github.com/Byntham/crow/blob/b5dfe995aa342db21ee11decde690761c2a19a31/docs/validation/historical-reviews.json) preserve failed setup, timeouts, retries and partial coverage. The [replay scripts](../../examples/historical_reviews/README.md) reproduce the process. This is a selected evaluation, not a representative benchmark or a claim that clean reviews prove the absence of bugs.
+
+The linked reports and screenshots remain in the original validation commit. Generated evidence is excluded from the current source tree; save new runs under the ignored `.crow-data/` directory.
 
 | Comparison | What Crow actually verified | Result and limits |
 | --- | --- | --- |
@@ -23,7 +25,7 @@ The htmx change fixes radio buttons losing their selection during a swap. Crow a
 
 | Before the PR | After the PR |
 | --- | --- |
-| ![htmx base: neither radio is selected, replacement text is green](../images/historical-htmx-base.png) | ![htmx head: the second radio is selected, replacement text incorrectly remains red](../images/historical-htmx-head.png) |
+| ![htmx base: neither radio is selected, replacement text is green](https://github.com/Byntham/crow/blob/b5dfe995aa342db21ee11decde690761c2a19a31/docs/images/historical-htmx-base.png?raw=true) | ![htmx head: the second radio is selected, replacement text incorrectly remains red](https://github.com/Byntham/crow/blob/b5dfe995aa342db21ee11decde690761c2a19a31/docs/images/historical-htmx-head.png?raw=true) |
 
 These are actual screenshots captured by Crow's Chromium experiment and delivered to the reviewer as native image content. They show a small reproduction loading the repository's actual `src/htmx.js`, not the htmx documentation website or screenshots supplied by the PR author. We independently repeated the experiment in Crow's sandbox, waited another 500 ms, and asserted the computed color. Base passed with `rgb(0, 128, 0)`; head failed with `rgb(255, 0, 0)`. Those verification receipts are included under `independentChecks`.
 
@@ -33,7 +35,7 @@ The web review recovered from several failed installs by choosing a small depend
 
 | Base host menu | Head host menu |
 | --- | --- |
-| ![T3 base component fixture without Auto balance](../images/historical-t3-hosts-base.png) | ![T3 head component fixture with Auto balance](../images/historical-t3-hosts-head.png) |
+| ![T3 base component fixture without Auto balance](https://github.com/Byntham/crow/blob/b5dfe995aa342db21ee11decde690761c2a19a31/docs/images/historical-t3-hosts-base.png?raw=true) | ![T3 head component fixture with Auto balance](https://github.com/Byntham/crow/blob/b5dfe995aa342db21ee11decde690761c2a19a31/docs/images/historical-t3-hosts-head.png?raw=true) |
 
 These screenshots show actual `ThreadDetailsPanel` and `PanelLayoutControls` components with the repository CSS. The fixture mocks stores, host data, the branch selector and unrelated controls. It checks selected component behavior, not the running T3 server, full `ChatView`, branch loading or integration with real workspaces. The head fixture exercises panel opening through the component handle, not the complete application keyboard binding path. Crow inspected all six captured images.
 
@@ -41,7 +43,7 @@ These screenshots show actual `ThreadDetailsPanel` and `PanelLayoutControls` com
 
 The original 128 MiB source archive limit blocked every T3 comparison before any command could run. T3 had about 253 MB of tracked files. Source export now follows the configured workspace allowance, capped at 512 MiB. It still streams to a bounded file and never extracts repository archives on the host. A regression test verifies both rejection and successful export under different bounds. Subsequent T3 reviews reached actual setup and focused tests.
 
-The package gateway used to accept and discard connections when all 16 tunnel slots were occupied. Concurrent pnpm requests then received connection resets. The gateway now leaves excess requests in the bounded socket backlog until a slot is free, keeping the same active-connection cap. A saturation test verifies that the seventeenth request waits and is handled after a slot is released. A [real managed-container check](historical-gateway.json) also downloaded and validated 24 npm package responses concurrently under the production default limits. The next full T3 install progressed to disk exhaustion instead of the earlier connection-reset errors. This does not make the whole monorepo fit within 512 MiB.
+The package gateway used to accept and discard connections when all 16 tunnel slots were occupied. Concurrent pnpm requests then received connection resets. The gateway now leaves excess requests in the bounded socket backlog until a slot is free, keeping the same active-connection cap. A saturation test verifies that the seventeenth request waits and is handled after a slot is released. A [real managed-container check](https://github.com/Byntham/crow/blob/b5dfe995aa342db21ee11decde690761c2a19a31/docs/validation/historical-gateway.json) also downloaded and validated 24 npm package responses concurrently under the production default limits. The next full T3 install progressed to disk exhaustion instead of the earlier connection-reset errors. This does not make the whole monorepo fit within 512 MiB.
 
 ## Conditions and remaining gaps
 

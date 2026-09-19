@@ -38,13 +38,13 @@ pub async fn plan(
         let Some((meta, path)) = item.split_once('\t') else {
             continue;
         };
-        if !meta.starts_with("100644 blob ") && !meta.starts_with("100755 blob ") {
-            continue;
-        }
         // Respect repositories that deliberately track the usual cache location.
         // Optional cache directories must never change how pinned source restores.
         if path == ".crow-home" || path.starts_with(".crow-home/") {
             return Ok(None);
+        }
+        if !meta.starts_with("100644 blob ") && !meta.starts_with("100755 blob ") {
+            continue;
         }
         let name = path.rsplit('/').next().unwrap_or(path);
         if [
@@ -515,6 +515,74 @@ version = "1.0.0"
             })
         );
         assert_eq!(plan.pins["npm"], false);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tracked_cache_home_symlinks_and_gitlinks_disable_package_caching() {
+        let repo = repository();
+        fs::write(repo.path().join("package-lock.json"), "{}").unwrap();
+        let original = commit(repo.path());
+        assert!(
+            plan(
+                &source(repo.path(), &original),
+                "head",
+                "owner/repo",
+                "pr:1",
+                "image"
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+
+        // A source-only PR update retains the lockfile cache key. It must not
+        // import a directory where pinned source now requires a symlink.
+        std::os::unix::fs::symlink("home", repo.path().join(".crow-home")).unwrap();
+        let linked = commit(repo.path());
+        assert!(
+            plan(
+                &source(repo.path(), &linked),
+                "head",
+                "owner/repo",
+                "pr:1",
+                "image"
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        fs::remove_file(repo.path().join(".crow-home")).unwrap();
+        git(repo.path(), &["rm", "--cached", ".crow-home"]);
+        git(
+            repo.path(),
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000",
+                &original,
+                ".crow-home",
+            ],
+        );
+        git(
+            repo.path(),
+            &["commit", "--quiet", "-m", "cache home submodule"],
+        );
+        let submodule = git(repo.path(), &["rev-parse", "HEAD"]);
+        assert!(
+            plan(
+                &source(repo.path(), &submodule),
+                "head",
+                "owner/repo",
+                "pr:1",
+                "image"
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[cfg(unix)]

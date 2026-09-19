@@ -70,14 +70,6 @@ fn read_record(path: &Path) -> Result<Value> {
 /// A stopped container is removed only when a matching receipt belongs to a known job.
 /// Image removal uses this root's registry and never force-removes an image in use.
 /// Preserve `deferredJobs` from evidence retention so later passes can retry cleanup.
-pub async fn cleanup(
-    root: &Path,
-    executable: &str,
-    env: &BTreeMap<String, String>,
-    jobs: &[Value],
-) -> Result<Value> {
-    cleanup_at(root, executable, env, jobs, crate::util::now()).await
-}
 pub async fn cleanup_with_images(
     root: &Path,
     executable: &str,
@@ -85,7 +77,7 @@ pub async fn cleanup_with_images(
     jobs: &[Value],
     protected_images: &[String],
 ) -> Result<Value> {
-    cleanup_at_with_images(
+    cleanup_at(
         root,
         executable,
         env,
@@ -96,15 +88,6 @@ pub async fn cleanup_with_images(
     .await
 }
 async fn cleanup_at(
-    root: &Path,
-    executable: &str,
-    env: &BTreeMap<String, String>,
-    jobs: &[Value],
-    now: i64,
-) -> Result<Value> {
-    cleanup_at_with_images(root, executable, env, jobs, &[], now).await
-}
-async fn cleanup_at_with_images(
     root: &Path,
     executable: &str,
     env: &BTreeMap<String, String>,
@@ -428,7 +411,7 @@ esac
             json!({"id":"active","state":"reviewing"}),
             json!({"id":"locked","state":"reviewing"}),
         ];
-        let result = cleanup_at(root.path(), &program, &env, &jobs, 100)
+        let result = cleanup_at(root.path(), &program, &env, &jobs, &[], 100)
             .await
             .unwrap();
         assert_eq!(
@@ -470,7 +453,7 @@ esac
         );
         fs::write(root.path().join("fail-remove"), "fail").unwrap();
         let jobs = [json!({"id":"done","state":"completed"})];
-        let result = cleanup_at(root.path(), &program, &env, &jobs, 100)
+        let result = cleanup_at(root.path(), &program, &env, &jobs, &[], 100)
             .await
             .unwrap();
         assert!(
@@ -481,7 +464,7 @@ esac
         );
         assert_eq!(result["containers"], json!([]));
         fs::remove_file(root.path().join("fail-remove")).unwrap();
-        let result = cleanup_at(root.path(), &program, &env, &jobs, 101)
+        let result = cleanup_at(root.path(), &program, &env, &jobs, &[], 101)
             .await
             .unwrap();
         assert_eq!(
@@ -547,7 +530,7 @@ esac
         );
         fs::create_dir(cache.join(".crow-build-orphan")).unwrap();
         let jobs = [json!({"id":"paused","state":"paused"})];
-        let result = cleanup_at(root.path(), &program, &env, &jobs, now)
+        let result = cleanup_at(root.path(), &program, &env, &jobs, &[], now)
             .await
             .unwrap();
         assert_eq!(result["warnings"], json!([]));
@@ -673,7 +656,7 @@ esac
             json!({"id":"done","state":"completed"}),
             json!({"id":"running","state":"reviewing"}),
         ];
-        let result = cleanup(root.path(), &executable, &env, &jobs)
+        let result = cleanup_with_images(root.path(), &executable, &env, &jobs, &[])
             .await
             .unwrap();
         assert_eq!(result["warnings"], json!([]), "{result}");

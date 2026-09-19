@@ -8,8 +8,10 @@ These scripts replay public GitHub PRs through Crow's production reviewer locall
 cargo build --example local_review
 python3 examples/historical_reviews/prepare.py .crow-data/historical-reviews
 python3 examples/historical_reviews/run.py .crow-data/historical-reviews --podman /path/to/podman
-python3 examples/historical_reviews/export.py .crow-data/historical-reviews docs/validation/historical-reviews.json
+python3 examples/historical_reviews/export.py .crow-data/historical-reviews .crow-data/historical-reviews/results.json
 ```
+
+Generated reports, receipts and screenshots belong under the ignored `.crow-data/` directory. Historical evidence is linked from its original commit in the [validation summary](../../docs/validation/historical-reviews.md).
 
 The scripts require Python 3.11 or newer. Preparation requires authenticated `gh` access to public PR metadata. Reviews use the operator's configured model and normal inference billing. `local_review` uses a ten-minute review deadline, twelve runtime attempts, 120 seconds per command, 1.5 GiB memory, two CPUs, 256 processes and a 512 MiB workspace. These match the earlier autonomous validation settings, not the slightly smaller production memory/process defaults. Model decisions can vary between runs.
 

@@ -10,11 +10,13 @@ On 18 September 2026, the production reviewer completed three local model-driven
 
 The Python experiment combined pytest and a successful diagnostic script in one shell command. Its command exit code was zero even though pytest reported a failure. The review correctly interpreted the output and compared that failure against base. Receipt statuses describe shell exit outcomes, not every nested test assertion.
 
-The actual reports and command receipts are saved in [autonomous-runtime.json](autonomous-runtime.json). Image content is omitted from that JSON; the checkout screenshots are below. No model reasoning transcripts or credentials are included.
+The actual reports and command receipts are saved in [autonomous-runtime.json](https://github.com/Byntham/crow/blob/b5dfe995aa342db21ee11decde690761c2a19a31/docs/validation/autonomous-runtime.json). Image content is omitted from that JSON; the checkout screenshots are below. No model reasoning transcripts or credentials are included.
+
+The linked reports and screenshots remain in the original validation commit. Generated evidence is excluded from the current source tree; save new runs under the ignored `.crow-data/` directory.
 
 | Base | Head |
 | --- | --- |
-| ![Base checkout](../images/runtime-base.png) | ![Head checkout with hidden label](../images/runtime-head.png) |
+| ![Base checkout](https://github.com/Byntham/crow/blob/b5dfe995aa342db21ee11decde690761c2a19a31/docs/images/runtime-base.png?raw=true) | ![Head checkout with hidden label](https://github.com/Byntham/crow/blob/b5dfe995aa342db21ee11decde690761c2a19a31/docs/images/runtime-head.png?raw=true) |
 
 These are controlled evaluations, not a representative benchmark of arbitrary repositories. The earlier checkout experiment used text-only pixel measurements; this evaluation used `read_artifact`, which returns actual MCP image content. A separate native MCP transport test verifies that screenshots are not flattened into JSON text.
 
