@@ -79,6 +79,7 @@ pub async fn discover(source: &Value, revision: &str) -> Result<Value> {
         let mut package_manager = Value::Null;
         let mut warning = Value::Null;
         let mut toolchain_files = Vec::new();
+        let mut manager_bootstrap = Value::Null;
         let mut setup_directory = directory.to_owned();
         let (setup, tests, start) = match language {
             "node" => {
@@ -97,6 +98,7 @@ pub async fn discover(source: &Value, revision: &str) -> Result<Value> {
                     Ok(None) => (package.clone(), None),
                     Err(note) => (package.clone(), Some(note)),
                 };
+                manager_bootstrap = package_manager_bootstrap(&selected).unwrap_or(Value::Null);
                 package_manager = selected["packageManager"]
                     .as_str()
                     .map(|value| Value::String(value.chars().take(256).collect()))
@@ -152,11 +154,11 @@ pub async fn discover(source: &Value, revision: &str) -> Result<Value> {
             ),
             _ => unreachable!(),
         };
-        projects.push(json!({"directory":directory,"setupDirectory":setup_directory,"manifest":path,"language":language,"setup":setup,"test":tests,"start":start,"packageManager":package_manager,"toolchainFiles":toolchain_files,"warning":warning}));
+        projects.push(json!({"directory":directory,"setupDirectory":setup_directory,"manifest":path,"language":language,"setup":setup,"test":tests,"start":start,"packageManager":package_manager,"packageManagerBootstrap":manager_bootstrap,"toolchainFiles":toolchain_files,"warning":warning}));
     }
     evidence.truncate(100);
     Ok(
-        json!({"revision":revision,"commit":commit,"projects":projects,"projectCount":project_count,"projectsTruncated":project_count > projects.len(),"instructionsToInspect":evidence,"browser":{"module":"/opt/browser/node_modules/playwright-core/index.mjs","executable":"/usr/bin/chromium","args":["--no-sandbox","--disable-dev-shm-usage"]},"note":"These are setup candidates, not verified commands. Run setup in setupDirectory, and test/start in directory. Workspace members share their owner's setup. Read CI and manifests, respect runtime versions, select affected projects, and repair failed setup using logs. Do not change application code to make a test pass. Static sites and standard-library projects need no dependency installation."}),
+        json!({"revision":revision,"commit":commit,"projects":projects,"projectCount":project_count,"projectsTruncated":project_count > projects.len(),"instructionsToInspect":evidence,"browser":{"module":"/opt/browser/node_modules/playwright-core/index.mjs","executable":"/usr/bin/chromium","args":["--no-sandbox","--disable-dev-shm-usage"]},"managedImageDefaults":{"scope":"Applies only to image auto. Discovery does not run tools or verify versions; inspect custom image tools before using these candidates.","installed":["node","npm","python3","pip3","git","bash","curl","cargo","rustc","go","sqlite3","psql","chromium"],"notInstalledByDefault":["pnpm","yarn","corepack","vp"],"writableDirectories":["/workspace","/tmp"],"home":"/workspace/.crow-home","guidance":"The system filesystem is read-only. Install tools under /workspace/.crow-tools with npm --prefix, not npm --global or a system path. Shell exports do not survive between experiments; use the returned runner again. Project scripts such as vp become available only after their dependencies are installed."},"note":"These are setup candidates, not verified commands. Run setup in setupDirectory, and test/start in directory. Workspace members share their owner's setup. Exact package-manager pins include a writable CLI bootstrap even when workspace setup is unresolved. Inspect workspace files before choosing dependencies; setup candidates already include their bootstrap. Read CI and manifests, respect runtime versions, select affected projects, and repair failed setup using logs. Do not change application code to make a test pass. Static sites and standard-library projects need no dependency installation."}),
     )
 }
 
@@ -415,6 +417,24 @@ fn pinned_manager(value: &str) -> Option<(&str, &str)> {
     Some((manager, version))
 }
 
+/// Describe how to install an exact package-manager pin inside Crow's writable workspace.
+///
+/// The managed image contains npm, but does not install pnpm or Yarn globally. Returning this
+/// separately from setup candidates lets a reviewer bootstrap a pinned CLI without guessing a
+/// workspace owner or writing to `/usr/local`.
+fn package_manager_bootstrap(package: &Value) -> Option<Value> {
+    let declaration = package["packageManager"].as_str()?;
+    let (manager, version) = pinned_manager(declaration)?;
+    let (runner, install) = node_manager_commands(manager, Some(version));
+    Some(json!({
+        "manager": manager,
+        "version": version,
+        "install": install,
+        "runner": runner,
+        "note": "Installs only this pinned CLI, not project dependencies. Does not resolve workspace membership. npm is present in the managed image; custom images must provide it. Run during prepare_environment, then retain and use this runner in later commands."
+    }))
+}
+
 fn node_setup(
     package: &Value,
     pnpm_lock: bool,
@@ -438,13 +458,32 @@ fn node_setup(
         None
     };
     let version = pinned.map(|(_, version)| version);
+    let (runner, install) = node_manager_commands(manager, version);
+    let arguments = match manager {
+        "pnpm" => "install --frozen-lockfile",
+        "yarn" if version.is_some_and(|v| !v.starts_with("1.") && !v.starts_with("0.")) => {
+            "install --immutable"
+        }
+        "yarn" => "install --frozen-lockfile",
+        _ if npm_lock => "ci --no-audit --no-fund",
+        _ => "install --no-audit --no-fund",
+    };
+    let setup = if install.is_empty() {
+        format!("{runner} {arguments}")
+    } else {
+        format!("{install} && {runner} {arguments}")
+    };
+    (setup, runner, warning)
+}
+
+fn node_manager_commands(manager: &str, version: Option<&str>) -> (String, String) {
     // A prepared monorepo can contain projects with different manager pins.
     // Separate installations keep later setup from replacing an earlier CLI.
     let identity = fingerprint(&[manager, version.unwrap_or("latest")]);
     let prefix = format!("/workspace/.crow-tools/{manager}/{identity}");
     let binaries = format!("{prefix}/node_modules/.bin");
     let binary = format!("{binaries}/{manager}");
-    let (runner, install) = match (manager, version) {
+    match (manager, version) {
         ("npm", None) => ("npm".to_owned(), String::new()),
         (manager, version) => {
             // Yarn 2+ ships its CLI through @yarnpkg/cli-dist, not the Yarn 1 package.
@@ -465,20 +504,10 @@ fn node_setup(
                 // Lifecycle hooks and nested package scripts invoke the manager by
                 // name. Keep those subprocesses on the selected installation too.
                 format!("PATH=\"{binaries}:$PATH\" {binary}"),
-                format!("npm install --prefix {prefix} --no-audit --no-fund {package} && "),
+                format!("npm install --prefix {prefix} --no-audit --no-fund {package}"),
             )
         }
-    };
-    let arguments = match manager {
-        "pnpm" => "install --frozen-lockfile",
-        "yarn" if version.is_some_and(|v| !v.starts_with("1.") && !v.starts_with("0.")) => {
-            "install --immutable"
-        }
-        "yarn" => "install --frozen-lockfile",
-        _ if npm_lock => "ci --no-audit --no-fund",
-        _ => "install --no-audit --no-fund",
-    };
-    (format!("{install}{runner} {arguments}"), runner, warning)
+    }
 }
 
 pub(crate) fn image_tag(cache: &Path) -> Result<String> {
@@ -1044,6 +1073,15 @@ mod discovery_tests {
             );
             assert!(runner.starts_with(&format!("PATH=\"{prefix}/node_modules/.bin:$PATH\" ")));
             assert!(setup.contains(&runner));
+            let bootstrap =
+                package_manager_bootstrap(&json!({"packageManager":declaration})).unwrap();
+            assert_eq!(bootstrap["runner"], runner);
+            assert_eq!(bootstrap["manager"], manager);
+            assert_eq!(bootstrap["version"], version);
+            let install = bootstrap["install"].as_str().unwrap();
+            assert!(setup.starts_with(&format!("{install} && ")));
+            assert!(install.contains(package));
+            assert!(!install.contains("--global"));
             assert!(warning.is_none());
             assert!(!setup.contains("sha224"));
         }
@@ -1061,6 +1099,7 @@ mod discovery_tests {
             "other@9.0.0",
         ] {
             assert!(pinned_manager(declaration).is_none(), "{declaration}");
+            assert!(package_manager_bootstrap(&json!({"packageManager":declaration})).is_none());
             let (setup, _, warning) =
                 node_setup(&json!({"packageManager":declaration}), false, false, true);
             assert_eq!(setup, "npm ci --no-audit --no-fund");
@@ -1070,6 +1109,8 @@ mod discovery_tests {
 
     #[test]
     fn projects_with_different_manager_pins_keep_separate_installations() {
+        assert!(package_manager_bootstrap(&json!({})).is_none());
+        assert!(package_manager_bootstrap(&json!({"packageManager":42})).is_none());
         for (manager, first, second) in [
             ("npm", "10.9.0", "10.9.1"),
             ("pnpm", "9.15.4", "10.0.0"),

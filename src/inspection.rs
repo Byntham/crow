@@ -929,19 +929,31 @@ struct McpOutbox {
     bytes: usize,
 }
 impl McpOutbox {
+    const MAX_MESSAGES: usize = 64;
+    const MAX_BYTES: usize = 16 * 1024 * 1024;
+
     fn is_empty(&self) -> bool {
         self.messages.is_empty()
     }
     fn push(&mut self, response: &Value) -> Result<()> {
-        let mut bytes = serde_json::to_vec(response)?;
-        bytes.push(b'\n');
+        let bytes = Self::encode(response)?;
         ensure!(
-            self.messages.len() < 64 && self.bytes + bytes.len() <= 16 * 1024 * 1024,
+            self.can_fit(bytes.len()),
             "MCP output backlog exceeded; client is not consuming responses"
         );
         self.bytes += bytes.len();
         self.messages.push_back(bytes);
         Ok(())
+    }
+    fn encode(response: &Value) -> Result<Vec<u8>> {
+        let mut bytes = serde_json::to_vec(response)?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+    fn can_fit(&self, bytes: usize) -> bool {
+        self.messages.len() < Self::MAX_MESSAGES
+            && bytes <= Self::MAX_BYTES
+            && self.bytes + bytes <= Self::MAX_BYTES
     }
     async fn write_next<W: tokio::io::AsyncWrite + Unpin>(&mut self, stdout: &mut W) -> Result<()> {
         let bytes = self.messages.front().context("Empty MCP output queue")?;
@@ -1071,11 +1083,20 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
         let mut outbox = McpOutbox::default();
         'requests: loop {
             let request = loop {
+                // Drain completed replies before starting another queued tool.
+                // This reserves the bounded outbox for that tool's result and
+                // prevents several large screenshot payloads from overflowing it.
+                if !outbox.is_empty() {
+                    tokio::select! {
+                        _ = &mut stop => break 'requests,
+                        written = outbox.write_next(&mut stdout) => written?,
+                    }
+                    continue;
+                }
                 if let Some(request) = pending.pop_front() { break request; }
-                if input_closed && outbox.is_empty() { break 'requests; }
+                if input_closed { break 'requests; }
                 tokio::select! {
                     _ = &mut stop => break 'requests,
-                    written = outbox.write_next(&mut stdout), if !outbox.is_empty() => written?,
                     request = mcp_request(&mut stdin, &mut line), if !input_closed => match request? {
                         Some(request) => break request,
                         None => input_closed = true,
@@ -1164,6 +1185,22 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
                 _=>json!({"error":{"code":-32601,"message":"Unsupported method"}}),
             };
             let mut response=response; response["jsonrpc"]="2.0".into(); response["id"]=id;
+            // A completed tool may be much larger than the small control
+            // replies already waiting in the bounded outbox (read_artifact
+            // commonly carries a multi-megabyte base64 PNG).  Drain enough
+            // output before enqueueing it instead of terminating the MCP
+            // server after accepted requests have completed.
+            let response_len = McpOutbox::encode(&response)?.len();
+            ensure!(response_len <= McpOutbox::MAX_BYTES, "MCP response exceeds output limit");
+            while !outbox.can_fit(response_len) {
+                if outbox.is_empty() {
+                    bail!("MCP response cannot fit in output limit");
+                }
+                tokio::select! {
+                    _ = &mut stop => break 'requests,
+                    written = outbox.write_next(&mut stdout) => written?,
+                }
+            }
             outbox.push(&response)?;
 
         } Ok::<_,anyhow::Error>(())

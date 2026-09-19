@@ -178,6 +178,88 @@ fn redirected_regular_file_input_preserves_mcp_frame_limit() {
 }
 
 #[tokio::test]
+async fn queued_large_artifacts_are_drained_before_the_next_tool_starts() {
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let directory = tempfile::tempdir().unwrap();
+    let experiments = directory.path().join("experiments");
+    let artifacts = experiments.join("artifacts");
+    std::fs::create_dir_all(&artifacts).unwrap();
+    let id = "a".repeat(32);
+    let mut paths = Vec::new();
+    for index in 0..3 {
+        let path = artifacts.join(format!("{id}-{index}.png"));
+        let file = std::fs::File::create(&path).unwrap();
+        let mut encoder = png::Encoder::new(file, 1397, 1000);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_compression(png::Compression::Fast);
+        let mut writer = encoder.write_header().unwrap();
+        let mut data = Vec::with_capacity(1397 * 1000 * 3);
+        let mut state = 0x9e37_79b9_u32.wrapping_add(index as u32);
+        for _ in 0..(1397 * 1000 * 3) {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            data.push((state >> 24) as u8);
+        }
+        writer.write_image_data(&data).unwrap();
+        paths.push(path);
+    }
+    let source = json!({"dir":directory.path(),"head":"a".repeat(40),"base":"b".repeat(40)});
+    std::fs::write(directory.path().join("source.json"), source.to_string()).unwrap();
+    let context = json!({"root":directory.path(),"source":source,"job":{"repo":"owner/repo","settings":{"execution":{"automatic":true}}}});
+    std::fs::write(directory.path().join("context.json"), context.to_string()).unwrap();
+    let artifacts_json: Vec<Value> = paths
+        .iter()
+        .map(|path| json!({"path":path,"saved":true}))
+        .collect();
+    std::fs::write(experiments.join(format!("{id}.json")), json!({"id":id,"status":"passed","commit":"a".repeat(40),"revision":"head","command":"capture","artifacts":artifacts_json}).to_string()).unwrap();
+    let mut child = tokio::process::Command::new(crow_binary())
+        .arg("_inspection-mcp")
+        .arg(directory.path().join("source.json"))
+        .arg(directory.path().join("context.json"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
+    for index in 0..3 {
+        input.write_all(format!("{}\n", json!({"id":index+1,"method":"tools/call","params":{"name":"read_artifact","arguments":{"experiment":id,"index":index}}})).as_bytes()).await.unwrap();
+    }
+    for index in 0..3 {
+        let line = tokio::time::timeout(Duration::from_secs(15), output.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let response: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["id"], index + 1, "response ordering/backpressure");
+        assert_eq!(
+            response["result"]["content"][1]["type"], "image",
+            "{response}"
+        );
+        assert!(
+            response["result"]["content"][1]["data"]
+                .as_str()
+                .unwrap()
+                .len()
+                > 4_000_000
+        );
+    }
+    drop(input);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(15), child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+}
+
+#[tokio::test]
 async fn mcp_exits_on_signals_while_stdout_pipe_is_full() {
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};

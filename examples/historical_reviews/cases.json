@@ -63,5 +63,45 @@
     "scenario": "Browser radio-button state during CSS transitions",
     "baseTip": "d66f4e921a8b8207832e873dfd552cbca612581e",
     "head": "40119cd872dc14a62268792412e239fb46127e2b"
+  },
+  {
+    "id": "t3code-12615",
+    "repo": "pingdotgg/t3code",
+    "number": 12615,
+    "scenario": "Windows Markdown path parsing",
+    "baseTip": "b44c1ce5d25ee0d5a5be82e380618a886c19ea96",
+    "head": "17e85cdfe3fecb11842596fcc4761105c4d175dc"
+  },
+  {
+    "id": "t3code-12571",
+    "repo": "pingdotgg/t3code",
+    "number": 12571,
+    "scenario": "Long confirmation dialog titles",
+    "baseTip": "dfbb11bdd7c3f1a5575cb55d3e3abb12be025727",
+    "head": "506a2dd8464c3ddccbf7b2fe2064248097d080db"
+  },
+  {
+    "id": "t3code-12583",
+    "repo": "pingdotgg/t3code",
+    "number": 12583,
+    "scenario": "Expanded diff review-comment anchors",
+    "baseTip": "dfbb11bdd7c3f1a5575cb55d3e3abb12be025727",
+    "head": "b64c6fee29697a161f3b3be3d6e71dfa72f6a618"
+  },
+  {
+    "id": "t3code-12614",
+    "repo": "pingdotgg/t3code",
+    "number": 12614,
+    "scenario": "Hover stability in expanded command rows",
+    "baseTip": "b44c1ce5d25ee0d5a5be82e380618a886c19ea96",
+    "head": "f27a87952813bf84aaa3efdbc13b6fc042c4d977"
+  },
+  {
+    "id": "t3code-12577",
+    "repo": "pingdotgg/t3code",
+    "number": 12577,
+    "scenario": "Preserving typed answers when selecting question options",
+    "baseTip": "dfbb11bdd7c3f1a5575cb55d3e3abb12be025727",
+    "head": "886ccd7e263ab50a81a5edd4f8903cd8a2ad925f"
   }
 ]

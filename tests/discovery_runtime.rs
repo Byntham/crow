@@ -82,6 +82,188 @@ async fn pnpm_workspace_roots_withhold_guessed_commands() {
 }
 
 #[tokio::test]
+async fn ambiguous_pnpm_workspace_exposes_only_exact_cli_bootstrap() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-b", "main"]);
+    std::fs::write(
+        repo.join("package.json"),
+        r#"{"private":true,"packageManager":"pnpm@11.10.0","scripts":{"test":"vp test run"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("pnpm-workspace.yaml"),
+        "packages:\n  - packages/*\n",
+    )
+    .unwrap();
+    for (name, package) in [
+        ("app", json!({"scripts":{"test":"node test.js"}})),
+        (
+            "unsafe",
+            json!({"packageManager":"pnpm@11.10.0; false","scripts":{"test":"node test.js"}}),
+        ),
+    ] {
+        let directory = repo.join("packages").join(name);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("package.json"), package.to_string()).unwrap();
+    }
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "workspace with exact CLI pin"]);
+    let commit = git(&repo, &["rev-parse", "HEAD"]);
+    let context = json!({"root":temp.path(),"job":{"repo":"fixture/pnpm-bootstrap","settings":{"execution":{"automatic":true}}},"source":{"dir":repo,"head":commit,"base":commit}});
+    let exec = Execution::from_context(&context, &temp.path().join("experiments"))
+        .unwrap()
+        .unwrap();
+    let found = call(&exec, "discover_environment", json!({"revision":"head"})).await;
+    let projects = found["projects"].as_array().unwrap();
+    assert_eq!(projects.len(), 3, "{found}");
+    for project in projects {
+        assert!(project["warning"].is_string(), "{project}");
+        for command in ["setup", "test", "start"] {
+            assert_eq!(project[command], "", "{project}");
+        }
+        let bootstrap = &project["packageManagerBootstrap"];
+        if project["directory"] == "." {
+            assert_eq!(bootstrap["manager"], "pnpm");
+            assert_eq!(bootstrap["version"], "11.10.0");
+            let install = bootstrap["install"].as_str().unwrap();
+            assert!(install.starts_with("npm install --prefix /workspace/.crow-tools/pnpm/"));
+            assert!(install.ends_with("pnpm@11.10.0"));
+            assert!(!install.contains("--global"));
+            assert!(!install.contains("--frozen-lockfile"));
+            assert!(
+                bootstrap["runner"]
+                    .as_str()
+                    .unwrap()
+                    .contains("/node_modules/.bin/pnpm")
+            );
+        } else {
+            // Bootstrap metadata must not imply an owner for unresolved workspace members.
+            assert!(bootstrap.is_null(), "{project}");
+        }
+    }
+    assert!(
+        found["managedImageDefaults"]["scope"]
+            .as_str()
+            .unwrap()
+            .contains("image auto")
+    );
+    assert!(
+        found["managedImageDefaults"]["installed"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("npm"))
+    );
+    assert!(
+        found["managedImageDefaults"]["notInstalledByDefault"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("corepack"))
+    );
+    assert_eq!(
+        found["managedImageDefaults"]["writableDirectories"],
+        json!(["/workspace", "/tmp"])
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires rootless Podman, the managed toolchain and public npm registry access"]
+async fn discovered_ambiguous_workspace_bootstrap_survives_prepared_snapshot() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(".crow-data/autonomous-runtime-test");
+    std::fs::create_dir_all(&root).unwrap();
+    let temp = tempfile::tempdir_in(&root).unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(repo.join("packages/app")).unwrap();
+    git(&repo, &["init", "-b", "main"]);
+    std::fs::write(
+        repo.join("package.json"),
+        r#"{"private":true,"packageManager":"pnpm@9.15.4","scripts":{"test":"vp test run"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("pnpm-workspace.yaml"),
+        "packages:\n  - packages/*\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("packages/app/package.json"),
+        r#"{"name":"app","private":true}"#,
+    )
+    .unwrap();
+    git(&repo, &["add", "."]);
+    git(
+        &repo,
+        &["commit", "-m", "exact CLI pin in unresolved workspace"],
+    );
+    let commit = git(&repo, &["rev-parse", "HEAD"]);
+    let config = json!({"podman":std::env::var("CROW_TEST_PODMAN").unwrap_or("podman".into()),"automatic":true});
+    let context = json!({"root":root,"job":{"repo":"fixture/pnpm-bootstrap","settings":{"execution":config}},"source":{"dir":repo,"head":commit,"base":commit}});
+    let exec = Execution::from_context(&context, &temp.path().join("experiments"))
+        .unwrap()
+        .unwrap();
+    let found = call(&exec, "discover_environment", json!({"revision":"head"})).await;
+    let project = found["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|project| project["directory"] == ".")
+        .unwrap();
+    assert!(
+        project["warning"]
+            .as_str()
+            .unwrap()
+            .contains("pnpm-workspace.yaml")
+    );
+    for command in ["setup", "test", "start"] {
+        assert_eq!(project[command], "", "{project}");
+    }
+    let bootstrap = &project["packageManagerBootstrap"];
+    assert_eq!(bootstrap["version"], "9.15.4");
+    let setup_purpose =
+        "Install the pinned package manager without guessing workspace dependencies";
+    let setup = call(
+        &exec,
+        "prepare_environment",
+        json!({"revision":"head","setup":bootstrap["install"],"purpose":setup_purpose}),
+    )
+    .await;
+    assert_eq!(setup["status"], "passed", "{setup}");
+    assert_eq!(setup["purpose"], setup_purpose);
+    assert_eq!(setup["command"], bootstrap["install"]);
+    let test_purpose = "Check the pinned package manager works offline in the prepared environment";
+    let command = format!("{} --version", bootstrap["runner"].as_str().unwrap());
+    let result = call(
+        &exec,
+        "run_experiment",
+        json!({"revision":"head","environment":setup["id"],"command":command,"purpose":test_purpose}),
+    ).await;
+    assert_eq!(result["status"], "passed", "{result}");
+    assert_eq!(
+        result["stdout"].as_str().unwrap().trim(),
+        "9.15.4",
+        "{result}"
+    );
+    assert_eq!(result["purpose"], test_purpose);
+    assert_eq!(result["environment"], setup["id"]);
+    let saved = call(&exec, "list_experiments", json!({})).await;
+    for receipt in [&setup, &result] {
+        assert!(
+            saved["runs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|record| record["id"] == receipt["id"]
+                    && record["purpose"] == receipt["purpose"]),
+            "{saved}"
+        );
+    }
+    println!(
+        "Ambiguous pnpm workspace retained empty project command candidates; the discovered CLI bootstrap installed pnpm 9.15.4 through the restricted gateway and the saved environment ran it offline with purpose labels intact."
+    );
+}
+
+#[tokio::test]
 #[ignore = "requires rootless Podman, the managed toolchain and public npm registry access"]
 async fn discovered_pinned_managers_and_nested_commands_run_offline() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(".crow-data/autonomous-runtime-test");
