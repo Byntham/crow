@@ -1399,6 +1399,10 @@ async fn run_review_inner(
         .as_u64()
         .filter(|n| *n > 0)
         .map(Duration::from_millis);
+    let runtime = crate::execution::Execution::from_context(
+        &util::read_json(&layout.context_path)?.context("Missing review execution context")?,
+        &layout.dir.join("experiments"),
+    )?;
     let result = process::run(
         executable(&layout.settings),
         &args,
@@ -1415,6 +1419,32 @@ async fn run_review_inner(
         },
     )
     .await;
+    // process::run has stopped the provider group, including its MCP servers.
+    // Detached containers need independent cleanup if that group was killed
+    // before an MCP could finish its bounded Podman removal.
+    if let Some(runtime) = runtime {
+        let cleanup = runtime.cleanup_after_provider().await;
+        let diagnostics = match &cleanup {
+            Ok(()) => json!({"at":util::now(),"status":"completed"}),
+            Err(error) => {
+                json!({"at":util::now(),"status":"error","error":crate::runtime_diagnostics::bounded_error(error)})
+            }
+        };
+        if let Err(error) = util::atomic(
+            &layout.dir.join("runtime-provider-cleanup.json"),
+            &diagnostics,
+        ) {
+            eprintln!(
+                "Could not save runtime cleanup diagnostics: {}",
+                crate::runtime_diagnostics::bounded_error(error)
+            );
+        }
+        if cleanup.is_err() {
+            eprintln!(
+                "Runtime container cleanup needs attention; inspect the review's runtime-provider-cleanup.json and experiment receipts."
+            );
+        }
+    }
     let state = events.lock().unwrap();
     if let Some(error) = &state.failure {
         return Err(error.clone().into());
@@ -1591,6 +1621,64 @@ mod tests {
             .await
         }
     }
+    #[tokio::test]
+    async fn provider_exit_recovers_owned_runtime_on_success_and_failure() {
+        for (failed, blocked_diagnostics) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let mut f = Fixture::new(if failed {
+                json!({"fail":"fixture provider failure"})
+            } else {
+                json!({})
+            });
+            let runtime = f.root.path().join("runtime");
+            std::os::unix::fs::symlink(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp-runtime.py"),
+                &runtime,
+            )
+            .unwrap();
+            f.job["settings"]["execution"] = json!({"podman":runtime,"automatic":true});
+            let experiments = f.root.path().join("reviews/job-one/experiments");
+            std::fs::create_dir_all(experiments.join("environments")).unwrap();
+            let id = "a".repeat(32);
+            util::atomic(&experiments.join(format!("{id}.json")), &json!({"id":id,"status":"running","containerStarted":true,"stage":"test_command","command":"interrupted test"})).unwrap();
+            let diagnostics = f
+                .root
+                .path()
+                .join("reviews/job-one/runtime-provider-cleanup.json");
+            if blocked_diagnostics {
+                std::fs::create_dir(&diagnostics).unwrap();
+            }
+            let result = f.run().await;
+            assert_eq!(result.is_err(), failed);
+            if failed {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("fixture provider failure")
+                );
+            }
+            let record = util::read_json(&experiments.join(format!("{id}.json")))
+                .unwrap()
+                .unwrap();
+            assert_eq!(record["status"], "interrupted");
+            assert!(record["cleanupRecoveredAt"].is_number());
+            assert_eq!(
+                std::fs::read_to_string(f.root.path().join("removed-names")).unwrap(),
+                format!("crow-experiment-{id}\n")
+            );
+            if blocked_diagnostics {
+                assert!(diagnostics.is_dir());
+            } else {
+                assert_eq!(
+                    util::read_json(&diagnostics).unwrap().unwrap()["status"],
+                    "completed"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn successful_diagnostics_summarize_capabilities_and_preserve_warnings() {
         let f = Fixture::new(json!({}));

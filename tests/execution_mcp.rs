@@ -363,6 +363,47 @@ exit 1
     wait_for_test_container(&podman, &dir.path().join("experiments"), "sleep 60").await;
     mcp.child.kill().await.unwrap();
     mcp.child.wait().await.unwrap();
+    // The provider's parent must clean up before any future MCP connection or
+    // resumed review is needed. Unrelated active reviews keep their containers.
+    let persisted_context: Value =
+        serde_json::from_slice(&std::fs::read(&context).unwrap()).unwrap();
+    let parent_runtime = crow::execution::Execution::from_context(
+        &persisted_context,
+        &dir.path().join("experiments"),
+    )
+    .unwrap()
+    .unwrap();
+    parent_runtime.cleanup_after_provider().await.unwrap();
+    let owned = parent_runtime
+        .call(
+            "list_experiments",
+            &json!({}),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let orphan = owned["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|run| run["command"] == "sleep 60")
+        .unwrap();
+    assert_eq!(orphan["status"], "interrupted");
+    assert!(orphan["cleanupRecoveredAt"].is_number());
+    let removed = Command::new(&podman)
+        .args([
+            "container",
+            "exists",
+            &format!("crow-experiment-{}", orphan["id"].as_str().unwrap()),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(removed.status.code(), Some(1));
+    let preserved = Command::new(&podman)
+        .args(["container", "exists", &unrelated.1])
+        .output()
+        .unwrap();
+    assert!(preserved.status.success());
     let mut mcp = Mcp::new(&source, &context);
     let recovered = mcp.call("list_experiments", json!({})).await;
     assert_eq!(recovered["runs"].as_array().unwrap().len(), 9);

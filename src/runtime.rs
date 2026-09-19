@@ -112,23 +112,28 @@ pub async fn discover(source: &Value, revision: &str) -> Result<Value> {
                     },
                 )
             }
-            "python" => (
-                if has("requirements.txt") {
-                    "python3 -m venv /workspace/.venv && /workspace/.venv/bin/pip install -r requirements.txt"
-                } else {
-                    "python3 -m venv /workspace/.venv && /workspace/.venv/bin/pip install -e ."
-                }.to_owned(),
-                "/workspace/.venv/bin/python -m pytest".to_owned(),
-                String::new(),
-            ),
+            "python" => {
+                let (setup, test) = python_setup(directory, has("requirements.txt"));
+                (setup, test, String::new())
+            }
             "rust" => {
                 toolchain_files = rust_toolchains(&files, directory);
                 if !toolchain_files.is_empty() {
-                    warning = json!("Inspect the toolchain files and Cargo.toml rust-version. The managed image uses stock Alpine rustc/cargo, which do not enforce rust-toolchain pins. Check rustc --version and cargo --version before testing. If the required exact version is unavailable, report the mismatch; an operator-provided image is needed for that version.");
+                    warning = json!(
+                        "Inspect the toolchain files and Cargo.toml rust-version. The managed image uses stock Alpine rustc/cargo, which do not enforce rust-toolchain pins. Check rustc --version and cargo --version before testing. If the required exact version is unavailable, report the mismatch; an operator-provided image is needed for that version."
+                    );
                 }
-                ("cargo fetch --locked".into(), "cargo test --offline --locked".into(), String::new())
-            },
-            "go" => ("go mod download".into(), "GOPROXY=off go test ./...".into(), String::new()),
+                (
+                    "cargo fetch --locked".into(),
+                    "cargo test --offline --locked".into(),
+                    String::new(),
+                )
+            }
+            "go" => (
+                "go mod download".into(),
+                "GOPROXY=off go test ./...".into(),
+                String::new(),
+            ),
             _ => unreachable!(),
         };
         projects.push(json!({"directory":directory,"manifest":path,"language":language,"setup":setup,"test":tests,"start":start,"packageManager":package_manager,"toolchainFiles":toolchain_files,"warning":warning}));
@@ -136,6 +141,27 @@ pub async fn discover(source: &Value, revision: &str) -> Result<Value> {
     evidence.truncate(100);
     Ok(
         json!({"revision":revision,"commit":commit,"projects":projects,"projectCount":project_count,"projectsTruncated":project_count > projects.len(),"instructionsToInspect":evidence,"browser":{"module":"/opt/browser/node_modules/playwright-core/index.mjs","executable":"/usr/bin/chromium","args":["--no-sandbox","--disable-dev-shm-usage"]},"note":"These are setup candidates, not verified commands. Read CI and manifests, respect runtime versions, select affected projects, and repair failed setup using logs. Do not change application code to make a test pass. Static sites and standard-library projects need no dependency installation."}),
+    )
+}
+
+fn python_setup(directory: &str, requirements: bool) -> (String, String) {
+    // Independent Python projects may require incompatible package versions.
+    // Hash the directory so repository filenames never become shell syntax.
+    let prefix = format!(
+        "/workspace/.crow-tools/python/{}",
+        fingerprint(&[directory])
+    );
+    let install = if requirements {
+        "-r requirements.txt"
+    } else {
+        "-e ."
+    };
+    let environment = format!("VIRTUAL_ENV={prefix} PATH=\"{prefix}/bin:$PATH\"");
+    (
+        format!(
+            "python3 -m venv {prefix} && {environment} {prefix}/bin/python -m pip install {install}"
+        ),
+        format!("{environment} {prefix}/bin/python -m pytest"),
     )
 }
 
@@ -211,7 +237,12 @@ fn node_setup(
         None
     };
     let version = pinned.map(|(_, version)| version);
-    let binary = format!("/workspace/.crow-tools/node_modules/.bin/{manager}");
+    // A prepared monorepo can contain projects with different manager pins.
+    // Separate installations keep later setup from replacing an earlier CLI.
+    let identity = fingerprint(&[manager, version.unwrap_or("latest")]);
+    let prefix = format!("/workspace/.crow-tools/{manager}/{identity}");
+    let binaries = format!("{prefix}/node_modules/.bin");
+    let binary = format!("{binaries}/{manager}");
     let (runner, install) = match (manager, version) {
         ("npm", None) => ("npm".to_owned(), String::new()),
         (manager, version) => {
@@ -232,10 +263,8 @@ fn node_setup(
             (
                 // Lifecycle hooks and nested package scripts invoke the manager by
                 // name. Keep those subprocesses on the selected installation too.
-                format!("PATH=\"/workspace/.crow-tools/node_modules/.bin:$PATH\" {binary}"),
-                format!(
-                    "npm install --prefix /workspace/.crow-tools --no-audit --no-fund {package} && "
-                ),
+                format!("PATH=\"{binaries}:$PATH\" {binary}"),
+                format!("npm install --prefix {prefix} --no-audit --no-fund {package} && "),
             )
         }
     };
@@ -376,6 +405,40 @@ mod discovery_tests {
     use super::*;
 
     #[test]
+    fn python_projects_keep_separate_environments_and_safe_nested_paths() {
+        let first = python_setup("services/first", true);
+        let second = python_setup("services/second", false);
+        assert_ne!(first.1, second.1);
+        assert!(first.0.ends_with("-m pip install -r requirements.txt"));
+        assert!(second.0.ends_with("-m pip install -e ."));
+        for directory in [
+            ".",
+            "services/first",
+            "services/second",
+            "$(touch /tmp/injected); project",
+        ] {
+            let (setup, test) = python_setup(directory, true);
+            let prefix = format!(
+                "/workspace/.crow-tools/python/{}",
+                fingerprint(&[directory])
+            );
+            assert!(setup.starts_with(&format!("python3 -m venv {prefix} && ")));
+            assert_eq!(
+                test,
+                format!(
+                    "VIRTUAL_ENV={prefix} PATH=\"{prefix}/bin:$PATH\" {prefix}/bin/python -m pytest"
+                )
+            );
+            assert!(!setup.contains("$("));
+            assert!(!test.contains("$("));
+        }
+        assert_eq!(
+            python_setup("services/first", true).1,
+            python_setup("services/first", false).1
+        );
+    }
+
+    #[test]
     fn rust_toolchain_discovery_checks_project_and_ancestor_pins() {
         let files = [
             "rust-toolchain.toml",
@@ -412,7 +475,12 @@ mod discovery_tests {
                 node_setup(&json!({"packageManager":declaration}), false, false, true);
             assert!(setup.contains(package), "{setup}");
             assert!(setup.contains(flag), "{setup}");
-            assert!(runner.starts_with("PATH=\"/workspace/.crow-tools/node_modules/.bin:$PATH\" "));
+            let (manager, version) = pinned_manager(declaration).unwrap();
+            let prefix = format!(
+                "/workspace/.crow-tools/{manager}/{}",
+                fingerprint(&[manager, version])
+            );
+            assert!(runner.starts_with(&format!("PATH=\"{prefix}/node_modules/.bin:$PATH\" ")));
             assert!(setup.contains(&runner));
             assert!(warning.is_none());
             assert!(!setup.contains("sha224"));
@@ -436,6 +504,53 @@ mod discovery_tests {
             assert_eq!(setup, "npm ci --no-audit --no-fund");
             assert!(warning.is_some());
         }
+    }
+
+    #[test]
+    fn projects_with_different_manager_pins_keep_separate_installations() {
+        for (manager, first, second) in [
+            ("npm", "10.9.0", "10.9.1"),
+            ("pnpm", "9.15.4", "10.0.0"),
+            ("yarn", "1.22.22", "4.9.2"),
+        ] {
+            let first = node_setup(
+                &json!({"packageManager":format!("{manager}@{first}")}),
+                false,
+                false,
+                true,
+            );
+            let second = node_setup(
+                &json!({"packageManager":format!("{manager}@{second}")}),
+                false,
+                false,
+                true,
+            );
+            let prefix = |setup: &str| {
+                setup
+                    .split("--prefix ")
+                    .nth(1)
+                    .unwrap()
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+                    .to_owned()
+            };
+            let first_prefix = prefix(&first.0);
+            let second_prefix = prefix(&second.0);
+            assert_ne!(first_prefix, second_prefix);
+            for (setup, runner, _) in [&first, &second] {
+                let prefix = prefix(setup);
+                assert_eq!(
+                    *runner,
+                    format!(
+                        "PATH=\"{prefix}/node_modules/.bin:$PATH\" {prefix}/node_modules/.bin/{manager}"
+                    )
+                );
+                assert!(setup.contains(runner));
+            }
+        }
+        let plain = node_setup(&json!({}), false, false, false);
+        assert_eq!(plain.1, "npm");
     }
 
     #[tokio::test]
@@ -486,13 +601,21 @@ mod discovery_tests {
                 .unwrap()
                 .contains("@yarnpkg/cli-dist@4.9.2")
         );
+        let prefix = format!(
+            "/workspace/.crow-tools/yarn/{}",
+            fingerprint(&["yarn", "4.9.2"])
+        );
         assert_eq!(
             found["projects"][0]["test"],
-            "PATH=\"/workspace/.crow-tools/node_modules/.bin:$PATH\" /workspace/.crow-tools/node_modules/.bin/yarn test"
+            format!(
+                "PATH=\"{prefix}/node_modules/.bin:$PATH\" {prefix}/node_modules/.bin/yarn test"
+            )
         );
         assert_eq!(
             found["projects"][0]["start"],
-            "PATH=\"/workspace/.crow-tools/node_modules/.bin:$PATH\" /workspace/.crow-tools/node_modules/.bin/yarn run dev"
+            format!(
+                "PATH=\"{prefix}/node_modules/.bin:$PATH\" {prefix}/node_modules/.bin/yarn run dev"
+            )
         );
     }
 }

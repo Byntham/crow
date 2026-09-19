@@ -108,3 +108,183 @@ async fn discovered_pinned_managers_and_nested_commands_run_offline() {
         );
     }
 }
+
+#[tokio::test]
+#[ignore = "requires rootless Podman, the managed toolchain and public npm registry access"]
+async fn discovered_projects_keep_distinct_manager_versions_in_one_environment() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(".crow-data/autonomous-runtime-test");
+    std::fs::create_dir_all(&root).unwrap();
+    let temp = tempfile::tempdir_in(&root).unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-b", "main"]);
+    for (name, version) in [("first", "10.9.0"), ("second", "10.9.1")] {
+        let directory = repo.join(name);
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("package.json"), json!({"name":name,"version":"1.0.0","private":true,"packageManager":format!("npm@{version}"),"scripts":{"postinstall":"node test.cjs","test":"node test.cjs","start":"node test.cjs"}}).to_string()).unwrap();
+        std::fs::write(directory.join("package-lock.json"),json!({"name":name,"version":"1.0.0","lockfileVersion":3,"requires":true,"packages":{"":{"name":name,"version":"1.0.0","hasInstallScript":true}}}).to_string()).unwrap();
+        std::fs::write(directory.join("test.cjs"),format!("const assert=require('node:assert/strict'); const {{execFileSync}}=require('node:child_process'); assert(process.env.npm_config_user_agent.includes('npm/{version}')); assert.equal(execFileSync('npm',['--version'],{{encoding:'utf8'}}).trim(),'{version}'); console.log('verified {name} npm/{version} and nested npm');\n")).unwrap();
+    }
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "different project manager pins"]);
+    let commit = git(&repo, &["rev-parse", "HEAD"]);
+    let config = json!({"podman":std::env::var("CROW_TEST_PODMAN").unwrap_or("podman".into()),"automatic":true});
+    let context = json!({"root":root,"job":{"repo":"fixture/discovery-monorepo","settings":{"execution":config}},"source":{"dir":repo,"head":commit,"base":commit}});
+    let exec = Execution::from_context(&context, &temp.path().join("experiments"))
+        .unwrap()
+        .unwrap();
+    let found = call(&exec, "discover_environment", json!({"revision":"head"})).await;
+    let projects = found["projects"].as_array().unwrap();
+    assert_eq!(projects.len(), 2, "{found}");
+    let setup_commands: Vec<_> = projects
+        .iter()
+        .map(|project| {
+            format!(
+                "(cd /workspace/{} && {})",
+                project["directory"].as_str().unwrap(),
+                project["setup"].as_str().unwrap()
+            )
+        })
+        .collect();
+    let setup = call(
+        &exec,
+        "prepare_environment",
+        json!({"revision":"head","setup":setup_commands.join(" && ")}),
+    )
+    .await;
+    assert_eq!(setup["status"], "passed", "{setup}");
+    // Run both only after both managers are installed, then repeat in reverse
+    // order. Each project's nested manager command must retain its own pin.
+    let commands: Vec<_> = projects
+        .iter()
+        .chain(projects.iter().rev())
+        .map(|project| {
+            format!(
+                "(cd /workspace/{} && {} && {})",
+                project["directory"].as_str().unwrap(),
+                project["test"].as_str().unwrap(),
+                project["start"].as_str().unwrap()
+            )
+        })
+        .collect();
+    let result = call(
+        &exec,
+        "run_experiment",
+        json!({"revision":"head","environment":setup["id"],"command":commands.join(" && ")}),
+    )
+    .await;
+    assert_eq!(result["status"], "passed", "{result}");
+    let output = result["stdout"].as_str().unwrap();
+    for marker in [
+        "verified first npm/10.9.0 and nested npm",
+        "verified second npm/10.9.1 and nested npm",
+    ] {
+        assert_eq!(output.matches(marker).count(), 4, "{result}");
+    }
+    println!(
+        "Two discovered projects retained npm 10.9.0 and 10.9.1 in one prepared environment; test/start and nested commands passed offline in both execution orders."
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires rootless Podman, the managed toolchain and public PyPI access for pytest"]
+async fn discovered_python_projects_keep_conflicting_dependencies_separate() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(".crow-data/autonomous-runtime-test");
+    std::fs::create_dir_all(&root).unwrap();
+    let temp = tempfile::tempdir_in(&root).unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-b", "main"]);
+    // Build tiny pure-Python wheels inside the sandbox. The same package name
+    // has incompatible versions in the two projects, without a build backend.
+    std::fs::write(repo.join("build_wheels.py"),r#"import base64, hashlib, io, csv, zipfile
+from pathlib import Path
+for project, version in [('first','1.0.0'), ('second','2.0.0')]:
+    package = 'crow_discovery_dependency'
+    info = f'{package}-{version}.dist-info'
+    files = {
+        f'{package}/__init__.py': f'VERSION = {version!r}\n',
+        f'{info}/METADATA': f'Metadata-Version: 2.1\nName: crow-discovery-dependency\nVersion: {version}\n',
+        f'{info}/WHEEL': 'Wheel-Version: 1.0\nGenerator: crow-test\nRoot-Is-Purelib: true\nTag: py3-none-any\n',
+    }
+    record = io.StringIO()
+    writer = csv.writer(record, lineterminator='\n')
+    for name, body in files.items():
+        digest = base64.urlsafe_b64encode(hashlib.sha256(body.encode()).digest()).rstrip(b'=').decode()
+        writer.writerow([name, f'sha256={digest}', len(body.encode())])
+    writer.writerow([f'{info}/RECORD', '', ''])
+    files[f'{info}/RECORD'] = record.getvalue()
+    with zipfile.ZipFile(Path(project) / f'{package}-{version}-py3-none-any.whl', 'w') as wheel:
+        for name, body in files.items(): wheel.writestr(name, body)
+"#).unwrap();
+    for (name, version) in [("first", "1.0.0"), ("second", "2.0.0")] {
+        let directory = repo.join(name);
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(
+            directory.join("requirements.txt"),
+            format!("pytest==8.4.2\n./crow_discovery_dependency-{version}-py3-none-any.whl\n"),
+        )
+        .unwrap();
+        std::fs::write(directory.join("test_dependency.py"),format!("import os, subprocess, sys\nfrom crow_discovery_dependency import VERSION\ndef test_isolated_dependency():\n    assert VERSION == '{version}'\n    assert os.environ['VIRTUAL_ENV'] == sys.prefix\n    nested = subprocess.check_output(['python', '-c', 'from crow_discovery_dependency import VERSION; print(VERSION)'], text=True).strip()\n    assert nested == '{version}'\n")).unwrap();
+    }
+    git(&repo, &["add", "."]);
+    git(
+        &repo,
+        &["commit", "-m", "incompatible Python project dependencies"],
+    );
+    let commit = git(&repo, &["rev-parse", "HEAD"]);
+    let config = json!({"podman":std::env::var("CROW_TEST_PODMAN").unwrap_or("podman".into()),"automatic":true});
+    let context = json!({"root":root,"job":{"repo":"fixture/python-discovery","settings":{"execution":config}},"source":{"dir":repo,"head":commit,"base":commit}});
+    let exec = Execution::from_context(&context, &temp.path().join("experiments"))
+        .unwrap()
+        .unwrap();
+    let found = call(&exec, "discover_environment", json!({"revision":"head"})).await;
+    let projects = found["projects"].as_array().unwrap();
+    assert_eq!(projects.len(), 2, "{found}");
+    assert_ne!(projects[0]["test"], projects[1]["test"]);
+    let mut setup_commands = vec!["python3 -I build_wheels.py".to_owned()];
+    setup_commands.extend(projects.iter().map(|project| {
+        format!(
+            "(cd /workspace/{} && {})",
+            project["directory"].as_str().unwrap(),
+            project["setup"].as_str().unwrap()
+        )
+    }));
+    let setup = call(
+        &exec,
+        "prepare_environment",
+        json!({"revision":"head","setup":setup_commands.join(" && ")}),
+    )
+    .await;
+    assert_eq!(setup["status"], "passed", "{setup}");
+    let commands: Vec<_> = projects
+        .iter()
+        .chain(projects.iter().rev())
+        .map(|project| {
+            format!(
+                "(cd /workspace/{} && {})",
+                project["directory"].as_str().unwrap(),
+                project["test"].as_str().unwrap()
+            )
+        })
+        .collect();
+    let result = call(
+        &exec,
+        "run_experiment",
+        json!({"revision":"head","environment":setup["id"],"command":commands.join(" && ")}),
+    )
+    .await;
+    assert_eq!(result["status"], "passed", "{result}");
+    assert_eq!(
+        result["stdout"]
+            .as_str()
+            .unwrap()
+            .matches("1 passed")
+            .count(),
+        4,
+        "{result}"
+    );
+    println!(
+        "Two discovered Python projects retained incompatible local dependency versions in one prepared environment; pytest and nested Python imports passed offline in both execution orders."
+    );
+}

@@ -509,36 +509,83 @@ impl Execution {
             json!({"content":[{"type":"text","text":json!({"experiment":id,"revision":record["revision"],"commit":record["commit"],"command":record["command"],"artifact":record["artifacts"][index]}).to_string()},{"type":"image","mimeType":"image/png","data":base64::engine::general_purpose::STANDARD.encode(bytes)}]}),
         )
     }
+    /// The provider process group is gone, but detached Podman containers may
+    /// outlive an MCP killed during cleanup. Recover them from the parent process.
+    pub async fn cleanup_after_provider(&self) -> Result<()> {
+        // SIGKILL delivery does not synchronously release a dying MCP's lock.
+        // Give that process time to exit before recovering its detached container.
+        let _lock = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Some(lock) = crate::retention::execution_lock(&self.dir)? {
+                    return Ok::<_, anyhow::Error>(lock);
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .context("Timed out waiting for MCP runtime cleanup lock")??;
+        self.recover().await
+    }
     async fn recover(&self) -> Result<()> {
+        let mut errors = Vec::new();
         for entry in std::fs::read_dir(&self.dir)? {
             let entry = entry?;
             if entry.path().extension().is_none_or(|e| e != "json") {
                 continue;
             }
+            let metadata = entry.metadata()?;
+            ensure!(
+                entry.file_type()?.is_file() && metadata.len() <= 1_048_576,
+                "Invalid experiment receipt"
+            );
             let mut record =
                 crate::util::read_json(&entry.path())?.context("Missing experiment receipt")?;
-            if record["status"] != "running" {
+            if record["status"] != "running" && record.get("cleanupError").is_none() {
                 continue;
             }
             let id = record["id"]
                 .as_str()
                 .filter(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
                 .context("Invalid experiment ID")?;
+            ensure!(
+                entry.file_name() == format!("{id}.json").as_str(),
+                "Experiment receipt ID mismatch"
+            );
             // Old receipts lack this flag, so retain their conservative cleanup.
-            if record["containerStarted"] != false {
+            let removed = if record["containerStarted"] != false {
                 remove_container(
                     &self.executable,
                     &format!("crow-experiment-{id}"),
                     &self.env,
                 )
-                .await?;
+                .await
+            } else {
+                Ok(())
+            };
+            if record["status"] == "running" {
+                record["status"] = json!("interrupted");
+                if let Some(stage) = record.get("stage").cloned() {
+                    record["failureStage"] = stage;
+                }
             }
-            record["status"] = json!("interrupted");
-            if let Some(stage) = record.get("stage").cloned() {
-                record["failureStage"] = stage;
+            match removed {
+                Ok(()) => {
+                    record.as_object_mut().unwrap().remove("cleanupError");
+                    record["cleanupRecoveredAt"] = json!(crate::util::now());
+                }
+                Err(error) => {
+                    let error = bounded_error(error);
+                    record["cleanupError"] = json!(error);
+                    errors.push(error);
+                }
             }
             crate::util::atomic(&entry.path(), &record)?;
         }
+        ensure!(
+            errors.is_empty(),
+            "Runtime container cleanup failed: {}",
+            errors.join("; ")
+        );
         Ok(())
     }
     #[allow(clippy::too_many_arguments)]
