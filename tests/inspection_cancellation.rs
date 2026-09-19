@@ -276,3 +276,112 @@ async fn mcp_stdin_eof_during_inspection_does_not_start_queued_runtime() {
 async fn parent_recovers_after_provider_kills_mcp_during_slow_container_removal() {
     scenario(false, false, true).await;
 }
+
+#[tokio::test]
+async fn discovery_cancellation_stops_git_and_releases_execution_lock() {
+    for signal in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/slow-discovery-git.py"),
+            root.path().join("git"),
+        )
+        .unwrap();
+        let paths = std::iter::once(root.path().to_owned()).chain(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .collect::<Vec<_>>(),
+        );
+        let source_path = root.path().join("source.json");
+        let source = json!({"dir":root.path(),"head":"a".repeat(40),"base":"a".repeat(40)});
+        std::fs::write(&source_path, source.to_string()).unwrap();
+        let context_path = root.path().join("context.json");
+        std::fs::write(&context_path, json!({"root":root.path(),"source":source,"job":{"repo":"fixture/repo","settings":{"execution":{"automatic":true}}}}).to_string()).unwrap();
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_crow"))
+            .arg("_inspection-mcp")
+            .arg(source_path)
+            .arg(context_path)
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
+        input.write_all(b"{\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"discover_environment\",\"arguments\":{\"revision\":\"head\"}}}\n").await.unwrap();
+        let git_pid = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(root.path().join("git-started"))
+                    && let Ok(pid) = pid.parse::<i32>()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Discovery did not start its Git read");
+        if signal {
+            assert_eq!(
+                unsafe { libc::kill(child.id().unwrap() as i32, libc::SIGTERM) },
+                0
+            );
+        } else {
+            input
+                .write_all(
+                    b"{\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":1}}\n",
+                )
+                .await
+                .unwrap();
+            let response: Value = serde_json::from_str(
+                &tokio::time::timeout(Duration::from_secs(3), output.next_line())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(response["id"], 1);
+            assert_eq!(response["result"]["isError"], true);
+            assert!(
+                response
+                    .to_string()
+                    .contains("Environment discovery interrupted")
+            );
+            // This tool acquires the same execution lock and must still succeed.
+            input.write_all(b"{\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"list_experiments\",\"arguments\":{}}}\n").await.unwrap();
+            let next: Value = serde_json::from_str(
+                &tokio::time::timeout(Duration::from_secs(3), output.next_line())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(next["id"], 2);
+            assert_ne!(next["result"]["isError"], true, "{next}");
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while unsafe { libc::kill(git_pid, 0) } == 0 {
+                // On server shutdown an exited child may briefly await its new
+                // parent's reap. It must be dead, even if that reap is delayed.
+                if std::fs::read_to_string(format!("/proc/{git_pid}/stat"))
+                    .is_ok_and(|stat| stat.contains(") Z "))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Discovery Git process survived cancellation");
+        drop(input);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+    }
+}

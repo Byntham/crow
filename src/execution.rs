@@ -228,7 +228,13 @@ impl Execution {
         }
         if name == "discover_environment" {
             let revision = requested_revision(args)?;
-            return crate::runtime::discover(&self.source, revision).await;
+            // Discovery only reads Git objects. Drop its Git future promptly on
+            // cancellation, after the awaited recovery above has stopped orphans.
+            return tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(anyhow::anyhow!("Environment discovery interrupted")),
+                result = crate::runtime::discover(&self.source, revision) => result,
+            };
         }
         if name == "read_artifact" {
             return self.read_artifact(args);
