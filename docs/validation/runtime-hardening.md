@@ -1,8 +1,8 @@
 # Runtime cleanup and diagnostics audit
 
-This follow-up replaces cross-review prepared-workspace sharing with verified package-download reuse. It also adds ownership-based maintenance and stage-specific failure reporting. Earlier model-driven and historical-PR results remain in their original validation documents; this audit tests the runtime and worker changes directly.
+This records validation of an earlier implementation. Its cross-review package-download cache was subsequently removed. The tests, limits and results below describe that earlier version only. Current reviews install dependencies afresh and reuse prepared environments only within the same review. See the [runtime guide](../user/runtime-experiments.md) for current behavior and retention.
 
-## Verified behavior
+## Historical validation results
 
 | Scenario | Result |
 | --- | --- |
@@ -45,7 +45,7 @@ cargo test --locked --lib real_podman_cleanup -- --ignored --nocapture --test-th
 
 The release workflow runs these real suites on x64. Its ARM job runs ordinary checks, builds and portable-binary smoke tests. Avoid concurrent Cargo builds in one target directory while subprocess tests are running: replacing a running test executable can make Linux `current_exe()` return a deleted path.
 
-## Retention and remaining limits
+## Historical retention and limits
 
 Prepared snapshots stay within a review and are released when it finishes. Verified downloads have a shared 4 GiB allowance, a 512 MiB per-archive limit and seven-day idle expiry. Import reserves workspace capacity for pinned source and installation. Receipts, screenshots and logs follow configurable review retention, normally seven days. Paused reviews retain their prepared environments.
 

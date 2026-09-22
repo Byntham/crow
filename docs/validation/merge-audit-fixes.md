@@ -1,6 +1,6 @@
 # Merge audit fixes and verification
 
-This records the earlier audit at commit `21c2e11`. Its cross-review workspace cache has since been replaced by verified package-download reuse. See [the subsequent cleanup and diagnostics audit](runtime-hardening.md) for current behavior and validation.
+This records the earlier audit at commit `21c2e11`. Its cross-review workspace cache and the later package-download cache have both been removed. These are historical validation results. See the [runtime guide](../user/runtime-experiments.md) for current behavior.
 
 
 The audit reproduced a source-restoration bypass, lost final log diagnostics, cache misses across production checkout paths, a misleading configuration display, and a CI image-ID incompatibility. The follow-up fixes those issues and adds runtime progress to Crow's main PR status comment.

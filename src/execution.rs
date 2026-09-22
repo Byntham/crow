@@ -449,6 +449,8 @@ impl Execution {
         }
         if let Err(error) = cleanup {
             record["cleanupError"] = json!(bounded_error(error));
+        } else {
+            record["cleanupRecoveredAt"] = json!(crate::util::now());
         }
         if prepare && record["status"] != "passed" {
             let _ = std::fs::remove_file(self.dir.join("environments").join(format!("{id}.tar")));
@@ -1196,8 +1198,8 @@ pub fn append_summary(report: &mut Value, dir: &Path) -> Result<()> {
     });
     let total = records.len();
     for shown in (1..=total.min(12)).rev() {
-        let mut checks = Vec::new();
         let mut details = Vec::new();
+        let mut outcomes = Vec::<(&str, &str, String, Vec<String>)>::new();
         for (index, record) in records.iter().take(shown).enumerate() {
             let setup = record["phase"] == "setup";
             let label = record["purpose"]
@@ -1218,7 +1220,17 @@ pub fn append_summary(report: &mut Value, dir: &Path) -> Result<()> {
             };
             let outcome = experiment_outcome(record);
             if !setup {
-                checks.push(format!("- {label}: **{outcome}** ({revision})."));
+                let purpose = record["purpose"].as_str().unwrap_or("");
+                let command = record["command"].as_str().unwrap_or("");
+                let status = format!("**{outcome}** ({revision})");
+                // Pair matching checks without conflating commands or dropping retries.
+                if let Some((_, _, _, statuses)) = outcomes.iter_mut().find(|(p, c, _, _)| {
+                    !purpose.trim().is_empty() && *p == purpose && *c == command
+                }) {
+                    statuses.push(status);
+                } else {
+                    outcomes.push((purpose, command, label.clone(), vec![status]));
+                }
             }
             let mut detail = format!("**{label}**\n\n- Version: {revision}");
             let commit = record["commit"].as_str().unwrap_or("");
@@ -1249,13 +1261,20 @@ pub fn append_summary(report: &mut Value, dir: &Path) -> Result<()> {
             ));
             details.push(detail);
         }
-        let checks = if checks.is_empty() {
+        let checks = if outcomes.is_empty() {
             String::new()
         } else {
-            format!("\n\n{}", checks.join("\n"))
+            format!(
+                "\n\nAttempt outcomes:\n{}",
+                outcomes
+                    .iter()
+                    .map(|(_, _, label, statuses)| format!("- {label}: {}.", statuses.join("; ")))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
         };
         let rendered = format!(
-            "\n\n### Runtime tests\n\n{overview}{checks}\n\n<details>\n<summary>Commands and diagnostics ({shown} of {total} attempts)</summary>\n\n{}\n\nFull logs remain on the worker.\n\n</details>",
+            "\n\n### Runtime tests\n\n{overview}\n\n<details>\n<summary>Attempt outcomes and diagnostics ({shown} of {total} attempts)</summary>{checks}\n\n---\n\n{}\n\nFull logs remain on the worker.\n\n</details>",
             details.join("\n\n---\n\n")
         );
         if append_report_suffix(report, &rendered) {
@@ -1549,7 +1568,9 @@ mod tests {
             json!({"phase":"test","revision":"head","status":"passed","command":"python3 test_archive.py","purpose":"Reject malformed archives"}),
         ];
         for (index, record) in records.iter().enumerate() {
-            crate::util::atomic(&dir.path().join(format!("{index}.json")), record).unwrap();
+            let mut record = record.clone();
+            record["id"] = json!(index.to_string());
+            crate::util::atomic(&dir.path().join(format!("{index}.json")), &record).unwrap();
         }
         let mut report = json!({"summary":"No new bug confirmed.","findings":[]});
         append_summary(&mut report, dir.path()).unwrap();
@@ -1558,9 +1579,12 @@ mod tests {
         assert!(visible.contains(
             "Test commands: 1 failed, 1 passed, 1 timed out. Dependency setup: 1 passed."
         ));
-        assert!(visible.contains("Run the Rust test suite: **timed out** (PR version)."));
-        assert!(visible.contains("Run the Rust test suite: **failed** (before this PR)."));
-        assert!(visible.contains("Reject malformed archives: **passed** (PR version)."));
+        assert!(!visible.contains("Run the Rust test suite:"));
+        assert!(!visible.contains("Reject malformed archives:"));
+        assert!(details.contains(
+            "Run the Rust test suite: **timed out** (PR version); **failed** (before this PR)."
+        ));
+        assert!(details.contains("Reject malformed archives: **passed** (PR version)."));
         assert!(!visible.contains("cargo test"));
         assert!(!visible.contains("Install Rust dependencies:"));
         assert!(!summary.contains("timed_out"));
@@ -1569,6 +1593,40 @@ mod tests {
         assert!(details.contains("Exit code: 101"));
         assert!(details.contains("cargo test --offline"));
         assert!(details.contains("Install Rust dependencies"));
+    }
+
+    #[test]
+    fn paired_outcomes_preserve_retries_and_distinct_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        for (index, (revision, status, command)) in [
+            ("head", "failed", "check total"),
+            ("head", "passed", "check total"),
+            ("base", "passed", "check total"),
+            ("head", "passed", "check subtotal"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            crate::util::atomic(
+                &dir.path().join(format!("{index}.json")),
+                &json!({"id":index.to_string(),"phase":"test","revision":revision,
+                    "status":status,"command":command,"purpose":"Check calculation"}),
+            )
+            .unwrap();
+        }
+        let mut report = json!({"summary":"Review complete.","findings":[]});
+        append_summary(&mut report, dir.path()).unwrap();
+        let summary = report["summary"].as_str().unwrap();
+        let (visible, details) = summary.split_once("<details>").unwrap();
+        assert!(visible.contains("1 failed, 3 passed"));
+        assert!(!visible.contains("Check calculation"));
+        assert!(details.contains("4 of 4 attempts"));
+        assert!(details.contains(
+            "- Check calculation: **failed** (PR version); **passed** (PR version); **passed** (before this PR)."
+        ));
+        assert_eq!(details.matches("- Check calculation:").count(), 2);
+        assert_eq!(details.matches("- Result:").count(), 4);
+        assert_eq!(details.matches("<pre>").count(), 4);
     }
 
     #[test]

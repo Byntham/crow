@@ -2,7 +2,7 @@
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::Path,
     time::Duration,
@@ -66,6 +66,17 @@ fn read_record(path: &Path) -> Result<Value> {
         .with_context(|| format!("Invalid runtime ownership record: {}", path.display()))
 }
 
+fn mark_cleaned(record: &mut Value, now: i64) {
+    if record["status"] == "running" {
+        record["status"] = json!("interrupted");
+        if let Some(stage) = record.get("stage").cloned() {
+            record["failureStage"] = stage;
+        }
+    }
+    record.as_object_mut().unwrap().remove("cleanupError");
+    record["cleanupRecoveredAt"] = json!(now);
+}
+
 /// Run before retention removes ownership receipts. Active execution locks are skipped.
 /// A stopped container is removed only when a matching receipt belongs to a known job.
 /// Image removal uses this root's registry and never force-removes an image in use.
@@ -104,8 +115,40 @@ async fn cleanup_at(
         .cloned()
         .collect();
     let mut containers: Option<HashSet<String>> = None;
+    let mut inventory_attempted = false;
     let mut existing_containers = HashSet::new();
     let mut deferred_jobs = HashSet::new();
+    // Hold every available review lock before taking one shared Podman
+    // inventory. Otherwise a later job could create a container after the
+    // inventory and be incorrectly marked clean from the stale snapshot.
+    let mut held_locks = HashMap::new();
+    for job in jobs {
+        let Some(job_id) = job["id"]
+            .as_str()
+            .filter(|id| crate::retention::valid_id(id))
+        else {
+            continue;
+        };
+        if held_locks.contains_key(job_id) {
+            continue;
+        }
+        let lock = crate::retention::experiments(root, job_id).and_then(|path| match path {
+            Some(path) => crate::retention::execution_lock(&path),
+            None => Ok(None),
+        });
+        match lock {
+            Ok(Some(lock)) => {
+                held_locks.insert(job_id.to_owned(), lock);
+            }
+            // The second pass defers existing directories without a lock.
+            // Missing experiment directories require no resource cleanup.
+            Ok(None) => {}
+            Err(error) => {
+                deferred_jobs.insert(job_id.to_owned());
+                warnings.push(format!("Runtime cleanup for review {job_id}: {error:#}"));
+            }
+        }
+    }
     for job in jobs {
         let Some(job_id) = job["id"]
             .as_str()
@@ -137,14 +180,17 @@ async fn cleanup_at(
                 {
                     protected_images.insert(image.to_owned());
                 }
-                if record["containerStarted"] != false {
+                if record["containerStarted"] != false
+                    && (record["status"] == "running"
+                        || record["cleanupRecoveredAt"].as_i64().is_none())
+                {
                     records.push((entry.path(), record));
                 }
             }
-            let Some(_lock) = crate::retention::execution_lock(&path)? else {
+            if !held_locks.contains_key(job_id) {
                 deferred_jobs.insert(job_id.to_owned());
                 return Ok(());
-            };
+            }
             temporary_files += remove_temporary(&path, ".crow-runtime-")?;
             // Export writes beside its destination before atomically publishing it.
             // A killed worker can leave partial snapshots or screenshots here even
@@ -156,6 +202,14 @@ async fn cleanup_at(
                 }
             }
             if !records.is_empty() && containers.is_none() {
+                // A broken engine must not incur one timeout per historical
+                // receipt. Defer the remaining records after the first failed
+                // inventory and retry on the next maintenance pass.
+                if inventory_attempted {
+                    deferred_jobs.insert(job_id.to_owned());
+                    return Ok(());
+                }
+                inventory_attempted = true;
                 let output = podman(
                     executable,
                     env,
@@ -191,6 +245,11 @@ async fn cleanup_at(
                 {
                     if existing_containers.contains(&name) {
                         deferred_jobs.insert(job_id.to_owned());
+                    } else {
+                        // The successful inventory confirms that this owned
+                        // container is gone, so clear stale cleanup warnings.
+                        mark_cleaned(&mut record, now);
+                        crate::util::atomic(&receipt_path, &record)?;
                     }
                     continue;
                 }
@@ -201,10 +260,7 @@ async fn cleanup_at(
                     &["rm".into(), "--ignore".into(), name.clone()],
                 )
                 .await?;
-                if record["status"] == "running" {
-                    record["status"] = json!("interrupted");
-                }
-                record["cleanupRecoveredAt"] = json!(now);
+                mark_cleaned(&mut record, now);
                 crate::util::atomic(&receipt_path, &record)?;
                 removed_containers.push(name);
             }
@@ -585,6 +641,148 @@ mod tests {
         .unwrap();
         assert_eq!(record["status"], "interrupted");
         assert_eq!(record["cleanupRecoveredAt"], 101);
+    }
+
+    #[tokio::test]
+    async fn missing_owned_container_clears_stale_cleanup_warning() {
+        let root = tempfile::tempdir().unwrap();
+        let (program, env) = mock(root.path());
+        file(&root.path().join("containers.json"), &json!([]));
+        let id = "a".repeat(32);
+        let receipt = root
+            .path()
+            .join(format!("reviews/done/experiments/{id}.json"));
+        file(
+            &receipt,
+            &json!({
+                "id": id,
+                "status": "passed",
+                "containerStarted": true,
+                "cleanupError": "old remove failure"
+            }),
+        );
+        let result = cleanup_at(
+            root.path(),
+            &program,
+            &env,
+            &[json!({"id":"done","state":"completed"})],
+            &[],
+            101,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["deferredJobs"], json!([]));
+        let record = read_record(&receipt).unwrap();
+        assert!(record.get("cleanupError").is_none());
+        assert_eq!(record["cleanupRecoveredAt"], 101);
+        assert_eq!(record["status"], "passed");
+        // Once absence is confirmed, engine failure must not hold this review.
+        fs::remove_file(root.path().join("containers.json")).unwrap();
+        let second = cleanup_at(
+            root.path(),
+            &program,
+            &env,
+            &[json!({"id":"done","state":"completed"})],
+            &[],
+            102,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second["deferredJobs"], json!([]));
+        assert_eq!(second["warnings"], json!([]));
+        assert_eq!(
+            fs::read_to_string(root.path().join("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert_eq!(read_record(&receipt).unwrap(), record);
+    }
+
+    #[tokio::test]
+    async fn failed_container_inventory_is_attempted_once_per_pass() {
+        let root = tempfile::tempdir().unwrap();
+        let (program, env) = mock(root.path());
+        let jobs: Vec<_> = (0..3)
+            .map(|job| {
+                let id = format!("{job:032x}");
+                file(
+                    &root
+                        .path()
+                        .join(format!("reviews/job-{job}/experiments/{id}.json")),
+                    &json!({"id":id,"status":"passed","containerStarted":true}),
+                );
+                json!({"id":format!("job-{job}"),"state":"completed"})
+            })
+            .collect();
+        let result = cleanup_at(root.path(), &program, &env, &jobs, &[], 100)
+            .await
+            .unwrap();
+        assert_eq!(result["deferredJobs"].as_array().unwrap().len(), 3);
+        let calls = fs::read_to_string(root.path().join("calls")).unwrap();
+        assert_eq!(
+            calls.lines().filter(|line| line.starts_with("ps ")).count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_inventory_cannot_mark_a_later_container_clean() {
+        let root = tempfile::tempdir().unwrap();
+        let a = "a".repeat(32);
+        let b = "b".repeat(32);
+        let program = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/runtime-inventory-race.py");
+        let mut env: BTreeMap<String, String> = crate::util::host_env().into_iter().collect();
+        env.insert(
+            "MOCK_DIR".into(),
+            root.path().to_string_lossy().into_owned(),
+        );
+        file(
+            &root.path().join(format!("reviews/a/experiments/{a}.json")),
+            &json!({"id":a,"status":"passed","containerStarted":true}),
+        );
+        let b_dir = root.path().join("reviews/b/experiments");
+        fs::create_dir_all(&b_dir).unwrap();
+        let positive = std::process::Command::new(&program)
+            .args(["rm", "--ignore", &format!("crow-experiment-{a}")])
+            .envs(&env)
+            .status()
+            .unwrap();
+        assert!(positive.success());
+        assert_eq!(
+            fs::read_to_string(root.path().join("race")).unwrap(),
+            "acquired"
+        );
+        assert!(root.path().join("late-container").exists());
+        fs::remove_file(root.path().join("late-container")).unwrap();
+        fs::remove_file(root.path().join("race")).unwrap();
+        fs::remove_file(b_dir.join(format!("{b}.json"))).unwrap();
+        let jobs = [
+            json!({"id":"a","state":"completed"}),
+            json!({"id":"b","state":"completed"}),
+        ];
+        let result = cleanup_at(
+            root.path(),
+            &program.to_string_lossy(),
+            &env,
+            &jobs,
+            &[],
+            100,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result["containers"],
+            json!([format!("crow-experiment-{a}")])
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("race")).unwrap(),
+            "blocked"
+        );
+        assert!(!root.path().join("late-container").exists());
+        assert!(!b_dir.join(format!("{b}.json")).exists());
     }
     #[tokio::test]
     async fn old_images_require_registry_identity_and_preserve_current_recent_and_paused() {

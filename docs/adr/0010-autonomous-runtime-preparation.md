@@ -5,7 +5,7 @@ amends: 0009
 
 # Prepare review environments automatically
 
-Requiring project owners to maintain dependency images and explain each project's testing procedure limits the usefulness of runtime review. Crow will offer a worker-level automatic mode and automatic images for individual authorized repositories. Existing installations do not acquire execution permission implicitly.
+Requiring project owners to maintain dependency images and explain each project's testing procedure limits the usefulness of runtime review. Crow will offer a worker-level automatic mode and automatic images for individual authorized repositories. When the worker configuration does not specify an execution policy, current installations use the worker default and runtime execution is enabled. An operator can disable it explicitly.
 
 The agent discovers setup from repository evidence, prepares dependencies in a sandbox, repairs setup failures, and runs focused offline experiments. Crow supplies a managed Linux toolchain and a restricted package-download gateway. The one host mount used during preparation contains only the gateway socket. Tests remain offline and receive no host mounts. Arbitrary repository Dockerfiles do not run in the trusted image builder.
 

@@ -55,7 +55,8 @@ def review(case):
     # Never overwrite an earlier attempt or its evidence.
     if state.exists():
         print(f'{case["id"]}: already has {args.attempt}, skipped', flush=True)
-        return
+        receipt = state / 'replay.json'
+        return receipt.exists() and json.loads(receipt.read_text()).get('exitCode') == 0
     if args.resume_from:
         previous = directory / args.resume_from
         if (previous / 'result.json').exists():
@@ -99,9 +100,12 @@ def review(case):
                'signal': signal.Signals(interrupted).name if interrupted else None}
     (state / 'replay.json').write_text(json.dumps(receipt, indent=2) + '\n')
     print(f'{case["id"]}: {receipt}', flush=True)
+    return exit_code == 0
 
 
 with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-    list(pool.map(review, [case for case in cases if not args.case or case['id'] in args.case]))
+    results = list(pool.map(review, [case for case in cases if not args.case or case['id'] in args.case]))
 if interruption is not None:
     raise SystemExit(128 + interruption)
+if not results or not all(results):
+    raise SystemExit(1)

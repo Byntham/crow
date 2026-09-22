@@ -1323,6 +1323,57 @@ esac
         assert_eq!(runtime_maintenance_status(root.path())["warningCount"], 0);
     }
     #[tokio::test]
+    async fn reviews_without_runtime_experiments_still_expire() {
+        let root = tempfile::tempdir().unwrap();
+        let review = root.path().join("reviews/done");
+        fs::create_dir_all(&review).unwrap();
+        util::atomic(
+            &review.join("result.json"),
+            &json!({"summary":"Inspection only"}),
+        )
+        .unwrap();
+        let jobs = [json!({"id":"done","state":"completed","updatedAt":0})];
+        let result = cleanup_runtime_data(
+            root.path(),
+            &json!({"podman":"/missing-podman"}),
+            &jobs,
+            &json!(0),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["warningCount"], 0, "{result}");
+        assert_eq!(result["runtime"]["deferredJobs"], json!([]));
+        assert_eq!(result["retention"]["removed"], json!(["done"]));
+        assert!(!review.exists());
+    }
+    #[tokio::test]
+    async fn confirmed_container_cleanup_allows_retention_without_podman() {
+        let root = tempfile::tempdir().unwrap();
+        let experiment = root.path().join("reviews/done/experiments");
+        fs::create_dir_all(experiment.join("environments")).unwrap();
+        fs::write(experiment.join("environments/prepared.tar"), "dependencies").unwrap();
+        let id = "a".repeat(32);
+        util::atomic(
+            &experiment.join(format!("{id}.json")),
+            &json!({
+                "id":id,"status":"passed","containerStarted":true,"cleanupRecoveredAt":1
+            }),
+        )
+        .unwrap();
+        let jobs = [json!({"id":"done","state":"completed","updatedAt":0})];
+        let result = cleanup_runtime_data(
+            root.path(),
+            &json!({"podman":"/missing-podman","enabled":false}),
+            &jobs,
+            &json!(0),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["warningCount"], 0, "{result}");
+        assert_eq!(result["retention"]["removed"], json!(["done"]));
+        assert!(!experiment.exists());
+    }
+    #[tokio::test]
     async fn cache_failure_does_not_prevent_terminal_snapshot_cleanup() {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir_all(root.path().join("runtime-cache/packages.lock")).unwrap();

@@ -100,6 +100,25 @@ sys.exit(23)
                         except ProcessLookupError:
                             pass
 
+    def test_exit_status_includes_failed_and_reused_attempts(self):
+        for failing_case in [None, CASES[1]['id']]:
+            with self.subTest(failing_case=failing_case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                reviewer = self.prepare(root, f'''import sys
+from pathlib import Path
+sys.exit(7 if Path(sys.argv[2]).parent.name == {failing_case!r} else 0)
+''')
+                expected = 1 if failing_case else 0
+                for _ in range(2):
+                    result = subprocess.run(self.command(root, reviewer), capture_output=True,
+                                            text=True, timeout=10)
+                    self.assertEqual(result.returncode, expected, (result.stdout, result.stderr))
+                # A directory left before a receipt was saved cannot count as success.
+                (root / CASES[0]['id'] / 'baseline' / 'replay.json').unlink()
+                result = subprocess.run(self.command(root, reviewer), capture_output=True,
+                                        text=True, timeout=10)
+                self.assertEqual(result.returncode, 1, result.stderr)
+
     def test_export_includes_failures_before_provider_events_exist(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -110,7 +129,7 @@ sys.exit(7)
 ''')
             result = subprocess.run(self.command(root, reviewer, jobs=1), capture_output=True,
                                     text=True, timeout=10)
-            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.returncode, 1, result.stderr)
             case = root / CASES[0]['id']
             for attempt, filename, body in [
                 ('error-only', 'error.txt', 'Early configuration failure'),
