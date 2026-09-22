@@ -252,7 +252,9 @@ async fn pair_and_combined_cleanup_each_emit_one_json_document() -> Result<()> {
     let cleanup = stdout(&fixture.run(&["cleanup", "--format", "json"]).await?);
     let cleanup: Value = serde_json::from_str(&cleanup)?;
     assert_eq!(cleanup["service"], json!({"jobs": 4, "events": 2}));
-    assert_eq!(cleanup["worker"], json!({"removed": [], "warnings": []}));
+    assert_eq!(cleanup["worker"]["removed"], json!([]));
+    assert_eq!(cleanup["worker"]["warnings"], json!([]));
+    assert_eq!(cleanup["worker"]["runtime"]["containers"], json!([]));
     Ok(())
 }
 

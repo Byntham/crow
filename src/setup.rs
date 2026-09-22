@@ -2,7 +2,7 @@
 //! by persisting enough information to resume without replacing another route.
 use crate::github::GitHubApi;
 use crate::{config, operations, util};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use axum::{
     Router,
     extract::{Request, State},
@@ -119,6 +119,11 @@ pub async fn ensure_command(command: &str) -> Result<()> {
     {
         return Ok(());
     }
+    if matches!(command, "gh" | "git") && !HostRuntimeSetup.supports_apt() {
+        bail!(
+            "{command} is missing. Guided package installation supports Ubuntu/Debian with apt-get. Install {command} using this distribution's package manager, then rerun crow setup."
+        );
+    }
     if !cfg!(target_os = "linux")
         || !confirm(
             &format!("{command} is missing. Install the official Linux package using sudo?"),
@@ -130,7 +135,9 @@ pub async fn ensure_command(command: &str) -> Result<()> {
     }
     if matches!(command, "gh" | "git") {
         operations::run("sudo", &["apt-get", "update"], true).await?;
-        operations::run("sudo", &["apt-get", "install", "-y", command], true).await?;
+        operations::run("sudo", &["apt-get", "install", "-y", command], true)
+            .await
+            .with_context(|| format!("Could not install {command}. Resolve the package-manager error above or install {command} from its official installation instructions, then rerun crow setup."))?;
     } else {
         let directory = tempfile::tempdir()?;
         let (url, filename, installer) = match command {
@@ -173,6 +180,181 @@ pub async fn ensure_command(command: &str) -> Result<()> {
         operations::run("sudo", &args, true).await?;
     }
     operations::run(command, &["--version"], false).await?;
+    Ok(())
+}
+
+const RUNTIME_PREREQUISITES: &[(&str, &str)] = &[
+    ("podman", "podman"),
+    ("newuidmap", "uidmap"),
+    ("newgidmap", "uidmap"),
+    ("slirp4netns", "slirp4netns"),
+    ("fuse-overlayfs", "fuse-overlayfs"),
+];
+
+fn runtime_requested(settings: &Value, role: &str) -> bool {
+    role != "service"
+        && (settings["execution"]["automatic"] == true
+            || settings["execution"]["repositories"]
+                .as_object()
+                .is_some_and(|repos| !repos.is_empty()))
+}
+
+fn runtime_install_hint() -> &'static str {
+    "Check the reported error with: podman info --format=json\n\n\
+On Ubuntu/Debian, the required packages can be installed with:\n  \
+sudo apt-get update && sudo apt-get install -y podman uidmap slirp4netns fuse-overlayfs dbus-user-session\n\n\
+Host configuration, if the error requires it:\n\
+- Missing UID/GID mappings: have an administrator assign non-overlapping ranges in /etc/subuid and /etc/subgid, then run podman system migrate.\n\
+- Cgroup v1: use a cgroup-v2 host or ask its administrator to enable the unified hierarchy and reboot.\n\
+- Blocked user namespaces or seccomp: ask the host administrator to permit rootless Podman.\n\n\
+Run Crow as your normal user. Rerun crow setup after fixing the reported issue."
+}
+
+#[async_trait::async_trait]
+trait RuntimeSetupBackend: Send + Sync {
+    async fn check(&self, settings: &Value) -> Result<()>;
+    fn available(&self, command: &str) -> bool;
+    fn supports_apt(&self) -> bool;
+    async fn confirm(&self, label: &str, fallback: bool) -> Result<bool>;
+    async fn install(&self, packages: &[String]) -> Result<()>;
+}
+
+struct HostRuntimeSetup;
+#[async_trait::async_trait]
+impl RuntimeSetupBackend for HostRuntimeSetup {
+    async fn check(&self, settings: &Value) -> Result<()> {
+        crate::execution::check_prerequisites(settings).await
+    }
+    fn available(&self, command: &str) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let executable = |path: &Path| {
+            path.metadata()
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        };
+        if command.contains('/') {
+            return executable(Path::new(command));
+        }
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .any(|directory| executable(&directory.join(command)))
+    }
+    fn supports_apt(&self) -> bool {
+        cfg!(target_os = "linux") && self.available("apt-get")
+    }
+    async fn confirm(&self, label: &str, fallback: bool) -> Result<bool> {
+        confirm(label, fallback).await
+    }
+    async fn install(&self, packages: &[String]) -> Result<()> {
+        operations::run("sudo", &["apt-get", "update"], true).await?;
+        let mut args = vec!["apt-get", "install", "-y"];
+        args.extend(packages.iter().map(String::as_str));
+        operations::run("sudo", &args, true).await?;
+        Ok(())
+    }
+}
+
+async fn runtime_setup_with_backend(
+    settings: &mut Value,
+    role: &str,
+    backend: &impl RuntimeSetupBackend,
+) -> Result<()> {
+    if !runtime_requested(settings, role) {
+        return Ok(());
+    }
+    let initial_check = backend.check(settings).await;
+    let podman = settings["execution"]["podman"].as_str().unwrap_or("podman");
+    // A custom executable can be a wrapper or remote-environment launcher.
+    // Installing another Podman cannot repair that operator-selected path.
+    let managed_command = podman == "podman";
+    let mut packages = Vec::new();
+    if managed_command {
+        for (command, package) in RUNTIME_PREREQUISITES {
+            // newuidmap/newgidmap do not provide a reliable --version exit code.
+            let required = matches!(*command, "podman" | "newuidmap" | "newgidmap");
+            if (required || initial_check.is_err())
+                && !backend.available(command)
+                && !packages.iter().any(|known| known == package)
+            {
+                packages.push((*package).to_owned());
+            }
+        }
+        if !packages.is_empty() {
+            // A user session bus is required by rootless Podman's systemd cgroup
+            // manager, but no binary reliably identifies dbus-user-session.
+            packages.push("dbus-user-session".to_owned());
+        }
+    }
+    let mut failure = match initial_check {
+        Ok(()) if packages.is_empty() => return Ok(()),
+        Ok(()) => anyhow::anyhow!(
+            "Podman is available, but required rootless helper commands are missing"
+        ),
+        Err(error) => error,
+    };
+    if !packages.is_empty()
+        && backend.supports_apt()
+        && backend
+            .confirm(
+                &format!(
+                    "Runtime testing needs Linux packages ({}). Install them using sudo?",
+                    packages.join(", ")
+                ),
+                true,
+            )
+            .await?
+    {
+        match backend.install(&packages).await {
+            Ok(()) => match backend.check(settings).await {
+                Ok(()) if backend.available("newuidmap") && backend.available("newgidmap") => {
+                    return Ok(());
+                }
+                Ok(()) => {
+                    failure = anyhow::anyhow!(
+                        "Package installation completed, but newuidmap or newgidmap is still unavailable"
+                    )
+                }
+                Err(error) => failure = error,
+            },
+            Err(error) => failure = error.context("Runtime package installation failed"),
+        }
+    }
+    println!(
+        "\nRuntime testing is not ready: {failure:#}\n{}",
+        runtime_install_hint()
+    );
+    if !managed_command {
+        println!(
+            "The configured Podman executable is {podman:?}. Correct worker.execution.podman or make that executable available; Crow will not replace a custom executable."
+        );
+    }
+    if backend
+        .confirm(
+            "Continue setup with runtime testing disabled for this worker?",
+            false,
+        )
+        .await?
+    {
+        settings["execution"]["automatic"] = json!(false);
+        settings["execution"]["repositories"] = json!({});
+        println!(
+            "Runtime testing is disabled. Crow will review source without running it. Re-enable worker.execution when this host is ready."
+        );
+        return Ok(());
+    }
+    Err(failure.context("Runtime setup is incomplete. Fix the reported host prerequisite and rerun crow setup, or rerun setup and choose to continue with runtime testing disabled"))
+}
+
+async fn ensure_runtime_prerequisites(config: &mut Value, role: &str, root: &Path) -> Result<()> {
+    // Keep cancellation outside error recovery so Ctrl-C during installation
+    // cannot be mistaken for a request to disable runtime testing.
+    tokio::select! {
+        biased;
+        interrupt = operations::interrupted() => {
+            interrupt?;
+            bail!("Setup interrupted. Run crow setup to continue.");
+        }
+        result = runtime_setup_with_backend(&mut config["worker"], role, &HostRuntimeSetup) => result?,
+    }
+    config::save(root, config)?;
     Ok(())
 }
 
@@ -1125,30 +1307,100 @@ pub async fn validate_models(config: &Value, root: &Path, worker: &Value) -> Res
     let models = catalog["models"]
         .as_array()
         .context("The provider returned no model catalog")?;
-    validate_model_selection(models, worker, "Review")?;
+    crate::provider::validate_model_selection(models, worker, "Review")?;
     if worker["subagents"]["mode"] == "configured" {
-        validate_model_selection(models, &worker["subagents"], "Subagent")?;
+        crate::provider::validate_model_selection(models, &worker["subagents"], "Subagent")?;
     }
     Ok(())
 }
 
-fn validate_model_selection(models: &[Value], selected: &Value, label: &str) -> Result<()> {
-    let model_name = string(selected, "model");
-    let model = models
-        .iter()
-        .find(|m| !model_name.is_empty() && m["model"] == model_name)
-        .with_context(|| {
-            format!("{label} model is not available from the provider: {model_name}")
-        })?;
-    let effort = string(selected, "effort");
-    if effort.is_empty()
-        || !model["supportedReasoningEfforts"]
-            .as_array()
-            .is_some_and(|efforts| efforts.iter().any(|e| e["reasoningEffort"] == effort))
-    {
-        bail!("{label} reasoning level {effort} is unsupported for {model_name}");
+async fn save_setup_listener(root: &Path, config: &Value) -> Result<()> {
+    // Keep the previous connection settings usable when the proposed listener
+    // is unavailable. Check before persisting the new port or role.
+    config::validate_config(config)?;
+    preflight_listener(config).await?;
+    config::save(root, config)
+}
+
+// Run before ingress creation so an occupied default port does not leave a
+// saved external route that then prevents the user selecting another port.
+async fn preflight_listener(config: &Value) -> Result<()> {
+    if config["role"] == "worker" {
+        return Ok(());
     }
-    Ok(())
+    let bind = string(config, "bind");
+    let port = config["port"]
+        .as_u64()
+        .and_then(|port| u16::try_from(port).ok())
+        .context("Invalid setup port")?;
+    let error = match tokio::net::TcpListener::bind((bind, port)).await {
+        Ok(listener) => {
+            drop(listener);
+            return Ok(());
+        }
+        Err(error) => error,
+    };
+    if error.kind() == io::ErrorKind::AddrInUse
+        && !config["app"].is_null()
+        && !string(config, "adminToken").is_empty()
+    {
+        // A public health response cannot prove this is our installation.
+        // Check its local identity and this installation's saved administrator
+        // credential, never an unrelated configured remote service URL.
+        let host = match bind {
+            "0.0.0.0" => "127.0.0.1",
+            "::" => "::1",
+            other => other,
+        };
+        let host = if host.contains(':') {
+            format!("[{host}]")
+        } else {
+            host.to_owned()
+        };
+        let base = format!("http://{host}:{port}");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        let health = client.get(format!("{base}/health")).send().await.ok();
+        let owns_service = if let Some(response) = health {
+            response.status().is_success()
+                && response
+                    .json::<Value>()
+                    .await
+                    .is_ok_and(|body| body["service"] == "crow" && body["configured"] == true)
+        } else {
+            false
+        };
+        if owns_service {
+            // Health identifies Crow; the authenticated status call proves
+            // that this installation owns the administrator credential.
+            let mut local = config.clone();
+            local["serviceUrl"] = json!(base);
+            if tokio::time::timeout(
+                Duration::from_secs(5),
+                operations::admin(&local, "status", &Value::Null),
+            )
+            .await
+            .is_ok_and(|result| result.is_ok())
+            {
+                return Ok(());
+            }
+        }
+    }
+    bail!(
+        "Crow cannot listen on {bind}:{port}: {error}. Stop the other listener or, before HTTPS/App onboarding, rerun `crow setup --port PORT` with an unused port. No new ingress or GitHub connection was created."
+    );
+}
+
+async fn preflight_systemd(command: &str) -> Result<()> {
+    if !cfg!(target_os = "linux") || unsafe { libc::geteuid() } == 0 {
+        bail!(
+            "Crow setup requires Linux and a normal user session with systemd. Log in as the account that will run Crow, without sudo, and rerun crow setup."
+        );
+    }
+    // Do not print the manager's environment; it can contain private values.
+    operations::run(command, &["--user", "show-environment"], false).await.map(|_| ()).map_err(|_| anyhow::anyhow!("Crow could not reach the systemd user manager. Log in directly as the normal user that will run Crow, without sudo. On Ubuntu/Debian, install dbus-user-session if missing, then log out and back in. Check `systemctl --user show-environment` and rerun crow setup. Guided persistent startup requires systemd."))
 }
 
 pub async fn setup(root: &Path, options: &Value) -> Result<()> {
@@ -1195,40 +1447,66 @@ pub async fn setup(root: &Path, options: &Value) -> Result<()> {
         "\nCrow installed. Settings and review history: {}",
         root.display()
     );
-    let local_bin = user_home()?.join(".local/bin");
+    let local_bin = crate::install::bin_directory()?;
     if !std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         .any(|path| path == local_bin)
     {
         println!(
-            "\nTo use the crow command in this terminal, run:\n  export PATH=\"$HOME/.local/bin:$PATH\""
+            "\nTo use the crow command in this terminal, run:\n  export PATH='{}':\"$PATH\"",
+            local_bin.to_string_lossy().replace('\'', "'\"'\"'")
         );
     }
     config["role"] = json!(role);
     apply_setup_port(&mut config, options.get("port").filter(|v| !v.is_null()))?;
-    config::save(root, &config)?;
+    save_setup_listener(root, &config).await?;
+    ensure_runtime_prerequisites(&mut config, &role, root).await?;
+    preflight_systemd("systemctl").await?;
     let mut identity = Value::Null;
     if role == "worker" {
         println!(
             "\nConnect this worker\nRun crow pair on your service machine, then enter its connection details."
         );
         let previous = string(&config, "serviceUrl");
-        config["serviceUrl"] = json!(util::https_url(
+        let service_url = util::https_url(
             &ask(
                 "Connection-service HTTPS URL",
                 if previous.starts_with("https:") {
                     previous
                 } else {
                     ""
-                }
+                },
             )
-            .await?
-        )?);
-        config["worker"]["id"] =
-            json!(ask("Worker ID from crow pair", string(&config["worker"], "id")).await?);
-        let token = ask("Worker token from crow pair", "").await?;
+            .await?,
+        )?;
+        let worker_id = ask("Worker ID from crow pair", string(&config["worker"], "id")).await?;
+        let token = if let Some(saved) = saved_pairing_token(&config, &service_url, &worker_id) {
+            match operations::check_worker_pairing(&config).await {
+                Ok(_) => {
+                    println!("Saved worker pairing verified.");
+                    saved.to_owned()
+                }
+                Err(error) => {
+                    println!("Could not verify saved pairing: {error}");
+                    let entered = ask(
+                        "Worker token from crow pair (Enter keeps the saved token)",
+                        "",
+                    )
+                    .await?;
+                    if entered.is_empty() {
+                        saved.to_owned()
+                    } else {
+                        entered
+                    }
+                }
+            }
+        } else {
+            ask("Worker token from crow pair", "").await?
+        };
         if token.is_empty() {
             bail!("Worker pairing token required");
         }
+        config["serviceUrl"] = json!(service_url);
+        config["worker"]["id"] = json!(worker_id);
         config["worker"]["token"] = json!(token);
         config::save(root, &config)?;
     } else {
@@ -1390,6 +1668,41 @@ pub async fn setup(root: &Path, options: &Value) -> Result<()> {
     Ok(())
 }
 
+fn saved_pairing_token<'a>(
+    config: &'a Value,
+    service_url: &str,
+    worker_id: &str,
+) -> Option<&'a str> {
+    let saved_url = util::https_url(string(config, "serviceUrl")).ok()?;
+    let same_service = saved_url == service_url;
+    (same_service && string(&config["worker"], "id") == worker_id)
+        .then(|| string(&config["worker"], "token"))
+        .filter(|token| !token.is_empty())
+}
+
+fn setup_model_default<'a>(models: &'a [Value], previous: &str) -> Result<&'a str> {
+    models.iter().find(|model| !previous.is_empty() && model["model"] == previous)
+        .or_else(|| models.iter().find(|model| model["isDefault"] == true))
+        .and_then(|model| model["model"].as_str())
+        .context("The provider did not report a usable default model. Retry model discovery before completing setup.")
+}
+
+fn setup_effort_default<'a>(model: &'a Value, previous: &str) -> Result<&'a str> {
+    let efforts = model["supportedReasoningEfforts"]
+        .as_array()
+        .context("The selected model did not report reasoning levels")?;
+    efforts
+        .iter()
+        .find(|effort| !previous.is_empty() && effort["reasoningEffort"] == previous)
+        .or_else(|| {
+            efforts
+                .iter()
+                .find(|effort| effort["reasoningEffort"] == model["defaultReasoningEffort"])
+        })
+        .and_then(|effort| effort["reasoningEffort"].as_str())
+        .context("The selected model did not report a supported default reasoning level")
+}
+
 async fn setup_provider(config: &mut Value, root: &Path) -> Result<()> {
     println!("\nChoose how Crow reviews code");
     ensure_command("git").await?;
@@ -1408,6 +1721,7 @@ async fn setup_provider(config: &mut Value, root: &Path) -> Result<()> {
         config["worker"]["codex"] = json!(crate::install::install_codex(root).await?);
         config::save(root, config)?;
     }
+    ensure_codex_capabilities(config, root).await?;
     if crate::provider::auth_status(&config["worker"], root).await?["authenticated"] != true {
         println!("Authenticate on your desktop using the URL and code printed below.");
         crate::provider::login(&config["worker"], root).await?;
@@ -1419,8 +1733,7 @@ async fn setup_provider(config: &mut Value, root: &Path) -> Result<()> {
     let models = catalog["models"]
         .as_array()
         .context("The provider returned no model catalog")?;
-    let initial = models.iter().find(|model| model["isDefault"] == true).or_else(|| models.iter().find(|model| !string(&config["worker"],"model").is_empty() && model["model"] == config["worker"]["model"])).context("The provider did not report a default model. Retry model discovery before completing initial setup.")?;
-    let previous = string(&config["worker"], "model");
+    let initial = setup_model_default(models, string(&config["worker"], "model"))?;
     let model_choices: Vec<_> = models
         .iter()
         .map(|model| {
@@ -1432,16 +1745,7 @@ async fn setup_provider(config: &mut Value, root: &Path) -> Result<()> {
             )
         })
         .collect();
-    let selected = choose(
-        "Review model",
-        if previous.is_empty() {
-            initial["model"].as_str().unwrap_or(string(initial, "id"))
-        } else {
-            previous
-        },
-        &model_choices,
-    )
-    .await?;
+    let selected = choose("Review model", initial, &model_choices).await?;
     let model = models
         .iter()
         .find(|model| model["model"] == selected)
@@ -1462,11 +1766,7 @@ async fn setup_provider(config: &mut Value, root: &Path) -> Result<()> {
         .collect();
     let effort = choose(
         "Reasoning level",
-        if previous.is_empty() {
-            string(model, "defaultReasoningEffort")
-        } else {
-            previous
-        },
+        setup_effort_default(model, previous)?,
         &effort_choices,
     )
     .await?;
@@ -1478,9 +1778,230 @@ async fn setup_provider(config: &mut Value, root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A locally installed Codex can answer `--version` while lacking the JSON,
+/// resume, or isolation controls Crow needs. Offer Crow's verified standalone
+/// binary as an explicit repair without replacing a user's executable silently.
+async fn ensure_codex_capabilities(config: &mut Value, root: &Path) -> Result<()> {
+    let diagnostics = crate::provider::diagnostics(&config["worker"], root, false).await?;
+    let failed = diagnostics["checks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|check| check["ok"] != true)
+        .collect::<Vec<_>>();
+    if failed.is_empty() {
+        return Ok(());
+    }
+    println!("\nThe configured Codex executable does not provide all controls Crow requires:");
+    for check in &failed {
+        println!("  {}: {}", string(check, "name"), string(check, "detail"));
+    }
+    if !confirm(
+        "Install Crow's verified standalone Codex executable instead?",
+        true,
+    )
+    .await?
+    {
+        bail!("Install a current official Codex CLI and rerun setup.");
+    }
+    config["worker"]["codex"] = json!(crate::install::install_codex(root).await?);
+    config::save(root, config)?;
+    let repaired = crate::provider::diagnostics(&config["worker"], root, false).await?;
+    ensure!(
+        repaired["ok"] == true,
+        "The installed Codex executable still lacks required controls. Rerun setup after updating Codex."
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_listener_setup_preserves_saved_connection_settings() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("config.json");
+        let original = config::defaults(root.path());
+        config::save(root.path(), &original).unwrap();
+        let saved = std::fs::read(&file).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut proposed = original.clone();
+        proposed["role"] = json!("service");
+        apply_setup_port(
+            &mut proposed,
+            Some(&json!(listener.local_addr().unwrap().port())),
+        )
+        .unwrap();
+        let error = save_setup_listener(root.path(), &proposed)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("crow setup --port PORT"), "{error}");
+        assert_eq!(std::fs::read(&file).unwrap(), saved);
+        assert_eq!(config::load(root.path()).unwrap(), original);
+
+        // A failed first setup should not create unusable connection settings.
+        let fresh = tempfile::tempdir().unwrap();
+        assert!(save_setup_listener(fresh.path(), &proposed).await.is_err());
+        assert!(!fresh.path().join("config.json").exists());
+
+        // Worker-only setup has no local listener, even if that port is busy.
+        proposed["role"] = json!("worker");
+        save_setup_listener(root.path(), &proposed).await.unwrap();
+        assert_eq!(config::load(root.path()).unwrap(), proposed);
+    }
+
+    #[tokio::test]
+    async fn listener_preflight_rejects_foreign_ports_before_route_creation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut config = json!({"role":"both", "bind":"127.0.0.1", "port":port});
+        let error = preflight_listener(&config).await.unwrap_err().to_string();
+        assert!(error.contains("crow setup --port PORT"), "{error}");
+        assert!(config["publicUrl"].is_null());
+        config["role"] = json!("worker");
+        preflight_listener(&config).await.unwrap();
+        config["role"] = json!("service");
+        // Let the OS select the free port within the bind itself. Reusing a
+        // released ephemeral port races other tests and subprocesses.
+        config["port"] = json!(0);
+        preflight_listener(&config).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn listener_preflight_allows_only_authenticated_existing_service() {
+        use axum::{Json, http::HeaderMap, routing::get};
+        let router = Router::new()
+            .route(
+                "/health",
+                get(|| async { Json(json!({"service":"crow","configured":true})) }),
+            )
+            .route(
+                "/admin/status",
+                get(|headers: HeaderMap| async move {
+                    if headers
+                        .get("authorization")
+                        .and_then(|header| header.to_str().ok())
+                        == Some("Bearer installation-secret")
+                    {
+                        (StatusCode::OK, Json(json!({"jobs":[],"repos":[]})))
+                    } else {
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({"error":"Unauthorized"})),
+                        )
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let mut config = json!({"role":"both","bind":"127.0.0.1","port":port,"app":{"id":1},"adminToken":"installation-secret","serviceUrl":"https://must-not-contact.invalid"});
+        preflight_listener(&config).await.unwrap();
+        config["adminToken"] = json!("wrong-installation");
+        assert!(preflight_listener(&config).await.is_err());
+        server.abort();
+        let _ = server.await;
+
+        // A foreign server returning plausible status JSON without Crow's health
+        // identity cannot exempt its occupied port from the preflight.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        config["port"] = json!(listener.local_addr().unwrap().port());
+        let router = Router::new().route(
+            "/admin/status",
+            get(|| async { Json(json!({"jobs":[],"repos":[]})) }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        assert!(preflight_listener(&config).await.is_err());
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn systemd_preflight_reports_actionable_errors_without_environment_output() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let command = dir.path().join("systemctl");
+        for code in [0, 1] {
+            std::fs::write(&command, format!("#!/bin/sh\ntest \"$*\" = '--user show-environment' || exit 9\nprintf 'PRIVATE_MANAGER_VALUE=canary\\n'\nexit {code}\n")).unwrap();
+            std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let result = preflight_systemd(command.to_str().unwrap()).await;
+            if code == 0 && unsafe { libc::geteuid() } != 0 {
+                result.unwrap();
+            } else {
+                let message = result.unwrap_err().to_string();
+                assert!(message.contains("normal user"), "{message}");
+                assert!(!message.contains("PRIVATE_MANAGER_VALUE"), "{message}");
+            }
+        }
+    }
+
+    #[test]
+    fn saved_pairing_is_reused_only_for_the_same_service_and_worker() {
+        let config = json!({"serviceUrl":"https://service.example/","worker":{"id":"worker-one","token":"saved-secret"}});
+        assert_eq!(
+            saved_pairing_token(
+                &config,
+                &util::https_url("https://service.example/").unwrap(),
+                "worker-one"
+            ),
+            Some("saved-secret")
+        );
+        assert_eq!(
+            saved_pairing_token(&config, "https://other.example", "worker-one"),
+            None
+        );
+        assert_eq!(
+            saved_pairing_token(&config, "https://service.example", "worker-two"),
+            None
+        );
+        assert_eq!(
+            saved_pairing_token(
+                &json!({"serviceUrl":"https://service.example","worker":{"id":"worker-one","token":""}}),
+                "https://service.example",
+                "worker-one"
+            ),
+            None
+        );
+        assert_eq!(
+            saved_pairing_token(
+                &json!({"serviceUrl":"http://service.example","worker":{"id":"worker-one","token":"saved-secret"}}),
+                "https://service.example",
+                "worker-one"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn provider_prompt_defaults_never_offer_removed_models_or_unsupported_effort() {
+        let models = vec![
+            json!({"model":"current-default","isDefault":true,"defaultReasoningEffort":"medium","supportedReasoningEfforts":[{"reasoningEffort":"medium"},{"reasoningEffort":"high"}]}),
+            json!({"model":"saved-model","isDefault":false,"defaultReasoningEffort":"low","supportedReasoningEfforts":[{"reasoningEffort":"low"}]}),
+        ];
+        assert_eq!(
+            setup_model_default(&models, "saved-model").unwrap(),
+            "saved-model"
+        );
+        assert_eq!(
+            setup_model_default(&models, "removed-model").unwrap(),
+            "current-default"
+        );
+        assert_eq!(setup_model_default(&models, "").unwrap(), "current-default");
+        assert_eq!(setup_effort_default(&models[0], "high").unwrap(), "high");
+        assert_eq!(setup_effort_default(&models[1], "high").unwrap(), "low");
+        assert_eq!(
+            setup_effort_default(&models[0], "removed-effort").unwrap(),
+            "medium"
+        );
+        assert!(setup_model_default(&[], "removed-model").is_err());
+        assert!(setup_effort_default(&json!({"defaultReasoningEffort":"high","supportedReasoningEfforts":[{"reasoningEffort":"low"}]}), "").is_err());
+    }
 
     struct AppConnectionProbe {
         root: PathBuf,
@@ -1937,6 +2458,242 @@ mod tests {
         assert!(apply_setup_port(&mut config, Some(&json!(true))).is_err());
     }
     #[test]
+    fn runtime_prerequisites_follow_role_and_explicit_execution_settings() {
+        assert!(runtime_requested(
+            &json!({"execution":{"automatic":true}}),
+            "both"
+        ));
+        assert!(runtime_requested(
+            &json!({"execution":{"repositories":{"owner/repo":{}}}}),
+            "worker"
+        ));
+        assert!(!runtime_requested(
+            &json!({"execution":{"automatic":true}}),
+            "service"
+        ));
+        assert!(!runtime_requested(
+            &json!({"execution":{"automatic":false,"repositories":{}}}),
+            "worker"
+        ));
+    }
+
+    struct RuntimeSetupProbe {
+        checks: std::sync::Mutex<std::collections::VecDeque<bool>>,
+        answers: std::sync::Mutex<std::collections::VecDeque<Option<bool>>>,
+        installs: std::sync::Mutex<Vec<Vec<String>>>,
+        check_count: std::sync::Mutex<usize>,
+        commands_present: bool,
+        missing_commands: HashSet<&'static str>,
+        apt: bool,
+        install_fails: bool,
+        installed_helpers_present: bool,
+    }
+    impl RuntimeSetupProbe {
+        fn new(checks: &[bool], answers: &[Option<bool>]) -> Self {
+            Self {
+                checks: std::sync::Mutex::new(checks.iter().copied().collect()),
+                answers: std::sync::Mutex::new(answers.iter().copied().collect()),
+                installs: std::sync::Mutex::new(Vec::new()),
+                check_count: std::sync::Mutex::new(0),
+                commands_present: false,
+                missing_commands: HashSet::new(),
+                apt: true,
+                install_fails: false,
+                installed_helpers_present: true,
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl RuntimeSetupBackend for RuntimeSetupProbe {
+        async fn check(&self, _: &Value) -> Result<()> {
+            *self.check_count.lock().unwrap() += 1;
+            if self
+                .checks
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected check")
+            {
+                Ok(())
+            } else {
+                bail!("fixture rootless prerequisite failed")
+            }
+        }
+        fn available(&self, command: &str) -> bool {
+            (self.commands_present && !self.missing_commands.contains(command))
+                || (!self.installs.lock().unwrap().is_empty()
+                    && !self.install_fails
+                    && self.installed_helpers_present)
+        }
+        fn supports_apt(&self) -> bool {
+            self.apt
+        }
+        async fn confirm(&self, _: &str, _: bool) -> Result<bool> {
+            self.answers
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected prompt")
+                .context("Setup interrupted")
+        }
+        async fn install(&self, packages: &[String]) -> Result<()> {
+            self.installs.lock().unwrap().push(packages.to_vec());
+            if self.install_fails {
+                bail!("fixture apt failure")
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_setup_skips_disabled_service_and_already_working_hosts() {
+        for (mut settings, role) in [
+            (json!({"execution":{"automatic":false}}), "worker"),
+            (json!({"execution":{"automatic":true}}), "service"),
+        ] {
+            let backend = RuntimeSetupProbe::new(&[], &[]);
+            runtime_setup_with_backend(&mut settings, role, &backend)
+                .await
+                .unwrap();
+            assert_eq!(*backend.check_count.lock().unwrap(), 0);
+            assert!(backend.installs.lock().unwrap().is_empty());
+        }
+        let mut settings = json!({"execution":{"automatic":true,"podman":"/custom/podman"}});
+        let backend = RuntimeSetupProbe::new(&[true], &[]);
+        runtime_setup_with_backend(&mut settings, "worker", &backend)
+            .await
+            .unwrap();
+        assert_eq!(*backend.check_count.lock().unwrap(), 1);
+        assert!(backend.installs.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_setup_installs_missing_packages_once_and_rechecks_rootless_support() {
+        let mut settings = json!({"execution":{"automatic":true}});
+        let backend = RuntimeSetupProbe::new(&[false, true], &[Some(true)]);
+        runtime_setup_with_backend(&mut settings, "both", &backend)
+            .await
+            .unwrap();
+        assert_eq!(*backend.check_count.lock().unwrap(), 2);
+        assert_eq!(
+            backend.installs.lock().unwrap().as_slice(),
+            &[vec![
+                "podman",
+                "uidmap",
+                "slirp4netns",
+                "fuse-overlayfs",
+                "dbus-user-session"
+            ]]
+        );
+        assert_eq!(settings["execution"]["automatic"], true);
+    }
+
+    #[tokio::test]
+    async fn runtime_setup_checks_required_helpers_even_when_podman_info_succeeds() {
+        let mut settings = json!({"execution":{"automatic":true}});
+        let mut backend = RuntimeSetupProbe::new(&[true, true], &[Some(true)]);
+        backend.commands_present = true;
+        backend.missing_commands = HashSet::from(["newuidmap", "newgidmap"]);
+        runtime_setup_with_backend(&mut settings, "worker", &backend)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.installs.lock().unwrap().as_slice(),
+            &[vec!["uidmap", "dbus-user-session"]]
+        );
+        assert_eq!(*backend.check_count.lock().unwrap(), 2);
+
+        let mut backend = RuntimeSetupProbe::new(&[true], &[]);
+        backend.commands_present = true;
+        backend.missing_commands = HashSet::from(["slirp4netns", "fuse-overlayfs"]);
+        runtime_setup_with_backend(&mut settings, "worker", &backend)
+            .await
+            .unwrap();
+        assert!(backend.installs.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_setup_rechecks_required_helpers_after_successful_package_install() {
+        let mut settings = json!({"execution":{"automatic":true}});
+        let mut backend = RuntimeSetupProbe::new(&[true, true], &[Some(true), Some(false)]);
+        backend.commands_present = true;
+        backend.missing_commands = HashSet::from(["newgidmap"]);
+        backend.installed_helpers_present = false;
+        let error = runtime_setup_with_backend(&mut settings, "worker", &backend)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("newuidmap or newgidmap is still unavailable"));
+        assert_eq!(settings["execution"]["automatic"], true);
+    }
+
+    #[tokio::test]
+    async fn runtime_setup_decline_or_install_failure_can_explicitly_disable_testing() {
+        for install_fails in [false, true] {
+            let mut settings = json!({"execution":{"automatic":true,"repositories":{"owner/repo":{}},"podman":"podman"}});
+            let mut backend = RuntimeSetupProbe::new(&[false], &[Some(install_fails), Some(true)]);
+            backend.install_fails = install_fails;
+            runtime_setup_with_backend(&mut settings, "worker", &backend)
+                .await
+                .unwrap();
+            assert_eq!(settings["execution"]["automatic"], false);
+            assert_eq!(settings["execution"]["repositories"], json!({}));
+            assert_eq!(settings["execution"]["podman"], "podman");
+            assert_eq!(
+                backend.installs.lock().unwrap().len(),
+                usize::from(install_fails)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_setup_cancellation_preserves_execution_authority() {
+        for commands_present in [false, true] {
+            let mut settings = json!({"execution":{"automatic":true}});
+            let original = settings.clone();
+            let mut backend = RuntimeSetupProbe::new(&[false], &[None]);
+            backend.commands_present = commands_present;
+            let error = runtime_setup_with_backend(&mut settings, "worker", &backend)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("Setup interrupted"));
+            assert_eq!(settings, original);
+            assert!(backend.installs.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_setup_does_not_install_over_custom_commands_or_on_unsupported_hosts() {
+        for custom in [false, true] {
+            let mut settings = json!({"execution":{"automatic":true}});
+            if custom {
+                settings["execution"]["podman"] = json!("/custom/podman");
+            }
+            let original = settings.clone();
+            let mut backend = RuntimeSetupProbe::new(&[false], &[Some(false)]);
+            backend.apt = custom;
+            let error = runtime_setup_with_backend(&mut settings, "worker", &backend)
+                .await
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("fixture rootless prerequisite failed"));
+            assert!(error.to_string().contains("Runtime setup is incomplete"));
+            assert_eq!(settings, original);
+            assert!(backend.installs.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_setup_does_not_report_success_when_installed_podman_is_unusable() {
+        let mut settings = json!({"execution":{"automatic":true}});
+        let backend = RuntimeSetupProbe::new(&[false, false], &[Some(true), Some(false)]);
+        let error = runtime_setup_with_backend(&mut settings, "worker", &backend)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("fixture rootless prerequisite failed"));
+        assert_eq!(*backend.check_count.lock().unwrap(), 2);
+        assert_eq!(backend.installs.lock().unwrap().len(), 1);
+        assert_eq!(settings["execution"]["automatic"], true);
+    }
+    #[test]
     fn role_changes_keep_repository_and_unfinished_job_assignments() {
         let directory = tempfile::tempdir().unwrap();
         let config = json!({"role":"both","worker":{"id":"local"}});
@@ -2043,21 +2800,21 @@ mod tests {
             json!({"id":"model-id","model":"review-model","supportedReasoningEfforts":[{"reasoningEffort":"medium"},{"reasoningEffort":"high"}]}),
         ];
         assert!(
-            validate_model_selection(
+            crate::provider::validate_model_selection(
                 &models,
                 &json!({"model":"model-id","effort":"high"}),
                 "Review",
             )
             .is_err()
         );
-        validate_model_selection(
+        crate::provider::validate_model_selection(
             &models,
             &json!({"model":"review-model","effort":"medium"}),
             "Subagent",
         )
         .unwrap();
         assert!(
-            validate_model_selection(
+            crate::provider::validate_model_selection(
                 &models,
                 &json!({"model":"unknown","effort":"medium"}),
                 "Review"
@@ -2065,7 +2822,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            validate_model_selection(
+            crate::provider::validate_model_selection(
                 &models,
                 &json!({"model":"review-model","effort":"max"}),
                 "Review"
@@ -2073,8 +2830,12 @@ mod tests {
             .is_err()
         );
         assert!(
-            validate_model_selection(&models, &json!({"model":null,"effort":null}), "Review")
-                .is_err()
+            crate::provider::validate_model_selection(
+                &models,
+                &json!({"model":null,"effort":null}),
+                "Review"
+            )
+            .is_err()
         );
     }
 

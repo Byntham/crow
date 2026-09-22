@@ -1,7 +1,12 @@
-//! Remove only expired artifacts whose ownership is recorded by the service.
+//! Release terminal runtime snapshots and expire service-owned review evidence.
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
-use std::{collections::HashSet, fs, io::ErrorKind, path::Path};
+use std::{
+    collections::HashSet,
+    fs,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+};
 
 pub(crate) fn valid_id(id: &str) -> bool {
     !id.is_empty()
@@ -20,7 +25,7 @@ pub(crate) fn valid_session(id: &str) -> bool {
             }
         })
 }
-fn directory(path: &Path) -> Result<bool> {
+pub(crate) fn directory(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(m) if m.is_dir() && !m.file_type().is_symlink() => Ok(true),
         Ok(_) => bail!(
@@ -30,6 +35,84 @@ fn directory(path: &Path) -> Result<bool> {
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e.into()),
     }
+}
+pub(crate) fn experiments(root: &Path, id: &str) -> Result<Option<PathBuf>> {
+    if !valid_id(id) {
+        bail!("Invalid review ID for runtime cleanup");
+    }
+    let path = root.join("reviews").join(id).join("experiments");
+    for parent in [
+        root.to_owned(),
+        root.join("reviews"),
+        root.join("reviews").join(id),
+        path.clone(),
+    ] {
+        if !directory(&parent)? {
+            return Ok(None);
+        }
+    }
+    Ok(Some(path))
+}
+/// Share the same lock as MCP execution; cleanup must not remove a live workspace.
+pub(crate) fn execution_lock(path: &Path) -> Result<Option<Lock>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path.join("execution.lock"))?;
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(Some(Lock(file))),
+        Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+/// Explicit unlock also releases transient fork-inherited descriptor copies.
+/// Closing only the parent's descriptor can leave a flock held until another
+/// thread's newly spawned subprocess reaches exec and closes its copy.
+pub(crate) struct Lock(pub(crate) fs::File);
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+/// Release bulky snapshots as soon as a review is terminal, while preserving evidence.
+/// Callers must mark their locally active jobs as nonterminal until cancellation finishes.
+pub fn cleanup_runtime(root: &Path, jobs: &[Value]) -> Result<Value> {
+    let mut removed = vec![];
+    let mut warnings = vec![];
+    for job in jobs {
+        if !matches!(
+            job["state"].as_str(),
+            Some("completed" | "superseded" | "cancelled")
+        ) {
+            continue;
+        }
+        let Some(id) = job["id"].as_str().filter(|id| valid_id(id)) else {
+            continue;
+        };
+        let action = || -> Result<bool> {
+            let Some(path) = experiments(root, id)? else {
+                return Ok(false);
+            };
+            let Some(_lock) = execution_lock(&path)? else {
+                return Ok(false);
+            };
+            let environments = path.join("environments");
+            if !directory(&environments)? {
+                return Ok(false);
+            }
+            fs::remove_dir_all(environments)?;
+            Ok(true)
+        };
+        match action() {
+            Ok(true) => removed.push(id.to_owned()),
+            Ok(false) => (),
+            Err(error) => warnings.push(error.to_string()),
+        }
+    }
+    Ok(json!({"removed":removed,"warnings":warnings}))
 }
 fn session(job: &Value) -> Option<&str> {
     job["session"]
@@ -108,12 +191,13 @@ pub fn cleanup_at(root: &Path, jobs: &[Value], days: f64, now: f64) -> Result<Va
     if !days.is_finite() || days < 0.0 || !now.is_finite() || now < 0.0 {
         bail!("Retention days and current time must be finite nonnegative values");
     }
-    let mut warnings = vec![];
+    let runtime = cleanup_runtime(root, jobs)?;
+    let mut warnings: Vec<String> = serde_json::from_value(runtime["warnings"].clone())?;
     let mut removed = vec![];
     if !directory(root)? {
         return Ok(json!({"removed":removed,"warnings":warnings}));
     }
-    let expired: Vec<&Value> = jobs
+    let mut expired: Vec<&Value> = jobs
         .iter()
         .filter(|j| {
             valid_id(j["id"].as_str().unwrap_or(""))
@@ -126,6 +210,28 @@ pub fn cleanup_at(root: &Path, jobs: &[Value], days: f64, now: f64) -> Result<Va
                     .is_some_and(|t| t <= now - days * 86_400_000.0)
         })
         .collect();
+    // Also protect full evidence expiration against another local MCP process.
+    // Keep these locks until all corresponding directories have been removed.
+    let mut execution_locks = vec![];
+    expired.retain(|job| {
+        let id = job["id"].as_str().unwrap();
+        match experiments(root, id) {
+            Ok(Some(path)) => match execution_lock(&path) {
+                Ok(Some(lock)) => {
+                    execution_locks.push(lock);
+                    true
+                }
+                Ok(None) => false,
+                Err(error) => {
+                    warnings.push(error.to_string());
+                    false
+                }
+            },
+            // Existing retention can safely unlink invalid leaf paths without
+            // traversing them, and reports unsafe parents separately below.
+            Ok(None) | Err(_) => true,
+        }
+    });
     let expired_ids: HashSet<&str> = expired.iter().filter_map(|j| j["id"].as_str()).collect();
     let mut retained: HashSet<String> = jobs
         .iter()
@@ -213,6 +319,113 @@ mod tests {
         let p = root.join(path);
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(p, body).unwrap();
+    }
+    #[test]
+    fn finished_cleanup_unlocks_even_with_an_inherited_descriptor() {
+        let root = tempfile::tempdir().unwrap();
+        let lock = execution_lock(root.path()).unwrap().unwrap();
+        // dup shares the same open file description as an inherited fork fd.
+        let inherited = lock.0.try_clone().unwrap();
+        assert!(execution_lock(root.path()).unwrap().is_none());
+        drop(lock);
+        assert!(execution_lock(root.path()).unwrap().is_some());
+        drop(inherited);
+    }
+    #[test]
+    fn terminal_snapshots_are_released_while_evidence_and_live_work_survive() {
+        let root = tempfile::tempdir().unwrap();
+        let jobs: Vec<_> = [
+            ("done", "completed"),
+            ("cancelled", "cancelled"),
+            ("superseded", "superseded"),
+            ("paused", "paused"),
+            ("running", "reviewing"),
+            ("locked", "completed"),
+        ]
+        .into_iter()
+        .map(|(id, state)| {
+            file(
+                root.path(),
+                &format!("reviews/{id}/experiments/environments/snapshot.tar"),
+                "dependencies",
+            );
+            file(
+                root.path(),
+                &format!("reviews/{id}/experiments/receipt.json"),
+                "evidence",
+            );
+            file(
+                root.path(),
+                &format!("reviews/{id}/experiments/shot.png"),
+                "screenshot",
+            );
+            json!({"id":id,"state":state,"updatedAt":1000})
+        })
+        .collect();
+        let lock = execution_lock(&root.path().join("reviews/locked/experiments"))
+            .unwrap()
+            .unwrap();
+        let result = cleanup_runtime(root.path(), &jobs).unwrap();
+        assert_eq!(
+            result,
+            json!({"removed":["done","cancelled","superseded"],"warnings":[]})
+        );
+        let expired_locked = [json!({"id":"locked","state":"completed","updatedAt":0})];
+        assert_eq!(
+            cleanup_at(root.path(), &expired_locked, 0.0, 1.0).unwrap()["removed"],
+            json!([])
+        );
+        assert!(
+            root.path()
+                .join("reviews/locked/experiments/receipt.json")
+                .exists()
+        );
+        for job in &jobs {
+            let id = job["id"].as_str().unwrap();
+            let experiments = root.path().join(format!("reviews/{id}/experiments"));
+            assert!(experiments.join("receipt.json").exists());
+            assert!(experiments.join("shot.png").exists());
+            assert_eq!(
+                experiments.join("environments").exists(),
+                ["paused", "running", "locked"].contains(&id)
+            );
+        }
+        drop(lock);
+        assert_eq!(
+            cleanup_runtime(root.path(), &jobs).unwrap()["removed"],
+            json!(["locked"])
+        );
+    }
+    #[test]
+    fn runtime_cleanup_rejects_linked_snapshot_and_lock_paths() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        file(outside.path(), "valuable", "keep");
+        let dir = root.path().join("reviews/done/experiments");
+        fs::create_dir_all(&dir).unwrap();
+        symlink(outside.path(), dir.join("environments")).unwrap();
+        let jobs = [json!({"id":"done","state":"completed"})];
+        assert_eq!(
+            cleanup_runtime(root.path(), &jobs).unwrap()["warnings"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        fs::remove_file(dir.join("execution.lock")).unwrap();
+        symlink(outside.path().join("valuable"), dir.join("execution.lock")).unwrap();
+        assert_eq!(
+            cleanup_runtime(root.path(), &jobs).unwrap()["warnings"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            fs::read_to_string(outside.path().join("valuable")).unwrap(),
+            "keep"
+        );
     }
     #[test]
     fn only_terminal_owned_artifacts_expire() {

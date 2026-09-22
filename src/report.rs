@@ -219,7 +219,12 @@ pub fn report_body(job: &Value, history: &[Value], earlier_reviews: &[Value]) ->
     if lines.is_empty() {
         return Ok(body);
     }
-    let detailed = format!("\n{}", lines.join("\n"));
+    // Keep previous review links out of the primary report. They are context
+    // for someone investigating history, not current findings.
+    let detailed = format!(
+        "\n\n<details>\n<summary>Earlier review context</summary>\n\n{}\n\n</details>",
+        lines.join("\n")
+    );
     if units(&body) + units(&detailed) <= 60_000 {
         body.push_str(&detailed);
         return Ok(body);
@@ -232,7 +237,7 @@ pub fn report_body(job: &Value, history: &[Value], earlier_reviews: &[Value]) ->
         .filter(|s| !s.is_empty() && seen.insert(s.clone()))
         .collect();
     let compact = format!(
-        "\n\nEarlier reviews, findings not reassessed:\n{}",
+        "\n\n<details>\n<summary>Earlier review context</summary>\n\nEarlier reviews, findings not reassessed:\n{}\n\n</details>",
         urls.iter()
             .enumerate()
             .map(|(i, u)| format!("- [Earlier review {}]({u})", i + 1))
@@ -248,7 +253,7 @@ pub fn report_body(job: &Value, history: &[Value], earlier_reviews: &[Value]) ->
         .filter(|s| units(s) < 500)
         .map(|s| format!("[previous review]({s}) and "))
         .unwrap_or_default();
-    body.push_str(&format!("\n\nEarlier findings not reassessed. See the {previous}[PR review history]({root}/pull/{}).",job["number"]));
+    body.push_str(&format!("\n\n<details>\n<summary>Earlier review context</summary>\n\nEarlier findings not reassessed. See the {previous}[PR review history]({root}/pull/{}).\n\n</details>",job["number"]));
     Ok(body)
 }
 
@@ -374,6 +379,44 @@ mod tests {
         assert_eq!(metadata(&body).unwrap()["base"], job["comparison"]["base"]);
     }
     #[test]
+    fn publication_keeps_findings_visible_with_runtime_and_history_collapsed() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..12 {
+            crate::util::atomic(
+                &dir.path().join(format!("{index}.json")),
+                &json!({"phase":"test","revision":"head","status":"failed",
+                    "purpose":format!("Reproduction {index}"),"command":"cargo test"}),
+            )
+            .unwrap();
+        }
+        let mut job = job();
+        crate::execution::append_summary(&mut job["report"], dir.path()).unwrap();
+        let body = report_body(
+            &job,
+            &[json!({"id":"old","title":"Old finding","url":"https://example.com/finding"})],
+            &[json!({"html_url":"https://example.com/review"})],
+        )
+        .unwrap();
+        let (visible_overview, runtime) = body.split_once("<details>").unwrap();
+        let (runtime, after_runtime) = runtime.split_once("</details>").unwrap();
+        let (visible_findings, history) = after_runtime.split_once("<details>").unwrap();
+        assert!(visible_overview.contains("Test commands: 12 failed"));
+        assert!(!visible_overview.contains("Reproduction"));
+        assert!(runtime.contains("12 of 12 attempts"));
+        assert!(visible_findings.contains("Missing authorization"));
+        assert!(visible_findings.contains("Check the caller before reading."));
+        assert!(!visible_findings.contains("Old finding"));
+        assert!(history.contains("Earlier findings, not reassessed"));
+        assert!(history.contains("Old finding"));
+        assert!(history.contains("https://example.com/finding"));
+        assert!(history.contains("https://example.com/review"));
+        assert_eq!(body.matches("<details>").count(), 2);
+        assert_eq!(body.matches("</details>").count(), 2);
+        assert!(!body.contains("<details open"));
+        assert!(units(&body) <= 60_000);
+        assert_eq!(metadata(&body).unwrap()["head"], job["comparison"]["head"]);
+    }
+    #[test]
     fn inline_comments_only_cover_added_lines_without_prior_finding_duplicates() {
         let patch = "diff --git a/src/api.js b/src/api.js\n--- a/src/api.js\n+++ b/src/api.js\n@@ -1,2 +1,3 @@\n context\n+new\n tail\n";
         let r = report();
@@ -414,10 +457,15 @@ mod tests {
         assert!(body.contains(previous));
         assert!(body.contains("Missing authorization"));
         assert!(body.contains("Earlier reviews, findings not reassessed"));
+        assert_eq!(body.matches("<details>").count(), 1);
+        assert!(body.ends_with("</details>"));
+        assert!(body.find("Missing authorization").unwrap() < body.find("<details>").unwrap());
         let prior:Vec<_>=(0..2000).map(|i|json!({"url":format!("https://github.com/owner/project/pull/3#pullrequestreview-{i}")})).collect();
         let body = report_body(&job, &[], &prior).unwrap();
         assert!(units(&body) <= 60000);
         assert!(body.contains("pullrequestreview-1999"));
         assert!(body.contains("PR review history"));
+        assert_eq!(body.matches("<details>").count(), 1);
+        assert!(body.ends_with("</details>"));
     }
 }

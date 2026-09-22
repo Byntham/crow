@@ -247,7 +247,7 @@ fn activate(root: &Path, executable: &Path) -> Result<Activation> {
     }
     Ok(activation)
 }
-fn bin_directory() -> Result<PathBuf> {
+pub(crate) fn bin_directory() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("CROW_BIN_DIR").filter(|p| !p.is_empty()) {
         return absolute(Path::new(&path));
     }
@@ -813,11 +813,7 @@ pub async fn install_command(root: &Path, no_setup: bool) -> Result<()> {
         println!("{instruction}");
         return Ok(());
     }
-    let status = tokio::process::Command::new(executable)
-        .arg("setup")
-        .env_clear()
-        .envs(crate::util::host_env())
-        .env("CROW_HOME", absolute(root)?)
+    let status = setup_command(&executable, root, &bin)?
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -827,10 +823,45 @@ pub async fn install_command(root: &Path, no_setup: bool) -> Result<()> {
     Ok(())
 }
 
+fn setup_command(executable: &Path, root: &Path, bin: &Path) -> Result<tokio::process::Command> {
+    let mut command = tokio::process::Command::new(executable);
+    command
+        .arg("setup")
+        .env_clear()
+        .envs(crate::util::host_env())
+        .env("CROW_HOME", absolute(root)?)
+        .env("CROW_BIN_DIR", absolute(bin)?);
+    Ok(command)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use flate2::{Compression, write::GzEncoder};
+
+    #[tokio::test]
+    async fn setup_child_preserves_custom_installation_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("probe");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' \"$CROW_HOME\" \"$CROW_BIN_DIR\" \"$1\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = directory.path().join("custom state");
+        let bin = directory.path().join("custom commands");
+        let output = setup_command(&executable, &root, &bin)
+            .unwrap()
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{}\n{}\nsetup\n", root.display(), bin.display())
+        );
+    }
 
     fn archive(path: &Path, entries: &[(&str, &[u8], u8)]) {
         let writer = GzEncoder::new(File::create(path).unwrap(), Compression::fast());
@@ -1214,13 +1245,27 @@ mod tests {
     #[tokio::test]
     async fn version_check_bounds_output_and_requires_success() {
         let tmp = tempfile::tempdir().unwrap();
-        let executable = tmp.path().join("check");
-        fs::write(&executable, "#!/bin/sh\nprintf 'crow 1.2.3\\n'\n").unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
-        assert_eq!(executable_version(&executable).await.unwrap(), "crow 1.2.3");
-        fs::write(&executable, "#!/bin/sh\nprintf 'crow 1.2.3\\n'\nexit 1\n").unwrap();
-        assert!(executable_version(&executable).await.is_err());
-        fs::write(&executable, "#!/bin/sh\nhead -c 5000 /dev/zero\n").unwrap();
-        assert!(executable_version(&executable).await.is_err());
+        // Immutable script bytes avoid ETXTBSY when parallel tests fork while
+        // another thread has a freshly generated executable open for writing.
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/version-check.sh");
+        for name in ["success", "failure", "oversized"] {
+            std::os::unix::fs::symlink(&fixture, tmp.path().join(name)).unwrap();
+        }
+        assert_eq!(
+            executable_version(&tmp.path().join("success"))
+                .await
+                .unwrap(),
+            "crow 1.2.3"
+        );
+        assert!(
+            executable_version(&tmp.path().join("failure"))
+                .await
+                .is_err()
+        );
+        assert!(
+            executable_version(&tmp.path().join("oversized"))
+                .await
+                .is_err()
+        );
     }
 }
