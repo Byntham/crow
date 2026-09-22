@@ -544,9 +544,17 @@ exit 1
             && body.contains("timed out"),
         "{body}"
     );
-    assert!(body.contains("Check that total adds two numbers: **passed** (before this PR)"));
-    assert!(body.contains("Check that total adds two numbers: **failed** (PR version)"));
     let (visible, details) = body.split_once("<details>").unwrap();
+    assert!(!visible.contains("Check that total adds two numbers:"));
+    assert!(details.contains(
+        "Check that total adds two numbers: **failed** (PR version); **passed** (before this PR)."
+    ));
+    assert_eq!(
+        details
+            .matches("Check that total adds two numbers:")
+            .count(),
+        1
+    );
     assert!(!visible.contains("expected=5"));
     assert!(details.contains("expected=5"));
     assert!(!body.contains("| Command excerpt |"));
