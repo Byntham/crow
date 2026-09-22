@@ -873,14 +873,13 @@ fn cleanup(v: &Value) -> String {
             "Another runtime cleanup is running. Its results will appear in crow status.\n",
         );
     }
-    if v["cacheBytesRemoved"].is_number() {
+    if v["runtime"].is_object() {
         let _ = writeln!(
             out,
-            "Runtime cleanup removed {} containers, {} image tags, {} temporary files and {} cached bytes.",
+            "Runtime cleanup removed {} containers, {} image tags and {} temporary files.",
             list(&v["runtime"]["containers"]).len(),
             list(&v["runtime"]["images"]).len(),
-            v["runtime"]["temporaryFiles"].as_u64().unwrap_or(0),
-            v["cacheBytesRemoved"]
+            v["runtime"]["temporaryFiles"].as_u64().unwrap_or(0)
         );
     }
     warnings(&mut out, v);

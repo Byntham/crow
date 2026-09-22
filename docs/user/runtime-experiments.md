@@ -57,7 +57,7 @@ Identical preparations can be reused within the same review, at the same commit 
 
 Every new review, including one triggered by a PR update, installs dependencies in a fresh workspace. Package downloads, installed dependencies and build outputs are not shared across reviews. This prevents one review's writable package caches from changing what a later review installs. Crow handles installation automatically; users do not need to clear caches or provide new settings. Successful prepared environments remain reusable within the same review, so repeated experiments do not reinstall dependencies.
 
-The shared toolchain image remains reusable across reviews. Maintenance removes obsolete cross-review package and workspace caches left by earlier versions.
+The shared toolchain image remains reusable across reviews.
 
 Containers, services, browsers and temporary workspaces are removed after each experiment. After Crow saves and submits a valid report, it releases that review's prepared workspace snapshots. Completed, superseded and cancelled jobs also release snapshots during maintenance. Paused and active reviews retain them for resumption. Receipts, logs and screenshots follow the normal configurable seven-day review retention.
 
@@ -73,7 +73,13 @@ Runtime tests are selective. Execution is available by default unless the worker
 
 The main Crow status comment shows runtime testing separately from review progress. It reports disabled execution, a pending testing decision, environment setup, running tests, and final command counts. Setup attempts have their own counts. If the reviewer finishes without running a test command, the comment says so. If setup fails before any tests run, it reports that testing was blocked. Interrupted jobs never leave a command labelled as still running. MCP cancellation targets the active request, stops its runtime command and waits for cleanup; disconnecting the client also cancels active setup or tests.
 
-Counts come from saved execution receipts, not the model's description of its work. Workers send updates on their ten-second heartbeat; very short experiments may appear only as completed counts. The service updates the existing comment when those counts change. Counts include both base and head commands and unsuccessful investigation attempts, so a failed command does not itself mean the PR introduced a bug. The review explains what Crow checked, what it observed, and what it could not verify. Runtime commands have short purpose labels, so the report can say which behavior was checked on the PR version and before the PR. Setup and test outcomes are counted separately. Commands, commit IDs, exit codes and failure stages appear in an expandable diagnostics section instead of a wide table. These counts describe command attempts, not individual assertions or confirmed bugs. See [comment examples](../validation/runtime-status.md).
+Counts come from saved execution receipts, not the model's description of its work. Workers send updates on their ten-second heartbeat; very short experiments may appear only as completed counts. The service updates the existing comment when those counts change. Counts include both base and head commands and unsuccessful investigation attempts, so a failed command does not itself mean the PR introduced a bug. The review explains what Crow checked, what it observed, and what it could not verify. Runtime commands have short purpose labels, so the report can say which behavior was checked on the PR version and before the PR. Setup and test outcomes are counted separately. Commands, commit IDs, exit codes and failure stages appear in an expandable diagnostics section instead of a wide table. These counts describe command attempts, not individual assertions or confirmed bugs.
+
+For example, the main comment can report:
+
+> **Runtime testing:** Finished. Test commands: 2 passed, 1 failed. Setup attempts: 2 passed. Failed commands can include base failures and investigation attempts; see the review for confirmed bugs.
+
+The review explains the result in plain language, such as "The checkout smoke test passed before and after the change, but the screenshots show that the new graphic hides the payment label." A compact count stays visible; individual attempt outcomes and command diagnostics are collapsed underneath. A passed screenshot command can still reveal a visual bug.
 
 ## Visual investigations
 

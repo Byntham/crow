@@ -1,4 +1,0 @@
-FROM docker.io/library/alpine:3.22
-RUN apk add --no-cache chromium nodejs npm font-dejavu
-RUN mkdir -p /opt/browser && cd /opt/browser && npm install --ignore-scripts --no-audit --no-fund playwright-core@1.58.2
-ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium

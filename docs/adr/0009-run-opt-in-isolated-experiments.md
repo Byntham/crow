@@ -17,4 +17,4 @@ The main reviewer runs experiments serially. Subagents remain inspection-only. D
 
 Cancellation removes the container, and a runtime deadline remains in force if Crow exits abruptly. Interrupted work is recorded as incomplete and cleaned up on the next tool call. There is no automatic retry of an experiment. The reviewer may make another attempt within the remaining budget.
 
-See [configuration and limitations](../user/runtime-experiments.md) and [validation](../design/runtime-experiments.md).
+See [configuration and limitations](../user/runtime-experiments.md) and [design](../design/runtime-experiments.md) and [validation](../maintainer/runtime-validation.md).

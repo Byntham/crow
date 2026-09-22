@@ -254,7 +254,6 @@ async fn pair_and_combined_cleanup_each_emit_one_json_document() -> Result<()> {
     assert_eq!(cleanup["service"], json!({"jobs": 4, "events": 2}));
     assert_eq!(cleanup["worker"]["removed"], json!([]));
     assert_eq!(cleanup["worker"]["warnings"], json!([]));
-    assert_eq!(cleanup["worker"]["cacheBytesRemoved"], 0);
     assert_eq!(cleanup["worker"]["runtime"]["containers"], json!([]));
     Ok(())
 }
