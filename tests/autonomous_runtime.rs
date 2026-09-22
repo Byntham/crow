@@ -379,11 +379,6 @@ checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
     )
     .await;
     assert_eq!(setup["status"], "passed", "{setup}");
-    assert!(setup["packageCacheKey"].is_null(), "{setup}");
-    assert!(
-        !setup["packageCacheRestored"].as_bool().unwrap_or(false),
-        "{setup}"
-    );
     let tested=call(&exec,"run_experiment",json!({"revision":"head","environment":setup["id"],"command":"rustc --version && cargo --version && node --version && python3 --version && node -e \"require('node:assert/strict').ok(Number(process.versions.node.split('.')[0]) >= 24)\" && cargo test --offline && GOPROXY=off go test ./..."})).await;
     assert_eq!(tested["status"], "passed", "{tested}");
     let output = tested["stdout"].as_str().unwrap();
@@ -398,18 +393,11 @@ checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
             "Missing toolchain evidence {marker}: {tested}"
         );
     }
-    assert!(setup["cacheSaveError"].is_null(), "{setup}");
     let second = Execution::from_context(&context, &dir.path().join("next-review"))
         .unwrap()
         .unwrap();
     let fresh = call(&second,"prepare_environment",json!({"revision":"head","setup":"test ! -e .crow-home/.cargo && test ! -e .crow-home/go/pkg/mod/cache/download && echo 'NEXT_REVIEW_HAS_NO_CARGO_OR_GO_CACHE' && cargo fetch --locked && go mod download all"})).await;
     assert_eq!(fresh["status"], "passed", "{fresh}");
-    assert!(fresh["packageCacheKey"].is_null(), "{fresh}");
-    assert!(
-        !fresh["packageCacheRestored"].as_bool().unwrap_or(false),
-        "{fresh}"
-    );
-    assert!(fresh["packageCache"].is_null(), "{fresh}");
     assert!(
         fresh["stdout"]
             .as_str()
@@ -561,8 +549,6 @@ async fn updated_pr_installs_fresh_dependencies_and_releases_finished_workspaces
         .unwrap();
     let initial = call(&exec,"prepare_environment",json!({"revision":"head","setup":"npm ci --no-audit --no-fund && printf 'must not be shared' > generated-output.txt"})).await;
     assert_eq!(initial["status"], "passed", "{initial}");
-    assert!(initial["cacheSaveError"].is_null(), "{initial}");
-    assert_ne!(initial["packageCacheRestored"], true, "{initial}");
     std::fs::write(repo.join("value.txt"), "updated commit\n").unwrap();
     git(
         &repo,
@@ -577,8 +563,6 @@ async fn updated_pr_installs_fresh_dependencies_and_releases_finished_workspaces
         .unwrap();
     let fresh = call(&next,"prepare_environment",json!({"revision":"head","setup":"test ! -e generated-output.txt && test ! -e node_modules && test ! -e .crow-home/.npm && test \"$(cat value.txt)\" = 'updated commit' && echo NEXT_REVIEW_STARTED_CLEAN && npm ci --no-audit --no-fund"})).await;
     assert_eq!(fresh["status"], "passed", "{fresh}");
-    assert!(fresh["packageCacheKey"].is_null(), "{fresh}");
-    assert_ne!(fresh["packageCacheRestored"], true, "{fresh}");
     assert!(
         fresh["stdout"]
             .as_str()

@@ -98,16 +98,13 @@ impl Progress {
                     .values()
                     .map(|n| u64::from(*n))
                     .sum::<u64>()
-                    <= total * 6
+                    <= total * 4
                 && (progress.active_stage.is_none()
                     || progress.setup.running + progress.tests.running > 0)
-                && progress.warnings.keys().all(|stage| matches!(
-                    stage,
-                    Stage::Cleanup
-                        | Stage::ArtifactCollection
-                        | Stage::CacheRestore
-                        | Stage::CacheSave
-                )),
+                && progress
+                    .warnings
+                    .keys()
+                    .all(|stage| matches!(stage, Stage::Cleanup | Stage::ArtifactCollection)),
             "Invalid runtime diagnostics"
         );
         Ok(progress)
@@ -325,27 +322,25 @@ mod tests {
     }
 
     #[test]
-    fn cache_warnings_remain_visible_and_recovered_cleanup_is_cleared() {
+    fn artifact_warnings_remain_visible_and_recovered_cleanup_is_cleared() {
         let temp = tempfile::tempdir().unwrap();
         let job =
             json!({"id":"job1","repo":"owner/repo","settings":{"execution":{"automatic":true}}});
         let path = temp.path().join("reviews/job1/experiments/one.json");
         let mut receipt = json!({"phase":"setup","status":"passed",
-            "cacheRestoreError":"private restore detail", "cacheSaveError":"private save detail",
             "cleanupError":"private cleanup detail", "artifacts":[{"saved":false},{"saved":false},{"saved":false}]});
         crate::util::atomic(&path, &receipt).unwrap();
         let progress = Progress::read(temp.path(), &job).unwrap();
-        assert_eq!(progress.warnings.values().sum::<u32>(), 6);
+        assert_eq!(progress.warnings.values().sum::<u32>(), 4);
         let text = progress.render(false);
-        assert!(text.contains("dependency cache restore"));
-        assert!(text.contains("dependency cache save"));
+        assert!(text.contains("screenshot collection"));
         assert!(text.contains("container cleanup"));
         assert!(!text.contains("private"));
         receipt["cleanupRecoveredAt"] = json!("2026-09-18T00:00:00Z");
         crate::util::atomic(&path, &receipt).unwrap();
         let recovered = Progress::read(temp.path(), &job).unwrap();
-        assert_eq!(recovered.warnings.values().sum::<u32>(), 5);
+        assert_eq!(recovered.warnings.values().sum::<u32>(), 3);
         assert!(!recovered.render(false).contains("container cleanup"));
-        assert!(recovered.render(false).contains("dependency cache save"));
+        assert!(recovered.render(false).contains("screenshot collection"));
     }
 }

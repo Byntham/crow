@@ -303,7 +303,6 @@ async fn failed_setup_and_incomplete_required_snapshot_never_become_usable_envir
         assert_eq!(result["status"], status, "{result}");
         assert_eq!(result["failureStage"], stage, "{result}");
         assert!(!fixture.snapshot(&result).exists());
-        assert!(result.get("cacheSaveError").is_none());
         assert!(
             fixture
                 .execution

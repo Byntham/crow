@@ -20,7 +20,6 @@ pub enum Stage {
     TestCommand,
     SnapshotExport,
     ArtifactCollection,
-    CacheSave,
     Cleanup,
 }
 
@@ -29,7 +28,7 @@ impl Stage {
         match self {
             Self::RuntimeCheck => "runtime availability check",
             Self::ImageProvision => "toolchain image preparation",
-            Self::CacheRestore => "dependency cache restore",
+            Self::CacheRestore => "prepared environment reuse",
             Self::SourceArchive => "source archive creation",
             Self::GatewayStart => "package gateway startup",
             Self::ContainerStart => "container startup",
@@ -39,7 +38,6 @@ impl Stage {
             Self::TestCommand => "test command",
             Self::SnapshotExport => "prepared environment export",
             Self::ArtifactCollection => "screenshot collection",
-            Self::CacheSave => "dependency cache save",
             Self::Cleanup => "container cleanup",
         }
     }
@@ -109,14 +107,6 @@ pub fn warnings(record: &Value) -> BTreeMap<Stage, u32> {
     let mut warnings = BTreeMap::new();
     if record.get("cleanupError").is_some() && record.get("cleanupRecoveredAt").is_none() {
         warnings.insert(Stage::Cleanup, 1);
-    }
-    for (field, stage) in [
-        ("cacheRestoreError", Stage::CacheRestore),
-        ("cacheSaveError", Stage::CacheSave),
-    ] {
-        if record.get(field).is_some() {
-            warnings.insert(stage, 1);
-        }
     }
     if let Some(artifacts) = record["artifacts"].as_array() {
         for artifact in artifacts.iter().take(3) {

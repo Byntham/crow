@@ -1578,20 +1578,21 @@ mod tests {
     fn receipt_warnings_are_visible_bounded_and_exclude_private_errors() {
         let dir = tempfile::tempdir().unwrap();
         for n in 0..50 {
-            crate::util::atomic(&dir.path().join(format!("{n}.json")), &json!({
-                "commit":"a".repeat(40), "phase":"setup", "status":"passed", "exitCode":0,
-                "command":"|".repeat(16000), "cleanupError":"private cleanup detail",
-                "cacheRestoreError":"private cache detail", "cacheSaveError":"private cache detail",
-                "artifacts":[{"saved":false,"error":"private artifact detail"}]
-            })).unwrap();
+            crate::util::atomic(
+                &dir.path().join(format!("{n}.json")),
+                &json!({
+                    "commit":"a".repeat(40), "phase":"setup", "status":"passed", "exitCode":0,
+                    "command":"|".repeat(16000), "cleanupError":"private cleanup detail",
+                    "artifacts":[{"saved":false,"error":"private artifact detail"}]
+                }),
+            )
+            .unwrap();
         }
         let mut report = json!({"summary":"x".repeat(8000),"findings":[]});
         append_summary(&mut report, dir.path()).unwrap();
         crate::report::validate_report(&report).unwrap();
         let summary = report["summary"].as_str().unwrap();
         assert!(summary.contains("50 passed"));
-        assert!(summary.contains("dependency cache restore"));
-        assert!(summary.contains("dependency cache save"));
         assert!(summary.contains("screenshot collection"));
         assert!(summary.contains("container cleanup"));
         assert!(!summary.contains("private"));
