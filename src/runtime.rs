@@ -548,19 +548,31 @@ fn node_setup(
     };
     let version = pinned.map(|(_, version)| version);
     let (runner, install) = node_manager_commands(manager, version);
-    let arguments = match manager {
-        "pnpm" => "install --frozen-lockfile",
+    let (environment, arguments) = match manager {
+        // pnpm enables frozen lockfiles by default when CI=true. Explicitly
+        // disable that default when discovery found no matching lockfile.
+        "pnpm" if pnpm_lock => ("", "install --frozen-lockfile"),
+        "pnpm" => ("", "install --no-frozen-lockfile"),
         "yarn" if version.is_some_and(|v| !v.starts_with("1.") && !v.starts_with("0.")) => {
-            "install --immutable"
+            // Modern Yarn also defaults to immutable installs in CI. The
+            // environment setting is supported by Yarn 2+ and keeps the
+            // no-lockfile candidate usable without weakening locked installs.
+            if yarn_lock {
+                ("", "install --immutable")
+            } else {
+                ("YARN_ENABLE_IMMUTABLE_INSTALLS=false ", "install")
+            }
         }
-        "yarn" => "install --frozen-lockfile",
-        _ if npm_lock => "ci --no-audit --no-fund",
-        _ => "install --no-audit --no-fund",
+        "yarn" if yarn_lock => ("", "install --frozen-lockfile"),
+        // Yarn Classic does not enable frozen lockfiles from CI=true.
+        "yarn" => ("", "install"),
+        _ if npm_lock => ("", "ci --no-audit --no-fund"),
+        _ => ("", "install --no-audit --no-fund"),
     };
     let setup = if install.is_empty() {
-        format!("{runner} {arguments}")
+        format!("{environment}{runner} {arguments}")
     } else {
-        format!("{install} && {runner} {arguments}")
+        format!("{install} && {environment}{runner} {arguments}")
     };
     (setup, runner, warning)
 }
@@ -1151,11 +1163,15 @@ mod discovery_tests {
             ("npm@10.9.0", "npm@10.9.0", "ci --no-audit"),
             ("pnpm@10.0.0-rc.1", "pnpm@10.0.0-rc.1", "--frozen-lockfile"),
         ] {
-            let (setup, runner, warning) =
-                node_setup(&json!({"packageManager":declaration}), false, false, true);
+            let (manager, version) = pinned_manager(declaration).unwrap();
+            let (setup, runner, warning) = node_setup(
+                &json!({"packageManager":declaration}),
+                manager == "pnpm",
+                manager == "yarn",
+                manager == "npm",
+            );
             assert!(setup.contains(package), "{setup}");
             assert!(setup.contains(flag), "{setup}");
-            let (manager, version) = pinned_manager(declaration).unwrap();
             let prefix = format!(
                 "/workspace/.crow-tools/{manager}/{}",
                 fingerprint(&[manager, version])
@@ -1193,6 +1209,30 @@ mod discovery_tests {
                 node_setup(&json!({"packageManager":declaration}), false, false, true);
             assert_eq!(setup, "npm ci --no-audit --no-fund");
             assert!(warning.is_some());
+        }
+    }
+
+    #[test]
+    fn pinned_manager_install_strictness_requires_its_own_lockfile() {
+        for declaration in ["pnpm@9.15.4", "yarn@1.22.22", "yarn@4.9.2", "npm@10.9.0"] {
+            for locks in 0..8 {
+                let (pnpm, yarn, npm) = (locks & 1 != 0, locks & 2 != 0, locks & 4 != 0);
+                let (setup, runner, _) =
+                    node_setup(&json!({"packageManager":declaration}), pnpm, yarn, npm);
+                let expected = match declaration {
+                    "pnpm@9.15.4" if pnpm => format!("{runner} install --frozen-lockfile"),
+                    "pnpm@9.15.4" => format!("{runner} install --no-frozen-lockfile"),
+                    "yarn@1.22.22" if yarn => format!("{runner} install --frozen-lockfile"),
+                    "yarn@4.9.2" if yarn => format!("{runner} install --immutable"),
+                    "yarn@4.9.2" => {
+                        format!("YARN_ENABLE_IMMUTABLE_INSTALLS=false {runner} install")
+                    }
+                    "yarn@1.22.22" => format!("{runner} install"),
+                    _ if npm => format!("{runner} ci --no-audit --no-fund"),
+                    _ => format!("{runner} install --no-audit --no-fund"),
+                };
+                assert_eq!(setup.split_once(" && ").unwrap().1, expected);
+            }
         }
     }
 

@@ -510,6 +510,108 @@ async fn discovered_pinned_managers_and_nested_commands_run_offline() {
 
 #[tokio::test]
 #[ignore = "requires rootless Podman, the managed toolchain and public npm registry access"]
+async fn discovered_pinned_managers_install_without_lockfiles_in_ci() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(".crow-data/autonomous-runtime-test");
+    std::fs::create_dir_all(&root).unwrap();
+    for (manager, version, lockfile) in [
+        ("pnpm", "9.15.4", "pnpm-lock.yaml"),
+        ("yarn", "1.22.22", "yarn.lock"),
+        ("yarn", "4.9.2", "yarn.lock"),
+    ] {
+        let temp = tempfile::tempdir_in(&root).unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        std::fs::write(
+            repo.join("package.json"),
+            json!({
+                "name":"crow-no-lock-fixture","version":"1.0.0","private":true,
+                "packageManager":format!("{manager}@{version}"),
+                "dependencies":{"is-number":"7.0.0"},
+                "scripts":{"test":"node test.cjs"}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("test.cjs"),
+            format!(
+                r#"const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const {{execFileSync}} = require('node:child_process');
+assert.equal(process.env.CI, 'true');
+assert.equal(process.env.YARN_ENABLE_IMMUTABLE_INSTALLS, undefined);
+assert.equal(execFileSync('{manager}', ['--version'], {{encoding:'utf8'}}).trim(), '{version}');
+assert.equal(require('is-number')('42'), true);
+assert.equal(require('is-number')('not a number'), false);
+assert(fs.readFileSync('{lockfile}', 'utf8').includes('is-number'));
+console.log('generated {lockfile} and used dependency offline with {manager}@{version}');
+"#
+            ),
+        )
+        .unwrap();
+        if version == "4.9.2" {
+            // Preserve downloaded PnP dependencies inside the prepared snapshot.
+            std::fs::write(repo.join(".yarnrc.yml"), "enableGlobalCache: false\n").unwrap();
+        }
+        git(&repo, &["add", "."]);
+        git(
+            &repo,
+            &["commit", "-m", "pinned manager without a lockfile"],
+        );
+        assert!(!repo.join(lockfile).exists());
+        let commit = git(&repo, &["rev-parse", "HEAD"]);
+        let config = json!({
+            "podman":std::env::var("CROW_TEST_PODMAN").unwrap_or("podman".into()),
+            "automatic":true
+        });
+        let context = json!({
+            "root":root,"job":{"repo":"fixture/discovery-no-lock","settings":{"execution":config}},
+            "source":{"dir":repo,"head":commit,"base":commit}
+        });
+        let exec = Execution::from_context(&context, &temp.path().join("experiments"))
+            .unwrap()
+            .unwrap();
+        let found = call(&exec, "discover_environment", json!({"revision":"head"})).await;
+        let project = &found["projects"][0];
+        assert!(project["warning"].is_null(), "{project}");
+        let setup = call(
+            &exec,
+            "prepare_environment",
+            json!({"revision":"head","setup":format!(
+                "test \"$CI\" = true && test ! -e {lockfile} && {} && test -s {lockfile}",
+                project["setup"].as_str().unwrap()
+            )}),
+        )
+        .await;
+        assert_eq!(
+            setup["status"], "passed",
+            "{manager}@{version} setup: {setup}"
+        );
+        let result = call(
+            &exec,
+            "run_experiment",
+            json!({"revision":"head","environment":setup["id"],"command":project["test"]}),
+        )
+        .await;
+        assert_eq!(
+            result["status"], "passed",
+            "{manager}@{version} test: {result}"
+        );
+        assert!(
+            result["stdout"].as_str().unwrap().contains(&format!(
+                "generated {lockfile} and used dependency offline with {manager}@{version}"
+            )),
+            "{result}"
+        );
+        println!(
+            "Discovered {manager}@{version} installed with CI=true and no lockfile; its generated lock and dependency survived the prepared snapshot."
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires rootless Podman, the managed toolchain and public npm registry access"]
 async fn discovered_projects_keep_distinct_manager_versions_in_one_environment() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(".crow-data/autonomous-runtime-test");
     std::fs::create_dir_all(&root).unwrap();

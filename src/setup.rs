@@ -1314,6 +1314,14 @@ pub async fn validate_models(config: &Value, root: &Path, worker: &Value) -> Res
     Ok(())
 }
 
+async fn save_setup_listener(root: &Path, config: &Value) -> Result<()> {
+    // Keep the previous connection settings usable when the proposed listener
+    // is unavailable. Check before persisting the new port or role.
+    config::validate_config(config)?;
+    preflight_listener(config).await?;
+    config::save(root, config)
+}
+
 // Run before ingress creation so an occupied default port does not leave a
 // saved external route that then prevents the user selecting another port.
 async fn preflight_listener(config: &Value) -> Result<()> {
@@ -1450,8 +1458,7 @@ pub async fn setup(root: &Path, options: &Value) -> Result<()> {
     }
     config["role"] = json!(role);
     apply_setup_port(&mut config, options.get("port").filter(|v| !v.is_null()))?;
-    config::save(root, &config)?;
-    preflight_listener(&config).await?;
+    save_setup_listener(root, &config).await?;
     ensure_runtime_prerequisites(&mut config, &role, root).await?;
     preflight_systemd("systemctl").await?;
     let mut identity = Value::Null;
@@ -1810,6 +1817,40 @@ async fn ensure_codex_capabilities(config: &mut Value, root: &Path) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_listener_setup_preserves_saved_connection_settings() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("config.json");
+        let original = config::defaults(root.path());
+        config::save(root.path(), &original).unwrap();
+        let saved = std::fs::read(&file).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut proposed = original.clone();
+        proposed["role"] = json!("service");
+        apply_setup_port(
+            &mut proposed,
+            Some(&json!(listener.local_addr().unwrap().port())),
+        )
+        .unwrap();
+        let error = save_setup_listener(root.path(), &proposed)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("crow setup --port PORT"), "{error}");
+        assert_eq!(std::fs::read(&file).unwrap(), saved);
+        assert_eq!(config::load(root.path()).unwrap(), original);
+
+        // A failed first setup should not create unusable connection settings.
+        let fresh = tempfile::tempdir().unwrap();
+        assert!(save_setup_listener(fresh.path(), &proposed).await.is_err());
+        assert!(!fresh.path().join("config.json").exists());
+
+        // Worker-only setup has no local listener, even if that port is busy.
+        proposed["role"] = json!("worker");
+        save_setup_listener(root.path(), &proposed).await.unwrap();
+        assert_eq!(config::load(root.path()).unwrap(), proposed);
+    }
 
     #[tokio::test]
     async fn listener_preflight_rejects_foreign_ports_before_route_creation() {
