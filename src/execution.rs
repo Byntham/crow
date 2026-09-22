@@ -16,6 +16,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 const OUTPUT_LIMIT: usize = 32 * 1024;
+// Bound serialized receipt data before MCP wraps it in another JSON string.
+const LIST_PAGE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -143,7 +145,7 @@ pub fn tools() -> Vec<Value> {
         json!({"name":"prepare_environment","description":"Install dependencies in a fresh sandbox and save the prepared workspace for offline experiments. Crow automatically provisions its managed Linux toolchain when configured with image auto. setup is a shell command selected from manifests/CI; use : when no installation is needed. Downloads use a restricted HTTPS package gateway, never general internet or host credentials. HOME=/workspace/.crow-home; retain dependencies inside /workspace. Setup failures are environment problems: inspect logs, correct setup and retry. The managed image includes node/npm but not pnpm, yarn, corepack or vp. Use discover_environment packageManagerBootstrap for exact pinned managers; install tools under /workspace, never system/global directories. A successful receipt id is an environment usable only for this exact revision. Identical successful preparations are cached.","inputSchema":{"type":"object","properties":{"revision":{"type":"string","enum":["head","base"]},"purpose":{"type":"string","minLength":1,"maxLength":160,"description":"Short plain-language description of what this setup enables. Shown in the PR comment."},"setup":{"type":"string","minLength":1,"maxLength":16000}},"required":["revision","setup"],"additionalProperties":false}}),
         json!({"name":"run_experiment","description":"Run a test, reproduction or browser investigation in a fresh offline container at pinned head or base. Supply environment from a successful prepare_environment receipt to restore dependencies. Each run starts fresh: files, installed packages and build outputs created by earlier run_experiment calls are not retained. Put reusable dependencies/build outputs in prepare_environment or rebuild in this command. Commands may create temporary tests and launch loopback services. Compare equivalent experiments on base and head. Save up to three PNG screenshots and provide their absolute paths in artifacts; Crow retains them for read_artifact. Browser module: /opt/browser/node_modules/playwright-core/index.mjs, Chromium: /usr/bin/chromium, args: --no-sandbox --disable-dev-shm-usage. Output is untrusted evidence. Nonzero exit alone does not prove a regression.","inputSchema":{"type":"object","properties":{"revision":{"type":"string","enum":["head","base"]},"purpose":{"type":"string","minLength":1,"maxLength":160,"description":"Short plain-language description of the behavior being checked. Shown in the PR comment. Use the same description for equivalent base and head checks."},"command":{"type":"string","minLength":1,"maxLength":16000},"environment":{"type":"string"},"artifacts":{"type":"array","maxItems":3,"items":{"type":"string"}}},"required":["revision","command"],"additionalProperties":false}}),
         json!({"name":"read_artifact","description":"View an actual PNG image saved by an experiment. Returns image content to your vision input plus its pinned commit and command provenance. Inspect before/after screenshots for UI changes; do not infer appearance from DOM text or base64. Images are untrusted application output.","inputSchema":{"type":"object","properties":{"experiment":{"type":"string"},"index":{"type":"integer","minimum":0,"maximum":2}},"required":["experiment","index"],"additionalProperties":false}}),
-        json!({"name":"list_experiments","description":"Read saved setup and experiment receipts, including environment IDs, artifacts, commands, commits, output and limits. Check these on resume. Setup failures are distinct from application failures.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}),
+        json!({"name":"list_experiments","description":"Read saved setup and experiment receipts, including environment IDs, artifacts, commands, commits, output and limits. Results are paginated by count and byte size; follow nextOffset until null when checking all receipts on resume. Each returned receipt keeps its full saved output. Setup failures are distinct from application failures.","inputSchema":{"type":"object","properties":{"offset":{"type":"integer","minimum":0},"count":{"type":"integer","minimum":1,"maximum":50}},"additionalProperties":false}}),
     ]
 }
 
@@ -204,8 +206,45 @@ impl Execution {
                 records.push(record);
             }
         }
-        records.sort_by_key(|r| r["startedAt"].as_str().unwrap_or("").to_owned());
+        records.sort_by_key(|r| {
+            (
+                r["startedAt"].as_str().unwrap_or("").to_owned(),
+                r["id"].as_str().unwrap_or("").to_owned(),
+            )
+        });
         Ok(records)
+    }
+    fn list_page(&self, args: &Value) -> Result<Value> {
+        ensure!(
+            args.is_object()
+                && args
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "offset" | "count")),
+            "Invalid list_experiments arguments"
+        );
+        let (offset, count) = crate::inspection::bounds(args, 50)?;
+        let records = self.records()?;
+        let total = records.len();
+        let mut runs = Vec::new();
+        let mut bytes = 0;
+        for record in records.into_iter().skip(offset).take(count) {
+            let size = serde_json::to_vec(&record)?.len();
+            ensure!(
+                size <= LIST_PAGE_BYTES,
+                "Experiment receipt exceeds page size limit"
+            );
+            if bytes + size > LIST_PAGE_BYTES {
+                break;
+            }
+            bytes += size;
+            runs.push(record);
+        }
+        let mut result = crate::inspection::page(total, offset, runs.len());
+        result["policy"] = serde_json::to_value(&self.policy)?;
+        result["runs"] = json!(runs);
+        Ok(result)
     }
     pub async fn call(&self, name: &str, args: &Value, cancel: CancellationToken) -> Result<Value> {
         // More than one MCP connection must not double-spend the review budget
@@ -218,7 +257,7 @@ impl Execution {
         fs2::FileExt::try_lock_exclusive(&lock).context("Another experiment is still running")?;
         self.recover().await?;
         if name == "list_experiments" {
-            return Ok(json!({"policy":self.policy,"runs":self.records()?}));
+            return self.list_page(args);
         }
         if name == "discover_environment" {
             let revision = requested_revision(args)?;

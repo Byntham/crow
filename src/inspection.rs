@@ -507,7 +507,7 @@ fn json_integer(value: &Value) -> Option<u64> {
         .filter(|v| v.is_finite() && v.fract() == 0.0 && *v >= 0.0 && *v <= 9_007_199_254_740_991.0)
         .map(|v| v as u64)
 }
-fn bounds(args: &Value, maximum: usize) -> Result<(usize, usize)> {
+pub(crate) fn bounds(args: &Value, maximum: usize) -> Result<(usize, usize)> {
     let offset = args
         .get("offset")
         .filter(|v| !v.is_null())
@@ -526,7 +526,7 @@ fn bounds(args: &Value, maximum: usize) -> Result<(usize, usize)> {
     );
     Ok((usize::try_from(offset)?, count as usize))
 }
-fn page(total: usize, offset: usize, count: usize) -> Value {
+pub(crate) fn page(total: usize, offset: usize, count: usize) -> Value {
     let next = offset.saturating_add(count);
     let more = next < total;
     json!({"offset":offset,"total":total,"nextOffset":if more {Some(next)} else {None},"truncated":more})
