@@ -4,7 +4,7 @@ Crow's main reviewer can discover project setup, prepare dependencies, run focus
 
 ## Execution and evidence
 
-`runtime.rs` reads manifests from pinned Git objects and suggests setup/test commands. The reviewer checks these against project documentation and CI. Crow builds its embedded managed image, never a repository Dockerfile. Custom immutable local images remain supported.
+`runtime.rs` reads manifests from pinned Git objects and suggests setup/test commands. The reviewer checks these against project documentation and CI. Crow builds its embedded managed image, never a repository Dockerfile. This trusted toolchain bootstrap uses Podman's normal build network; only subsequent project dependency setup uses the restricted gateway. Custom immutable local images support preprovisioned, offline operation.
 
 `execution.rs` owns authorization, budgets, rootless Podman containers and durable receipts. A file lock serializes runtime calls across MCP connections and resumes. Each attempt starts with a receipt and counts against the review limit, including failures. `runtime_diagnostics.rs` records stages and separates command failures from artifact or cleanup warnings. Bounded logs retain both their beginning and end. `runtime_status.rs` derives public progress from receipts; detailed errors stay on the worker.
 

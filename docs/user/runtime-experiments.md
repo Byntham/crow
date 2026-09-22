@@ -21,6 +21,8 @@ To re-enable it, set `worker.execution` to `{"automatic":true}` and rerun `crow 
 
 No image IDs, test commands, or new budget settings are required. Crow provisions a shared toolchain image itself. It currently contains Node/npm, Python/pip, Rust/Cargo, Go, C/C++ build tools, Chromium/Playwright, SQLite and PostgreSQL tools. The image is based on Alpine 3.23, whose stock packages provide Rust 1.91 and Node 24 while retaining Python 3.12. Package patch versions can change when the image is rebuilt. Projects requiring other versions or platforms may still need a custom image. Repository Dockerfiles are evidence for setup, never instructions to execute on the host.
 
+First-use toolchain provisioning uses Podman's normal build network to fetch Crow's fixed Alpine and npm inputs. It does not use the project download gateway or include repository files. Operators requiring offline provisioning must preload an image and configure its immutable ID below. The restricted gateway applies to project dependency setup; tests run offline.
+
 To restrict runtime testing to selected repositories with automatic images:
 
 ```sh
