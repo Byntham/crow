@@ -1,6 +1,6 @@
 # Crow
 
-Crow reviews GitHub pull requests on your own Linux machine, using your Codex (ChatGPT) or Claude Code (Claude) subscription. It responds on GitHub with advisory inline findings and a summary intended for coding agents.
+Crow reviews GitHub pull requests on your own Linux machine, using your Codex (ChatGPT) or Claude Code (Claude) subscription. It keeps one updated comment on each PR with its advisory report, written for coding agents, and adds inline comments for new findings.
 
 Each operator runs an independent installation. There is no shared Crow backend, required Docker installation, Marketplace listing, or separately billed API-key fallback.
 

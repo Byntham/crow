@@ -18,7 +18,7 @@ Each worker uses one provider: Codex through `codex exec`, or Claude Code throug
 
 A newer PR revision supersedes an unfinished review of an older revision. Crow cancels obsolete work and queues the latest revision. Reports identify the commit actually reviewed.
 
-Reports contain inline findings and a short summary written primarily for coding agents. Findings explain the problem, triggering conditions, consequences, and supporting code evidence. A successful review without actionable findings says so explicitly.
+Reports contain findings and a short summary written primarily for coding agents. Each PR has one Crow comment holding its status and latest report, and new findings on added lines also get inline comments (ADR 0012). Findings explain the problem, triggering conditions, consequences, and supporting code evidence. A successful review without actionable findings says so explicitly.
 
 ## Model configuration
 
@@ -44,13 +44,13 @@ Startup and recovery catch-up are enabled by default and can be disabled. Repeat
 
 A completed review identifies its repository, PR, reviewed head commit, target branch, and comparison base. Advancing the head or changing the comparison requires another review. An unrelated target-branch commit that leaves the comparison unchanged does not alone require a rerun.
 
-Reports visibly identify the reviewed commit, target branch, and comparison base, with full revision identifiers in machine-readable completion metadata. Crow recognizes completion using its own authenticated published review records. Failed or cancelled attempts are not completed reviews; successful clean reviews are.
+Reports visibly identify the reviewed commit, target branch, and comparison base, with full revision identifiers in machine-readable completion metadata. Crow recognizes completion using the markers in its own authenticated PR comment and review records. Failed or cancelled attempts are not completed reviews; successful clean reviews are.
 
 Later summaries represent earlier findings through links rather than posting identical inline comments again. Omission from a new review must not imply that an earlier finding was fixed. A summary may identify a finding as still present or fixed when it has actually been reassessed; otherwise it must describe its current status as unverified. GitHub marking a comment outdated is not evidence of a fix.
 
-Keep this presentation brief. A label such as "Earlier findings not reassessed" with links is sufficient; repeated explanatory disclaimers are unnecessary.
+Keep this presentation brief. A count of earlier findings that were not rechecked, beside links to the earlier reviews, is sufficient; repeated explanatory disclaimers are unnecessary.
 
-This is a reporting requirement, not a requirement to supply all earlier findings to the model on every review. Crow preserves earlier GitHub comments and represents them in subsequent summaries so an agent reading the latest report does not mistake silence for resolution. Missing or unavailable history must not be silently interpreted as resolved findings. Each finding has a stable identifier derived from its path and title, and summaries link earlier findings that the new report does not repeat.
+This is a reporting requirement, not a requirement to supply all earlier findings to the model on every review. Crow preserves earlier GitHub comments and represents them in subsequent summaries so an agent reading the latest report does not mistake silence for resolution. Missing or unavailable history must not be silently interpreted as resolved findings. Each finding has a stable identifier derived from its path and title. The PR's Crow comment counts the earlier findings that the new report does not repeat, and each keeps its inline thread (ADR 0012).
 
 ## Review guidance
 
@@ -92,7 +92,7 @@ Crow retains paused review sessions while the PR remains open and the saved comp
 
 ## Operational visibility
 
-Review status is visible both on GitHub and on the worker's host. The first version uses one updatable status comment per PR, showing the relevant commit, current state, last-update time, and any action needed. States include reviewing, retrying, paused, and completed; completed status links to the published review. An incomplete review must not appear to be a successful review with no findings.
+Review status is visible both on GitHub and on the worker's host. Each PR has one updatable Crow comment. A completed review shows its report there; any other state shows its commit, what triggered it, and any action needed, with the latest published report folded below. States include reviewing, retrying, paused, and completed. An incomplete review must not appear to be a successful review with no findings.
 
 GitHub receives concise operational explanations. Detailed errors and diagnostic logs remain on the host. The connection service maintains the status comment so it can report worker disconnections even when the worker cannot update GitHub itself. Native GitHub checks are outside the initial scope; status comments preserve the advisory design without becoming required checks.
 
