@@ -1,6 +1,7 @@
 //! Read-only inspection of pinned Git objects. Reviewed files are never checked out.
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::Engine;
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -996,7 +997,7 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
     if execution.is_some() {
         definitions.extend(crate::execution::tools());
     }
-    let mut stdin = BufReader::new(crate::process::NonblockingIo::stdin()?);
+    let stdin = BufReader::new(crate::process::NonblockingIo::stdin()?);
     let mut stdout = crate::process::NonblockingIo::stdout()?;
     #[cfg(unix)]
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -1011,41 +1012,66 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
         }
     };
     tokio::pin!(stop);
+    let reply = |request: &Value, mut response: Value| {
+        response["jsonrpc"] = "2.0".into();
+        response["id"] = request["id"].clone();
+        response
+    };
+    let (source, delegation_ref, execution_ref) =
+        (&source, delegation.as_ref(), execution.as_ref());
     let result = async {
+        // Tool calls run concurrently and are answered by ID, so a long experiment
+        // does not hold up inspection or a client's timeout for other calls. One
+        // read stays pending across turns: a partly read message cannot resume.
+        let next = |mut stdin| async move {
+            let line = read_message(&mut stdin).await;
+            (stdin, line)
+        };
+        let mut reading = Box::pin(next(stdin));
+        let mut open = true;
+        let mut calls = FuturesUnordered::new();
         loop {
-            let line = tokio::select! {
-                _ = &mut stop => break,
-                line = read_message(&mut stdin) => line?,
-            };
-            if line.is_empty() {
+            // After EOF, answer every request already read, then exit.
+            if !open && calls.is_empty() {
                 break;
             }
-            // Notifications and malformed messages need no reply.
-            let Ok(request) = serde_json::from_slice::<Value>(&line) else {
-                continue;
-            };
-            if !request.is_object() || request.get("id").is_none() {
-                continue;
-            }
-            let mut response = match request["method"].as_str() {
-                Some("initialize") => json!({"result": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "crow-inspection", "version": "1.0.0"},
-                }}),
-                Some("tools/list") => json!({"result": {"tools": definitions}}),
-                Some("ping") => json!({"result": {}}),
-                Some("tools/call") => {
-                    let output = tokio::select! {
-                        _ = &mut stop => break,
-                        output = call_tool(&source, delegation.as_ref(), execution.as_ref(), &request["params"]) => output,
+            let response = tokio::select! {
+                _ = &mut stop => break,
+                Some(response) = calls.next() => response,
+                (stdin, line) = &mut reading, if open => {
+                    let line = line?;
+                    if line.is_empty() {
+                        open = false;
+                        continue;
+                    }
+                    reading = Box::pin(next(stdin));
+                    // Notifications and malformed messages need no reply.
+                    let Ok(request) = serde_json::from_slice::<Value>(&line) else {
+                        continue;
                     };
-                    json!({"result": tool_result(output)})
+                    if !request.is_object() || request.get("id").is_none() {
+                        continue;
+                    }
+                    let response = match request["method"].as_str() {
+                        Some("initialize") => json!({"result": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "crow-inspection", "version": "1.0.0"},
+                        }}),
+                        Some("tools/list") => json!({"result": {"tools": definitions}}),
+                        Some("ping") => json!({"result": {}}),
+                        Some("tools/call") => {
+                            calls.push(async move {
+                                let output = call_tool(source, delegation_ref, execution_ref, &request["params"]).await;
+                                reply(&request, json!({"result": tool_result(output)}))
+                            });
+                            continue;
+                        }
+                        _ => json!({"error": {"code": -32601, "message": "Unsupported method"}}),
+                    };
+                    reply(&request, response)
                 }
-                _ => json!({"error": {"code": -32601, "message": "Unsupported method"}}),
             };
-            response["jsonrpc"] = "2.0".into();
-            response["id"] = request["id"].clone();
             let write = async {
                 stdout.write_all(response.to_string().as_bytes()).await?;
                 stdout.write_all(b"\n").await?;

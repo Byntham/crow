@@ -3,7 +3,7 @@
 //! tests in `runtime_podman.rs`.
 use crow::execution::Execution;
 use serde_json::{Value, json};
-use std::{path::Path, process::Command};
+use std::{collections::BTreeMap, path::Path, process::Command};
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -228,4 +228,94 @@ async fn experiments_prepare_reuse_and_account_for_every_attempt() {
             .join("reviews/review1/experiments/environments")
             .exists()
     );
+}
+
+#[tokio::test]
+async fn mcp_answers_during_an_experiment_and_refuses_a_second_one() {
+    use std::{process::Stdio, time::Duration};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let source = source(root);
+    let podman = fake_podman(root);
+    std::fs::write(root.join("podman/image"), "").unwrap();
+    let context = json!({
+        "root": root,
+        "job": {"id": "review1", "settings": {"execution": {
+            "podman": podman,
+            "limits": {"timeoutSeconds": 30, "maxRuns": 5},
+        }}},
+        "source": source,
+    });
+    let (source_file, context_file) = (root.join("source.json"), root.join("context.json"));
+    std::fs::write(&source_file, source.to_string()).unwrap();
+    std::fs::write(&context_file, context.to_string()).unwrap();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_crow"))
+        .arg("_inspection-mcp")
+        .arg(&source_file)
+        .arg(&context_file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
+    let tool = |id: u64, name: &str, arguments: Value| json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":arguments}});
+    let experiment =
+        |command: String| json!({"revision":"head","command":command,"purpose":"Probe"});
+    // The first experiment runs until the test creates `release`.
+    let release = root.join("release");
+    let waiting = format!(
+        "while [ ! -e '{}' ]; do sleep 0.05; done",
+        release.display()
+    );
+    let test = async {
+        for request in [
+            tool(1, "run_experiment", experiment(waiting)),
+            json!({"jsonrpc":"2.0","id":2,"method":"ping"}),
+            tool(3, "run_experiment", experiment("true".into())),
+        ] {
+            input
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        let mut early = BTreeMap::new();
+        while early.len() < 2 {
+            let line = output.next_line().await.unwrap().unwrap();
+            let response: Value = serde_json::from_str(&line).unwrap();
+            early.insert(response["id"].as_u64().unwrap(), response);
+        }
+        // The ping and the refusal arrive while the first experiment is still running.
+        assert_eq!(early[&2]["result"], json!({}));
+        assert_eq!(early[&3]["result"]["isError"], true);
+        let refusal = early[&3]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(refusal.contains("still running"), "{refusal}");
+        std::fs::write(&release, "").unwrap();
+        let first: Value =
+            serde_json::from_str(&output.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(first["id"], 1);
+        assert!(
+            first["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("passed")
+        );
+        // The refused call did not use an attempt.
+        let info = tool(4, "runtime_info", json!({}));
+        input
+            .write_all(format!("{info}\n").as_bytes())
+            .await
+            .unwrap();
+        let info: Value =
+            serde_json::from_str(&output.next_line().await.unwrap().unwrap()).unwrap();
+        let info: Value =
+            serde_json::from_str(info["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(info["attempts"]["used"], 1);
+    };
+    tokio::time::timeout(Duration::from_secs(30), test)
+        .await
+        .unwrap();
 }

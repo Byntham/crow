@@ -919,11 +919,9 @@ mod tests {
             "limits": crate::execution::Limits::default(),
         });
         // A receipt from earlier in this review appears in the published summary.
-        crate::util::atomic(
-            &f.root.path().join("reviews/job-one/experiments/0001.json"),
-            &json!({"id":"1","kind":"test","revision":"head","status":"passed","purpose":"Run the unit tests"}),
-        )
-        .unwrap();
+        let receipt = json!({"id":"1","kind":"test","revision":"head","status":"passed","purpose":"Run the unit tests"});
+        let receipt_path = "reviews/job-one/experiments/0001.json";
+        crate::util::atomic(&f.root.path().join(receipt_path), &receipt).unwrap();
         let report = f.run().await.unwrap();
         assert!(
             text(&report, "summary").contains("- passed, PR version: Run the unit tests"),
@@ -956,6 +954,15 @@ mod tests {
         let allowed = flag(invocation["args"].as_array().unwrap(), "--allowedTools").unwrap();
         assert!(!allowed.contains("run_experiment"));
         assert!(!text(&invocation, "prompt").contains("Runtime tools are available"));
+        assert!(!text(&plain.run().await.unwrap(), "summary").contains("Runtime checks"));
+        // A resumed review that lost its policy still reports what already ran.
+        let resumed = Fixture::new(json!({}));
+        crate::util::atomic(&resumed.root.path().join(receipt_path), &receipt).unwrap();
+        let report = resumed.run().await.unwrap();
+        assert!(
+            text(&report, "summary").contains("- passed, PR version: Run the unit tests"),
+            "{report}"
+        );
     }
     #[tokio::test]
     async fn pinned_models_and_fixed_effort_models_are_accepted() {

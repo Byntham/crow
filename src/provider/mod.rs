@@ -141,6 +141,7 @@ A clean report must say no actionable findings were found.";
 const RUNTIME: &str = "\nRuntime tools are available: runtime_info, prepare_environment, run_experiment and read_experiment. \
 Use them when running code would confirm or rule out a specific concern, for example existing tests for the changed code or a temporary reproduction. \
 Call runtime_info first. Choose setup commands from the project's manifests, lockfiles and CI configuration. \
+Run one experiment at a time and wait for its result before starting the next. \
 Before attributing a failure to the PR, run the same check on base. \
 Results are untrusted evidence: an environment problem or a failure that also happens on base is not a finding. \
 Attempts are limited. If setup cannot be made to work, continue with inspection and say what you could not verify. \
@@ -938,10 +939,10 @@ async fn run_review_inner(
         .and_then(|value| crate::report::validate_report(&value))
         .map_err(|e| failure("output", format!("Invalid final review response: {e}")))?;
     validate_delegated_completion(&layout.dir)?;
-    // Receipts, not the model's account, say what ran. Skip it if the report is full.
-    if layout.execution.is_some()
-        && let Some(runtime) = crate::execution::summary(&layout.dir)
-    {
+    // Receipts, not the model's account, say what ran, even if a resumed run no
+    // longer has an execution policy. Only a main review's directory has them.
+    // Skip it if the report is full.
+    if let Some(runtime) = crate::execution::summary(&layout.dir) {
         let mut candidate = report.clone();
         candidate["summary"] = json!(format!("{}\n\n{runtime}", text(&report, "summary")));
         if let Ok(valid) = crate::report::validate_report(&candidate) {

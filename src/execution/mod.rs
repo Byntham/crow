@@ -13,7 +13,6 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -177,7 +176,7 @@ pub fn tools() -> Vec<Value> {
     vec![
         tool(
             "runtime_info",
-            "Show the sandbox's toolchains, limits, remaining attempts, prepared environments and earlier experiments. Call this first.",
+            "Show the sandbox's toolchains, limits, remaining attempts, prepared environments and earlier experiments. Call this first. Experiments run one at a time.",
             json!({}),
             &[],
         ),
@@ -215,7 +214,7 @@ pub struct Execution {
     review: String,
     dir: PathBuf,
     source: Value,
-    recovered: AtomicBool,
+    recovered: tokio::sync::OnceCell<()>,
     turn: tokio::sync::Mutex<()>,
 }
 impl Execution {
@@ -241,23 +240,27 @@ impl Execution {
             dir: root.join("reviews").join(&review).join("experiments"),
             review,
             source: context["source"].clone(),
-            recovered: AtomicBool::new(false),
+            recovered: tokio::sync::OnceCell::new(),
             turn: tokio::sync::Mutex::new(()),
         }))
     }
     pub async fn call(&self, name: &str, args: &Value) -> Result<Value> {
-        // Experiments run one at a time per review.
-        let _turn = self.turn.lock().await;
-        if !self.recovered.swap(true, Ordering::SeqCst) {
-            self.recover().await?;
-        }
-        match name {
-            "runtime_info" => self.info().await,
-            "read_experiment" => self.read(args),
-            "prepare_environment" => self.experiment(args, true).await,
-            "run_experiment" => self.experiment(args, false).await,
+        self.recovered.get_or_try_init(|| self.recover()).await?;
+        let setup = match name {
+            "runtime_info" => return self.info().await,
+            "read_experiment" => return self.read(args),
+            "prepare_environment" => true,
+            "run_experiment" => false,
             _ => bail!("Unknown runtime tool"),
-        }
+        };
+        // Experiments run one at a time per review. The client's timeout covers
+        // one experiment, so a second one fails now instead of waiting.
+        let Ok(_turn) = self.turn.try_lock() else {
+            bail!(
+                "Another experiment is still running. Wait for its result, then start the next one."
+            );
+        };
+        self.experiment(args, setup).await
     }
     /// Mark attempts that a crash or cancellation interrupted, and remove their containers.
     async fn recover(&self) -> Result<()> {
