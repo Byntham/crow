@@ -349,8 +349,10 @@ fn render(job: &Value, records: &[Value], published: &Value, links: bool) -> Str
             if !links {
                 return finding_block(f, &location(f));
             }
+            // The plain view, because a line anchor doesn't work where
+            // GitHub renders a file, as it does Markdown.
             let mut at = format!(
-                "[{}](https://github.com/{repo}/blob/{head}/{}#L{})",
+                "[{}](https://github.com/{repo}/blob/{head}/{}?plain=1#L{})",
                 location(f),
                 url_path(string(&f["path"])),
                 f["line"]
@@ -625,10 +627,10 @@ mod tests {
             .unwrap();
         assert!(high < low);
         assert!(body.contains(&format!(
-            "[`src/api.js:2`]({blob}/src/api.js#L2) · [Thread]({thread})\n\nCheck the caller"
+            "[`src/api.js:2`]({blob}/src/api.js?plain=1#L2) · [Thread]({thread})\n\nCheck the caller"
         )));
         assert!(body.contains(&format!(
-            "[`src/a b(1).js:2`]({blob}/src/a%20b%281%29.js#L2)\n\nCheck the caller"
+            "[`src/a b(1).js:2`]({blob}/src/a%20b%281%29.js?plain=1#L2)\n\nCheck the caller"
         )));
         assert!(body.contains("<summary>Review notes</summary>\n\nTwo issues.\n</details>"));
         assert!(body.ends_with(

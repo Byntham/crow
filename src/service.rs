@@ -208,6 +208,11 @@ fn comment_body(j: &Value, saved: &Value) -> String {
     // A review published before reports moved into this comment.
     if !s(j, "reviewUrl").is_empty() && j["reviewUrl"] != saved["url"] {
         body.push_str(&format!("\n\n[Read review]({})", s(j, "reviewUrl")));
+    } else if state == "completed" {
+        // Such as after a force-push back to a reviewed commit.
+        body.push_str(
+            "\n\nCrow reviewed this commit earlier. Its report is in this comment's edit history.",
+        );
     }
     if state == "paused" {
         let restart_only = s(j, "reason").starts_with("Restart required");
@@ -4109,6 +4114,7 @@ mod tests {
         j["head"] = json!("d".repeat(40));
         let body = comment_body(&j, &saved);
         assert!(body.starts_with("<!-- crow-status:v1 -->\n### ✅ Reviewed [`ddddddd`]"));
+        assert!(body.contains("</sub>\n\nCrow reviewed this commit earlier. Its report is in this comment's edit history.\n\n<details>"));
         j["state"] = json!("reviewing");
         j["startedAt"] = json!(1_791_355_500_000i64);
         j["updatedAt"] = json!(1);
