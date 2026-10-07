@@ -331,12 +331,19 @@ impl GitHub {
         let status = response.status();
         let headers = response.headers().clone();
         if !status.is_success() {
-            let retry_after = headers
-                .get("retry-after")
-                .and_then(|h| h.to_str().ok())
+            let header = |name: &str| headers.get(name).and_then(|h| h.to_str().ok());
+            // A spent primary rate limit gives its reset time instead of Retry-After.
+            let reset = (header("x-ratelimit-remaining") == Some("0"))
+                .then(|| header("x-ratelimit-reset")?.parse::<i64>().ok())
+                .flatten()
+                .map(|reset| {
+                    (reset * 1000 - chrono::Utc::now().timestamp_millis()).max(1000) as u64
+                });
+            let retry_after = header("retry-after")
                 .and_then(|h| h.parse::<f64>().ok())
                 .filter(|v| v.is_finite() && *v > 0.0)
                 .map(|v| (v * 1000.0) as u64)
+                .or(reset)
                 .unwrap_or(0);
             return Err(GitHubError {
                 message: format!(
@@ -1105,6 +1112,23 @@ mod tests {
         assert_eq!(error.status, 429);
         assert_eq!(error.retry_after, 3000);
         assert!(!error.message.contains("secret"));
+        // A spent primary rate limit answers 403 with its reset time instead.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
+        let reset = chrono::Utc::now().timestamp() + 60;
+        headers.insert("x-ratelimit-reset", reset.to_string().parse().unwrap());
+        m.push(403, headers, json!({}));
+        let error = gh
+            .request("/rate", Some("token"), "GET", None)
+            .await
+            .unwrap_err();
+        let error = error.downcast_ref::<GitHubError>().unwrap();
+        assert_eq!(error.status, 403);
+        assert!(
+            (50_000..=61_000).contains(&error.retry_after),
+            "{}",
+            error.retry_after
+        );
         assert!(
             m.calls.lock().unwrap()[1]
                 .path

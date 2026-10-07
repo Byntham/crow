@@ -81,11 +81,9 @@ fn eligible(repo: &Value, pr: &Value) -> bool {
         && (s(repo, "policy") == "everyone"
             || matches_login(&repo["authors"], s(&pr["user"], "login")))
 }
-/// Event retries spent on a push lookup before the pusher counts as
-/// unconfirmed. GitHub lists a push about a second after it happens, and the
-/// event backoff of 5, 10 and 20 seconds also bounds how long the
-/// repository's later events wait.
-const LISTING_RETRIES: i64 = 3;
+/// GitHub lists a push about a second after it happens. A push still unlisted
+/// this long after its webhook's event counts as unconfirmed.
+const LISTING_WINDOW_MS: i64 = 60_000;
 /// Whether Crow checks who pushed each version of a repository's PRs. It does
 /// unless the repository reviews everyone, or accepts pushes from anyone.
 fn checks_pushers(repo: &Value) -> bool {
@@ -176,10 +174,12 @@ fn error_status(e: &anyhow::Error) -> u16 {
     e.downcast_ref::<GitHubError>().map_or(400, |e| e.status)
 }
 /// GitHub refused a request for good, for example with a 404 for a private
-/// fork the App cannot read. A 403 can be a spent rate limit, so it is retried.
+/// fork the App cannot read, or a 451 for one taken down. A 403 is final
+/// unless it is a rate limit, which carries a retry delay.
 fn refused(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<GitHubError>()
-        .is_some_and(|e| matches!(e.status, 404 | 410 | 422))
+    e.downcast_ref::<GitHubError>().is_some_and(|e| {
+        matches!(e.status, 404 | 410 | 422 | 451) || (e.status == 403 && e.retry_after == 0)
+    })
 }
 fn retry_after(e: &anyhow::Error) -> i64 {
     e.downcast_ref::<GitHubError>()
@@ -292,9 +292,9 @@ impl Service {
         };
         Ok(pr)
     }
-    /// Queue the PR's current version after an older one was superseded, if
-    /// it is eligible and, unless requested, a listed author pushed it. A
-    /// failed lookup leaves the version to the PR's next event.
+    /// Queue the PR's current version if it is eligible and, unless requested
+    /// or `admitted` already, a listed author pushed it. Transient lookup
+    /// failures are errors.
     async fn requeue(
         &self,
         repo: &Value,
@@ -305,17 +305,29 @@ impl Service {
         if !eligible(repo, pr) {
             return Ok(None);
         }
-        if !b(options, "manual") {
-            match self.with_pushes(repo, pr.clone(), token).await {
-                Ok(pr) if pushed_by_author(repo, &pr) => {}
-                Ok(_) => return Ok(None),
-                Err(e) => {
-                    eprintln!("Could not read who pushed PR #{}: {e}", n(pr, "number"));
-                    return Ok(None);
-                }
+        if !b(options, "manual") && !b(options, "admitted") {
+            let pr = self.with_pushes(repo, pr.clone(), token).await?;
+            if !pushed_by_author(repo, &pr) {
+                return Ok(None);
             }
         }
         Ok(Some(self.db(|db| db.queue(repo, pr, options))?))
+    }
+    /// Requeue the PR after `job` was superseded. The same version keeps the
+    /// job's admission or request, so it needs no lookup. A new version is left
+    /// to its own event if the lookup fails.
+    async fn succeed(&self, repo: &Value, pr: &Value, token: &str, job: &Value) -> Option<Value> {
+        let options = if job["head"] == pr["head"]["sha"] {
+            json!({"manual": b(job, "manual"), "admitted": !b(job, "manual")})
+        } else {
+            json!({})
+        };
+        self.requeue(repo, pr, token, &options)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("Could not requeue PR #{}: {e}", n(pr, "number"));
+                None
+            })
     }
     async fn enqueue(&self, repo: &Value, number: i64, opts: &Value) -> Result<Value> {
         ensure!(number > 0, "Invalid pull request number");
@@ -359,17 +371,8 @@ impl Service {
         {
             return Ok(active.clone());
         }
-        let retries = n(opts, "retries");
-        let pr = match self.with_pushes(&repo, pr.clone(), &token).await {
-            Ok(pr) => pr,
-            // Once the event has retried, a lasting failure, such as a fork
-            // taken down, leaves the pusher unconfirmed.
-            Err(e) if retries >= LISTING_RETRIES => {
-                eprintln!("Could not read who pushed PR #{number}: {e}");
-                patch(pr, &json!({"pushes": null}))
-            }
-            Err(e) => return Err(e),
-        };
+        // A transient failure defers the event, like any other GitHub failure.
+        let pr = self.with_pushes(&repo, pr.clone(), &token).await?;
         if pushed_by_author(&repo, &pr) {
             return self.db(|db| db.queue(&repo, &pr, opts));
         }
@@ -378,8 +381,13 @@ impl Service {
             return Ok(completed);
         }
         // GitHub can list a push late, a new branch's first push included.
-        // While the event can retry, try again later instead of skipping.
-        if pr["pushes"].is_array() && head_push(&pr).is_none() && retries < LISTING_RETRIES {
+        // Shortly after the event, try again later instead of skipping.
+        let since = n(opts, "occurredAt");
+        if pr["pushes"].is_array()
+            && head_push(&pr).is_none()
+            && since > 0
+            && now() - since < LISTING_WINDOW_MS
+        {
             bail!("GitHub has not listed the push of PR #{number} yet");
         }
         // Show the skipped version on the PR's status. The new job has no
@@ -487,7 +495,7 @@ impl Service {
                 self.enqueue(
                     &repo,
                     n(e, "number"),
-                    &json!({"event":true,"trigger":trigger,"retries":e["retries"]}),
+                    &json!({"event":true,"trigger":trigger,"occurredAt":e["occurredAt"]}),
                 )
                 .await?;
             }
@@ -536,7 +544,17 @@ impl Service {
                         && eligible(&current, pr)
                         && !array(&current["excluded"]).contains(&pr["number"])
                 }) {
-                    self.requeue(&current, pr, &token, &json!({})).await?;
+                    // A transient failure defers the event; on its retry, PRs it
+                    // already queued are found without another lookup.
+                    let key = format!("{}#{}", s(&current, "name"), n(pr, "number"));
+                    let queued = self.latest(&key)?.is_some_and(|j| {
+                        ACTIVE.contains(&s(&j, "state"))
+                            && j["head"] == pr["head"]["sha"]
+                            && j["target"] == pr["base"]["ref"]
+                    });
+                    if !queued {
+                        self.requeue(&current, pr, &token, &json!({})).await?;
+                    }
                 }
             }
             _ => {}
@@ -646,7 +664,7 @@ impl Service {
             || pr["base"]["ref"] != j["target"]
         {
             self.update(s(j, "id"), json!({"state":"superseded"}), None)?;
-            self.requeue(&repo, &pr, &token, &json!({})).await?;
+            self.succeed(&repo, &pr, &token, j).await;
             return Ok(());
         }
         if pr["base"]["sha"] != j["comparison"]["targetSha"] {
@@ -1081,7 +1099,7 @@ impl Service {
             || repo["worker"] != job["worker"]
         {
             self.update(id, json!({"state":"superseded"}), Some(lease))?;
-            self.requeue(&repo, &pr, &api_token, &json!({})).await?;
+            self.succeed(&repo, &pr, &api_token, job).await;
             return Ok(Value::Null);
         }
         // Settings are fixed when a review first starts and kept for recovery.
@@ -1411,10 +1429,7 @@ impl Service {
                     }
                     self.update(id, json!({"state":"superseded"}), Some(lease))?;
                     let same = pr["head"]["sha"] == j["head"] && pr["base"]["ref"] == j["target"];
-                    // A requested review of this same version stays requested.
-                    let manual = same && b(&j, "manual");
-                    let options = json!({"manual": manual});
-                    if let Some(replacement) = self.requeue(&repo, &pr, &token, &options).await?
+                    if let Some(replacement) = self.succeed(&repo, &pr, &token, &j).await
                         && same
                     {
                         self.update(s(&replacement, "id"), json!({"nextAt":now()+5000}), None)?;
@@ -3098,14 +3113,15 @@ mod tests {
         );
         f.close().await;
 
-        // A lasting failure, once the event has retried, leaves the pusher unconfirmed.
+        // A server error defers the event however long it has waited; a fork
+        // taken down (451) is refused for good, so the pusher is unconfirmed.
         let f = Fixture::new().await;
+        let opened = json!({"event":true,"trigger":"Pull request opened","occurredAt":1});
+        f.github.fail_pushes.lock().unwrap().insert(1, 502);
+        assert!(enqueue(&f, opened.clone()).await.is_err());
         f.github.fail_pushes.lock().unwrap().insert(1, 451);
-        let first = json!({"event":true,"trigger":"Pull request opened","retries":0});
-        assert!(enqueue(&f, first).await.is_err());
-        let last = json!({"event":true,"trigger":"Pull request opened","retries":LISTING_RETRIES});
         assert_eq!(
-            enqueue(&f, last).await.unwrap()["skipped"],
+            enqueue(&f, opened).await.unwrap()["skipped"],
             "Not pushed by a listed author"
         );
         let status = f.handle.service.latest("owner/project#1").unwrap().unwrap();
@@ -3115,23 +3131,28 @@ mod tests {
         );
         f.close().await;
 
-        // A base-branch push requeues the PRs it can confirm and skips the rest.
+        // A base-branch push defers when a lookup fails. Its retry finds the
+        // PRs it already queued without looking them up again.
         let f = Fixture::new().await;
         f.github.prs.lock().unwrap().push(pr(2));
-        f.github.fail_pushes.lock().unwrap().insert(1, 502);
-        let service = f.handle.service.clone();
+        f.github.fail_pushes.lock().unwrap().insert(2, 502);
         let push = json!({"type":"push","repo":"owner/project","ref":"refs/heads/main"});
-        f.handle
-            .execute(async move { service.handle_event(&push).await })
-            .await
-            .unwrap();
+        let handle = |f: &Fixture| {
+            let (service, push) = (f.handle.service.clone(), push.clone());
+            f.handle
+                .execute(async move { service.handle_event(&push).await })
+        };
+        assert!(handle(&f).await.is_err());
         assert!(
             f.handle
                 .service
                 .latest("owner/project#1")
                 .unwrap()
-                .is_none()
+                .is_some()
         );
+        f.github.fail_pushes.lock().unwrap().insert(1, 502);
+        f.github.fail_pushes.lock().unwrap().remove(&2);
+        handle(&f).await.unwrap();
         assert!(
             f.handle
                 .service
@@ -3151,17 +3172,18 @@ mod tests {
             "{status}"
         );
         f.close().await;
-        // A spent rate limit also answers 403, so only 404, 410 and 422 are final.
-        let error = |status| {
+        // A 403 is final unless it is a rate limit, which carries a retry delay.
+        let error = |status, retry_after| {
             let message = String::new();
             anyhow::Error::from(GitHubError {
                 message,
                 status,
-                retry_after: 0,
+                retry_after,
             })
         };
-        assert!(refused(&error(404)) && refused(&error(422)));
-        assert!(!refused(&error(403)) && !refused(&error(429)) && !refused(&error(502)));
+        assert!(refused(&error(404, 0)) && refused(&error(451, 0)) && refused(&error(403, 0)));
+        assert!(!refused(&error(403, 60_000)) && !refused(&error(429, 0)));
+        assert!(!refused(&error(502, 0)));
 
         // One PR's failed lookup skips that PR, not the whole catch-up.
         let f = Fixture::new().await;
@@ -3207,17 +3229,17 @@ mod tests {
                     .await
             })
         };
-        let event =
-            |retries: i64| json!({"event":true,"trigger":"Pull request opened","retries":retries});
+        let event = |occurred: i64| json!({"event":true,"trigger":"Pull request opened","occurredAt":occurred});
         let earlier = json!({"type":"push","actor":"alice","after":"c".repeat(40)});
 
-        // GitHub has not listed the push yet: the event retries rather than skipping.
+        // GitHub has not listed the push yet: shortly after the event, it
+        // retries rather than skipping.
         let f = Fixture::new().await;
         *f.github.pushes.lock().unwrap() = Some(vec![]);
-        let error = enqueue(&f, event(0)).await.unwrap_err();
+        let error = enqueue(&f, event(now())).await.unwrap_err();
         assert!(error.to_string().contains("not listed"), "{error}");
         *f.github.pushes.lock().unwrap() = Some(vec![earlier]);
-        assert!(enqueue(&f, event(LISTING_RETRIES - 1)).await.is_err());
+        assert!(enqueue(&f, event(now() - 30_000)).await.is_err());
         assert!(
             f.handle
                 .service
@@ -3225,8 +3247,10 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        // Once the event has spent its retries, the version is skipped.
-        let skipped = enqueue(&f, event(LISTING_RETRIES)).await.unwrap();
+        // A minute after the event, the version is skipped.
+        let skipped = enqueue(&f, event(now() - LISTING_WINDOW_MS - 1000))
+            .await
+            .unwrap();
         assert_eq!(skipped["skipped"], "Not pushed by a listed author");
         f.close().await;
 
@@ -3235,7 +3259,7 @@ mod tests {
         let f = Fixture::new().await;
         let ghost = json!({"type":"push","actor":null,"after":"a".repeat(40)});
         *f.github.pushes.lock().unwrap() = Some(vec![ghost]);
-        let skipped = enqueue(&f, event(0)).await.unwrap();
+        let skipped = enqueue(&f, event(now())).await.unwrap();
         assert_eq!(skipped["skipped"], "Not pushed by a listed author");
         f.close().await;
 
@@ -3250,7 +3274,7 @@ mod tests {
             .service
             .update(id, json!({"state":"completed"}), None)
             .unwrap();
-        let edited = json!({"event":true,"trigger":"Pull request edited","retries":0});
+        let edited = json!({"event":true,"trigger":"Pull request edited","occurredAt":now()});
         assert_eq!(enqueue(&f, edited).await.unwrap()["id"], requested["id"]);
         let latest = f.handle.service.latest("owner/project#1").unwrap().unwrap();
         assert_eq!(latest["id"], requested["id"]);
