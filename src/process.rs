@@ -187,6 +187,9 @@ pub struct RunOptions {
     pub detached: bool,
     pub capture: bool,
     pub inherit: bool,
+    /// Fail when the process exits unsuccessfully. Disable for commands whose
+    /// output reports the failure, such as an unauthenticated status query.
+    pub check: bool,
     pub on_line: Option<LineCallback>,
 }
 impl Default for RunOptions {
@@ -201,6 +204,7 @@ impl Default for RunOptions {
             detached: true,
             capture: true,
             inherit: false,
+            check: true,
             on_line: None,
         }
     }
@@ -398,7 +402,7 @@ pub async fn run(program: &str, args: &[String], options: RunOptions) -> Result<
             Some(s) => s,
             None => child.wait().await?,
         };
-        if !status.success() {
+        if options.check && !status.success() {
             bail!(
                 "{program} exited {status}: {}",
                 String::from_utf8_lossy(&stderr)

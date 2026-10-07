@@ -7,7 +7,7 @@ The hosted installer and binary downloads are live while the source repository s
 | Cloudflare Pages direct-upload project | `crow-site`     | `https://birdapp.dev`           |
 | R2 bucket                              | `crow-releases` | `https://downloads.birdapp.dev` |
 
-Pages serves `website/`, including `install.sh`. R2 serves archives larger than Pages' 25 MiB file limit. Neither resource runs Crow or handles review traffic. Gibo is not part of the download service.
+Pages serves `website/`, including `install.sh`. R2 serves archives larger than Pages' 25 MiB file limit. Neither resource runs Crow or handles review traffic. No Crow installation is part of the download service.
 
 ## Create Cloudflare resources
 

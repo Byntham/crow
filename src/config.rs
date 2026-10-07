@@ -17,7 +17,8 @@ fn string<'a>(value: &'a Value, label: &str) -> Result<&'a str> {
 fn one_of(value: &Value, values: &[&str]) -> bool {
     value.as_str().is_some_and(|v| values.contains(&v))
 }
-/// Match JavaScript JSON number semantics for consumers using integer accessors.
+/// Earlier releases may have stored whole numbers as floats (`3.0`); convert
+/// them so integer accessors work.
 /// Unknown fields are retained; only exact integer-valued floating numbers change representation.
 pub fn normalize_numbers(value: &mut Value) {
     match value {
@@ -65,11 +66,34 @@ pub fn home() -> PathBuf {
 }
 pub fn defaults(root: &Path) -> Value {
     json!({
-        "version":1,"role":"both","operator":null,"publicUrl":null,"port":8787,"bind":"127.0.0.1",
-        "adminToken":format!("{}{}",id(),id()),"serviceUrl":"http://127.0.0.1:8787",
-        "worker":{"id":id(),"token":format!("{}{}",id(),id()),"concurrency":3,"codex":"codex","codexHome":root.join("codex"),
-            "model":null,"effort":null,"subagents":{"mode":"inherit","max":8},"retry":{"mode":"fixed","count":10,"delayMs":5000},"timeoutMs":0},
-        "catchUp":{"enabled":true,"threshold":10},"auditIntervalMs":3600000,"retentionDays":7,"ingress":{"type":"funnel"},"app":null
+        "version": 1,
+        "role": "both",
+        "operator": null,
+        "publicUrl": null,
+        "port": 8787,
+        "bind": "127.0.0.1",
+        "adminToken": format!("{}{}", id(), id()),
+        "serviceUrl": "http://127.0.0.1:8787",
+        "worker": {
+            "id": id(),
+            "token": format!("{}{}", id(), id()),
+            "concurrency": 3,
+            "provider": "codex",
+            "codex": "codex",
+            "codexHome": root.join("codex"),
+            "claude": "claude",
+            "claudeHome": root.join("claude"),
+            "model": null,
+            "effort": null,
+            "subagents": {"mode": "inherit", "max": 8},
+            "retry": {"mode": "fixed", "count": 10, "delayMs": 5000},
+            "timeoutMs": 0,
+        },
+        "catchUp": {"enabled": true, "threshold": 10},
+        "auditIntervalMs": 3600000,
+        "retentionDays": 7,
+        "ingress": {"type": "funnel"},
+        "app": null,
     })
 }
 fn validate_app(app: &Value) -> Result<()> {
@@ -181,6 +205,17 @@ pub fn validate_config(value: &Value) -> Result<()> {
     }
     for key in ["codex", "codexHome"] {
         string(&worker[key], &format!("worker.{key}"))?;
+    }
+    // Installations configured before Claude Code support omit these keys.
+    if let Some(provider) = worker.get("provider")
+        && !one_of(provider, &["codex", "claude"])
+    {
+        bail!("worker.provider must be codex or claude");
+    }
+    for key in ["claude", "claudeHome"] {
+        if let Some(v) = worker.get(key) {
+            string(v, &format!("worker.{key}"))?;
+        }
     }
     for key in ["operator", "publicUrl"] {
         let v = c.get(key).with_context(|| format!("Invalid {key}"))?;
@@ -386,6 +421,21 @@ mod tests {
         c["worker"]["concurrency"] = json!(1.0);
         validate_config(&c).unwrap();
         c["worker"].as_object_mut().unwrap().remove("model");
+        assert!(validate_config(&c).is_err());
+    }
+    #[test]
+    fn provider_is_optional_for_older_installations_but_must_be_known() {
+        let mut c = defaults(Path::new("/tmp/crow"));
+        c["worker"]["provider"] = json!("claude");
+        validate_config(&c).unwrap();
+        c["worker"]["provider"] = json!("gemini");
+        assert!(validate_config(&c).is_err());
+        let worker = c["worker"].as_object_mut().unwrap();
+        for key in ["provider", "claude", "claudeHome"] {
+            worker.remove(key);
+        }
+        validate_config(&c).unwrap();
+        c["worker"]["claudeHome"] = json!("");
         assert!(validate_config(&c).is_err());
     }
     #[test]

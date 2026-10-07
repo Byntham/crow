@@ -4,7 +4,7 @@ use crate::{
     github::{GitHub, GitHubApi, GitHubError},
     report,
     store::Store,
-    util,
+    util::{self, now},
 };
 use anyhow::{Result, anyhow, bail, ensure};
 use axum::{
@@ -66,9 +66,6 @@ fn patch(mut value: Value, changes: &Value) -> Value {
     }
     value
 }
-fn now() -> i64 {
-    chrono::Utc::now().timestamp_millis()
-}
 fn matches_login(values: &Value, name: &str) -> bool {
     values.as_array().is_some_and(|xs| {
         xs.iter()
@@ -98,12 +95,30 @@ fn ineligible_reason(repo: &Value, pr: Option<&Value>) -> &'static str {
         _ => "PR is not eligible",
     }
 }
+/// Whether a paused or held job has work to continue. A paused job that
+/// started without saving a provider session or report can only restart.
+fn can_resume(j: &Value) -> bool {
+    match s(j, "state") {
+        "held" => true,
+        "paused" => n(j, "startedAt") == 0 || !j["session"].is_null() || !j["report"].is_null(),
+        _ => false,
+    }
+}
 fn comparison_key(c: &Value) -> String {
     format!("{}:{}:{}", s(c, "head"), s(c, "target"), s(c, "base"))
 }
+/// Settings fixed when a review starts and kept through recovery. `provider`
+/// is present only when the worker reported it.
 fn review_settings(v: &Value) -> Value {
     let mut out = json!({});
-    for k in ["model", "effort", "subagents", "retry", "timeoutMs"] {
+    for k in [
+        "provider",
+        "model",
+        "effort",
+        "subagents",
+        "retry",
+        "timeoutMs",
+    ] {
         if let Some(x) = v.get(k) {
             out[k] = x.clone();
         }
@@ -167,8 +182,27 @@ impl Service {
         self.get("repos", &util::repo_name(name)?)?
             .ok_or_else(|| anyhow!("Repository is not enrolled"))
     }
+    /// The service's worker settings overlaid with a worker's reported defaults.
+    /// The provider comes only from the worker; the service host's own setting
+    /// says nothing about a worker on another machine.
+    fn worker_settings(&self, worker: &Value) -> Value {
+        let mut base = self.config["worker"].clone();
+        if let Some(base) = base.as_object_mut() {
+            base.remove("provider");
+        }
+        patch(base, &worker["defaults"])
+    }
+    /// Apply `change` to every unfinished job for one pull request.
+    fn update_active(&self, repo: &str, number: i64, change: Value) -> Result<()> {
+        for j in self.all("jobs")?.iter().filter(|j| {
+            s(j, "repo") == repo && n(j, "number") == number && ACTIVE.contains(&s(j, "state"))
+        }) {
+            self.update(s(j, "id"), change.clone(), None)?;
+        }
+        Ok(())
+    }
     fn latest(&self, key: &str) -> Result<Option<Value>> {
-        Ok(self.all("jobs")?.into_iter().rfind(|j| s(j, "key") == key))
+        self.db(|db| db.latest_job(key))
     }
     fn owns(&self, id: &str, lease: &str, state: &str) -> Result<bool> {
         Ok(self
@@ -189,17 +223,12 @@ impl Service {
             return Ok(json!({"skipped":"Requester is no longer authorized"}));
         }
         if !eligible(&repo, &pr) {
-            for j in self.all("jobs")?.iter().filter(|j| {
-                s(j, "repo") == s(&repo, "name")
-                    && n(j, "number") == number
-                    && ACTIVE.contains(&s(j, "state"))
-            }) {
-                self.update(
-                    s(j, "id"),
-                    json!({"state":"cancelled","reason":ineligible_reason(&repo,Some(&pr))}),
-                    None,
-                )?;
-            }
+            let reason = ineligible_reason(&repo, Some(&pr));
+            self.update_active(
+                s(&repo, "name"),
+                number,
+                json!({"state":"cancelled","reason":reason}),
+            )?;
             return Ok(json!({"skipped":"PR is not eligible"}));
         }
         if b(opts, "event") || b(opts, "manual") {
@@ -240,7 +269,12 @@ impl Service {
         {
             let current = prs.iter().find(|p| n(p, "number") == n(j, "number"));
             if current.is_none_or(|pr| !eligible(&repo, pr)) {
-                self.update(s(j,"id"),json!({"state":"cancelled","autoRecover":false,"reason":ineligible_reason(&repo,current)}),None)?;
+                let reason = ineligible_reason(&repo, current);
+                self.update(
+                    s(j, "id"),
+                    json!({"state":"cancelled","autoRecover":false,"reason":reason}),
+                    None,
+                )?;
             }
         }
         let fresh: Vec<_> = prs
@@ -307,33 +341,35 @@ impl Service {
                     && n(e, "number") > 0
                     && matches_login(requesters(&repo), s(e, "actor")) =>
             {
+                let number = n(e, "number");
                 if s(e, "command") == "pause" {
-                    for j in self.all("jobs")?.iter().filter(|j| {
-                        s(j, "repo") == name
-                            && j["number"] == e["number"]
-                            && ACTIVE.contains(&s(j, "state"))
-                    }) {
-                        self.update(s(j,"id"),json!({"state":"paused","autoRecover":false,"reason":"Paused by the operator","trigger":"Pause command"}),None)?;
-                    }
+                    let paused = json!({
+                        "state": "paused",
+                        "autoRecover": false,
+                        "reason": "Paused by the operator",
+                        "trigger": "Pause command",
+                    });
+                    self.update_active(&name, number, paused)?;
                 } else {
-                    if s(e, "command") == "resume" {
-                        let current = self.latest(&format!("{}#{}", name, n(e, "number")))?;
-                        if current.as_ref().is_none_or(|j| {
-                            !["paused", "held"].contains(&s(j, "state"))
-                                || (s(j, "state") == "paused"
-                                    && n(j, "startedAt") > 0
-                                    && j["session"].is_null()
-                                    && j["report"].is_null())
-                        }) {
-                            return Ok(());
-                        }
+                    if s(e, "command") == "resume"
+                        && !self
+                            .latest(&format!("{name}#{number}"))?
+                            .is_some_and(|j| can_resume(&j))
+                    {
+                        return Ok(());
                     }
                     let trigger = match s(e, "command") {
                         "resume" => "Resume command",
                         "restart" => "Restart command",
                         _ => "Manual request",
                     };
-                    self.enqueue(&repo,n(e,"number"),&json!({"manual":true,"restart":s(e,"command")=="restart","requester":e["actor"],"trigger":trigger})).await?;
+                    let options = json!({
+                        "manual": true,
+                        "restart": s(e, "command") == "restart",
+                        "requester": e["actor"],
+                        "trigger": trigger,
+                    });
+                    self.enqueue(&repo, number, &options).await?;
                 }
             }
             "push" if s(e, "ref").starts_with("refs/heads/") => {
@@ -399,7 +435,12 @@ impl Service {
             body.push_str(&format!("\n\n[Read review]({})", s(j, "reviewUrl")));
         }
         if state == "paused" {
-            body.push_str("\n\nComment `/crow resume` to continue saved work, or `/crow restart` to start again.");
+            let restart_only = s(j, "reason").starts_with("Restart required");
+            body.push_str(if can_resume(j) && !restart_only {
+                "\n\nComment `/crow resume` to continue saved work, or `/crow restart` to start again."
+            } else {
+                "\n\nComment `/crow restart` to start the review again."
+            });
         }
         let key = s(j, "key");
         let prev = self.get("status", key)?;
@@ -424,7 +465,15 @@ impl Service {
                 prev.as_ref().and_then(|p| p["id"].as_i64()),
             )
             .await?;
-        self.db(|db|db.put("status",key,&json!({"id":result["id"],"body":body,"state":j["state"],"trigger":j["trigger"],"head":j["head"],"updatedAt":now()})))
+        let record = json!({
+            "id": result["id"],
+            "body": body,
+            "state": j["state"],
+            "trigger": j["trigger"],
+            "head": j["head"],
+            "updatedAt": now(),
+        });
+        self.db(|db| db.put("status", key, &record))
     }
     async fn publish(&self, j: &Value) -> Result<()> {
         let (pr, token) = self
@@ -448,7 +497,12 @@ impl Service {
             return Ok(());
         }
         if pr["base"]["sha"] != j["comparison"]["targetSha"] {
-            self.update(s(j,"id"),json!({"state":"queued","nextAt":0,"reason":"Target branch changed; verifying the comparison before publication."}),None)?;
+            let reason = "Target branch changed; verifying the comparison before publication.";
+            self.update(
+                s(j, "id"),
+                json!({"state":"queued","nextAt":0,"reason":reason}),
+                None,
+            )?;
             return Ok(());
         }
         let reviews = self.github.reviews(&repo, n(j, "number"), &token).await?;
@@ -560,7 +614,12 @@ impl Service {
         }
         for j in self.all("jobs")? {
             if s(&j, "state") == "reviewing" && now() - n(&j, "updatedAt") > 90000 {
-                self.update(s(&j,"id"),json!({"state":"paused","autoRecover":true,"reason":"Worker disconnected. Saved work will resume when it reconnects."}),None)?;
+                let reason = "Worker disconnected. Saved work will resume when it reconnects.";
+                self.update(
+                    s(&j, "id"),
+                    json!({"state":"paused","autoRecover":true,"reason":reason}),
+                    None,
+                )?;
             }
         }
         let mut latest = HashMap::new();
@@ -587,7 +646,14 @@ impl Service {
                     self.publish(j).await
                 };
             if let Err(e) = result {
-                self.update(s(j,"id"),json!({"publishAt":now()+30000.max(retry_after(&e)),"reason":"GitHub publication failed; the completed report is saved and will be retried."}),None)?;
+                let reason =
+                    "GitHub publication failed; the completed report is saved and will be retried.";
+                let publish_at = now() + 30000.max(retry_after(&e));
+                self.update(
+                    s(j, "id"),
+                    json!({"publishAt":publish_at,"reason":reason}),
+                    None,
+                )?;
                 eprintln!("Publication deferred: {e}");
             }
         }
@@ -604,7 +670,12 @@ impl Service {
         validate_admin(a)?;
         match action {
             "pair" => {
-                let worker = json!({"id":a["id"].as_str().unwrap_or(&util::id()),"token":a["token"].as_str().unwrap_or(&format!("{}{}",util::id(),util::id()))});
+                let worker = json!({
+                    "id": a["id"].as_str().map_or_else(util::id, str::to_owned),
+                    "token": a["token"]
+                        .as_str()
+                        .map_or_else(|| format!("{}{}", util::id(), util::id()), str::to_owned),
+                });
                 let id = s(&worker, "id");
                 ensure!(
                     !id.is_empty()
@@ -658,7 +729,18 @@ impl Service {
                     self.db(|db| db.enroll(&repo).map(|_| ()))?;
                     return Ok(repo);
                 }
-                let mut repo = json!({"name":name,"installation":installation["id"],"worker":a["worker"].as_str().unwrap_or(s(&self.config["worker"],"id")),"policy":a["policy"].as_str().unwrap_or("selected"),"authors":a.get("authors").cloned().unwrap_or_else(||json!([self.config["operator"]])),"requesters":[self.config["operator"]],"settings":a.get("settings").cloned().unwrap_or_else(||json!({})),"enrolledAt":now(),"excluded":[]});
+                let operator = &self.config["operator"];
+                let mut repo = json!({
+                    "name": name,
+                    "installation": installation["id"],
+                    "worker": a["worker"].as_str().unwrap_or(s(&self.config["worker"], "id")),
+                    "policy": a["policy"].as_str().unwrap_or("selected"),
+                    "authors": a.get("authors").cloned().unwrap_or_else(|| json!([operator])),
+                    "requesters": [operator],
+                    "settings": a.get("settings").cloned().unwrap_or_else(|| json!({})),
+                    "enrolledAt": now(),
+                    "excluded": [],
+                });
                 ensure!(
                     self.get("workers", s(&repo, "worker"))?.is_some(),
                     "Pair the worker before enrolling repositories"
@@ -701,7 +783,12 @@ impl Service {
                         && s(&repo, "policy") != "everyone"
                         && !matches_login(&repo["authors"], s(j, "author"))
                 }) {
-                    self.update(s(job,"id"),json!({"state":"cancelled","autoRecover":false,"reason":"PR author is no longer authorized"}),None)?;
+                    let reason = "PR author is no longer authorized";
+                    self.update(
+                        s(job, "id"),
+                        json!({"state":"cancelled","autoRecover":false,"reason":reason}),
+                        None,
+                    )?;
                 }
                 Ok(repo)
             }
@@ -712,12 +799,7 @@ impl Service {
                 if action == "resume" {
                     let current = self.latest(&format!("{}#{number}", s(&repo, "name")))?;
                     ensure!(
-                        current.as_ref().is_some_and(|j| ["paused", "held"]
-                            .contains(&s(j, "state"))
-                            && !(s(j, "state") == "paused"
-                                && n(j, "startedAt") > 0
-                                && j["session"].is_null()
-                                && j["report"].is_null())),
+                        current.as_ref().is_some_and(can_resume),
                         "No paused review with saved work to resume"
                     );
                     if a.get("model").is_some() || a.get("effort").is_some() {
@@ -730,7 +812,7 @@ impl Service {
                         } else {
                             let cfg = patch(
                                 self.config.clone(),
-                                &json!({"worker":patch(self.config["worker"].clone(),&worker["defaults"])}),
+                                &json!({"worker": self.worker_settings(&worker)}),
                             );
                             config::settings(&cfg, Some(&repo))?
                         };
@@ -773,13 +855,9 @@ impl Service {
             "pause" => {
                 let repo = self.repo(string(&a["repo"], "repository")?)?;
                 let number = number_argument(a)?;
-                for j in self.all("jobs")?.iter().filter(|j| {
-                    j["repo"] == repo["name"]
-                        && n(j, "number") == number
-                        && ACTIVE.contains(&s(j, "state"))
-                }) {
-                    self.update(s(j,"id"),json!({"state":"paused","autoRecover":false,"reason":"Paused by the operator"}),None)?;
-                }
+                let paused =
+                    json!({"state":"paused","autoRecover":false,"reason":"Paused by the operator"});
+                self.update_active(s(&repo, "name"), number, paused)?;
                 Ok(json!({"paused":true}))
             }
             "catch-up" => {
@@ -822,13 +900,63 @@ impl Service {
             _ => bail!("Unknown administrative action"),
         }
     }
+    /// Hand a claimed job to its worker after rechecking the PR on GitHub. The
+    /// worker gets a read-only source token; publication credentials stay here.
+    async fn dispatch(&self, job: &Value, worker: &Value) -> Result<Value> {
+        let id = s(job, "id");
+        let lease = s(job, "lease");
+        let assigned = self.repo(s(job, "repo"))?;
+        let (pr, _) = self.refresh(&assigned, n(job, "number")).await?;
+        let token = self.github.checkout_token(&assigned).await?;
+        if !self.owns(id, lease, "reviewing")? {
+            return Ok(Value::Null);
+        }
+        // Enrollment can change while GitHub calls are pending.
+        let repo = self.repo(s(job, "repo"))?;
+        if !eligible(&repo, &pr)
+            || pr["head"]["sha"] != job["head"]
+            || pr["base"]["ref"] != job["target"]
+            || repo["worker"] != job["worker"]
+        {
+            self.update(id, json!({"state":"superseded"}), Some(lease))?;
+            if eligible(&repo, &pr) {
+                self.db(|db| db.queue(&repo, &pr, &json!({})))?;
+            }
+            return Ok(Value::Null);
+        }
+        // Settings are fixed when a review first starts and kept for recovery.
+        let settings = if job["settings"].is_null() {
+            let defaults = self.worker_settings(worker);
+            let config = patch(self.config.clone(), &json!({"worker": defaults}));
+            review_settings(&config::settings(&config, Some(&repo))?)
+        } else {
+            let mut settings = review_settings(&job["settings"]);
+            // Reviews started before provider selection ran on Codex.
+            if settings.get("provider").is_none() {
+                settings["provider"] = json!("codex");
+            }
+            settings
+        };
+        self.update(
+            id,
+            json!({"settings":settings,"author":pr["user"]["login"]}),
+            Some(lease),
+        )?;
+        Ok(json!({
+            "job": patch(job.clone(), &json!({"settings": settings})),
+            "pr": pr,
+            "token": token,
+            "repo": repo,
+        }))
+    }
     async fn worker_action(&self, action: &str, a: &Value, mut worker: Value) -> Result<Value> {
         object(a)?;
         worker["lastSeen"] = json!(now());
         if action == "next" && a.get("defaults").is_some() {
             object(&a["defaults"])?;
-            let mut candidate = self.config["worker"].clone();
+            let mut candidate = self.worker_settings(&Value::Null);
             for key in [
+                "provider",
                 "model",
                 "effort",
                 "subagents",
@@ -875,7 +1003,16 @@ impl Service {
                         && !active.iter().any(|id| id == s(j, "id"))
                 }) {
                     let usable = !job["session"].is_null() || !job["report"].is_null();
-                    self.update(s(job,"id"),json!({"state":if usable{"queued"}else{"paused"},"autoRecover":false,"reason":if usable{Value::Null}else{json!("Restart required: no saved provider session")}}),None)?;
+                    let change = if usable {
+                        json!({"state":"queued","autoRecover":false,"reason":null})
+                    } else {
+                        json!({
+                            "state": "paused",
+                            "autoRecover": false,
+                            "reason": "Restart required: no saved provider session",
+                        })
+                    };
+                    self.update(s(job, "id"), change, None)?;
                 }
             }
             let job = self.db(|db| {
@@ -883,7 +1020,7 @@ impl Service {
                     .get("state", "drain")?
                     .is_some_and(|v| v.as_bool() == Some(true))
                     || db
-                        .get("state", "cooldown")?
+                        .get("state", &cooldown_key(&worker))?
                         .and_then(|v| v.as_i64())
                         .unwrap_or(0)
                         > now()
@@ -914,24 +1051,14 @@ impl Service {
             let Some(job) = job else {
                 return Ok(Value::Null);
             };
-            let dispatch=async {
-                let assigned_repo = self.repo(s(&job,"repo"))?;
-                let (pr,_) = self.refresh(&assigned_repo,n(&job,"number")).await?;
-                // Publication credentials stay in the service. Workers only fetch source.
-                let token = self.github.checkout_token(&assigned_repo).await?;
-                if !self.owns(s(&job,"id"),s(&job,"lease"),"reviewing")? {return Ok(Value::Null);}
-                let repo=self.repo(s(&job,"repo"))?;
-                if !eligible(&repo,&pr) || pr["head"]["sha"]!=job["head"] || pr["base"]["ref"]!=job["target"] || repo["worker"]!=job["worker"] {
-                    self.update(s(&job,"id"),json!({"state":"superseded"}),Some(s(&job,"lease")))?;
-                    if eligible(&repo,&pr){self.db(|db|db.queue(&repo,&pr,&json!({})))?;}
-                    return Ok(Value::Null);
-                }
-                let effective=if !job["settings"].is_null(){review_settings(&job["settings"])}else{let cfg=patch(self.config.clone(),&json!({"worker":patch(self.config["worker"].clone(),&worker["defaults"])}));review_settings(&config::settings(&cfg,Some(&repo))?)};
-                self.update(s(&job,"id"),json!({"settings":effective,"author":pr["user"]["login"]}),Some(s(&job,"lease")))?;
-                Ok(json!({"job":patch(job.clone(),&json!({"settings":effective})),"pr":pr,"token":token,"repo":repo}))
-            }.await;
+            let dispatch = self.dispatch(&job, &worker).await;
             if dispatch.is_err() && self.owns(s(&job, "id"), s(&job, "lease"), "reviewing")? {
-                self.update(s(&job,"id"),json!({"state":"queued","nextAt":now()+30000,"reason":"GitHub connection failed; dispatch will retry."}),Some(s(&job,"lease")))?;
+                let retry = json!({
+                    "state": "queued",
+                    "nextAt": now() + 30000,
+                    "reason": "GitHub connection failed; dispatch will retry.",
+                });
+                self.update(s(&job, "id"), retry, Some(s(&job, "lease")))?;
             }
             return dispatch;
         }
@@ -939,7 +1066,14 @@ impl Service {
             return Ok(json!({"ok":true,"id":worker["id"]}));
         }
         if action == "maintenance" {
-            let jobs=self.all("jobs")?.iter().filter(|j|j["worker"]==worker["id"]).map(|j|json!({"id":j["id"],"state":j["state"],"updatedAt":j["updatedAt"],"session":j["session"]})).collect::<Vec<_>>();
+            let jobs: Vec<Value> = self
+                .all("jobs")?
+                .iter()
+                .filter(|j| j["worker"] == worker["id"])
+                .map(|j| {
+                    json!({"id":j["id"],"state":j["state"],"updatedAt":j["updatedAt"],"session":j["session"]})
+                })
+                .collect();
             return Ok(json!({"jobs":jobs,"retentionDays":self.config["retentionDays"]}));
         }
         let id = string(&a["id"], "job ID")?;
@@ -978,13 +1112,27 @@ impl Service {
                 if !j["comparison"].is_null()
                     && comparison_key(&j["comparison"]) != comparison_key(&c)
                 {
-                    self.update(id, json!({"state":"superseded"}), Some(lease))?;
-                    self.enqueue(
-                        &self.repo(s(&j, "repo"))?,
-                        n(&j, "number"),
-                        &json!({"restart":true}),
-                    )
-                    .await?;
+                    // Queue the replacement before retiring this job. If GitHub is
+                    // unavailable, requeue this job instead; its next lease finds
+                    // the changed comparison again.
+                    let replacement = self
+                        .enqueue(
+                            &self.repo(s(&j, "repo"))?,
+                            n(&j, "number"),
+                            &json!({"restart":true}),
+                        )
+                        .await;
+                    if self.owns(id, lease, "reviewing")? {
+                        let change = match replacement {
+                            Ok(_) => json!({"state":"superseded"}),
+                            Err(_) => json!({
+                                "state": "queued",
+                                "nextAt": now() + 30000,
+                                "reason": "GitHub connection failed; the changed comparison will be queued on retry.",
+                            }),
+                        };
+                        self.update(id, change, Some(lease))?;
+                    }
                     return Ok(json!({"cancel":true}));
                 }
                 let mut previous = self.get(
@@ -1012,7 +1160,13 @@ impl Service {
                     }
                 }
                 if let Some(previous) = previous.filter(|_| !b(&j, "manual")) {
-                    self.update(id,json!({"state":"completed","comparison":c,"reviewUrl":previous["reviewUrl"],"reason":null}),Some(lease))?;
+                    let completed = json!({
+                        "state": "completed",
+                        "comparison": c,
+                        "reviewUrl": previous["reviewUrl"],
+                        "reason": null,
+                    });
+                    self.update(id, completed, Some(lease))?;
                     return Ok(json!({"skip":true}));
                 }
                 for field in ["guidanceFingerprint", "guidanceTargetSha"] {
@@ -1101,24 +1255,47 @@ impl Service {
                         "Provider interrupted; retry {count}/{} is scheduled.",
                         n(retry, "count")
                     );
+                    // A provider outage delays this worker's other reviews too. Workers
+                    // can use different providers and accounts, so others continue.
+                    let key = cooldown_key(&worker);
                     self.db(|db| {
                         db.tx(|db| {
-                            let cooldown = db
-                                .get("state", "cooldown")?
-                                .and_then(|v| v.as_i64())
-                                .unwrap_or(0);
-                            db.put("state", "cooldown", &json!(cooldown.max(next_at)))
+                            let cooldown =
+                                db.get("state", &key)?.and_then(|v| v.as_i64()).unwrap_or(0);
+                            db.put("state", &key, &json!(cooldown.max(next_at)))
                         })
                     })?;
                 }
-                match kind {"auth"=>reason="Codex subscription login needs attention on the worker. Then resume this review.".to_owned(),"quota"=>reason="Subscription usage is unavailable. Resume when quota is available.".to_owned(),"config"=>reason="The configured model or reasoning level is unavailable. Check Crow settings on the worker.".to_owned(),_=>{}}
-                if kind == "restart"
-                    || (j["session"].is_null() && !["auth", "quota", "config"].contains(&kind))
-                {
-                    reason = "Restart required: no usable saved provider session.".to_owned();
-                }
-                if kind == "output" {
-                    reason="Codex did not return a valid completed report. Resume the saved session to correct it.".to_owned();
+                // Without a saved session, resume is refused, so name the command that works.
+                let saved = !j["session"].is_null();
+                let then = if saved { "resume" } else { "restart" };
+                match kind {
+                    "auth" => {
+                        reason = format!(
+                            "The worker's provider login needs attention. Run crow login on the worker, then {then} this review."
+                        )
+                    }
+                    "quota" => {
+                        reason = format!(
+                            "Subscription usage is unavailable. {} this review when usage is available.",
+                            if saved { "Resume" } else { "Restart" }
+                        )
+                    }
+                    "config" => {
+                        reason = format!(
+                            "The configured model or reasoning level is unavailable. Check Crow settings on the worker, then {then} this review."
+                        )
+                    }
+                    "output" if saved => {
+                        reason = "The provider did not return a valid completed report. Resume the saved session to correct it.".to_owned()
+                    }
+                    "restart" => {
+                        reason = "Restart required: no usable saved provider session.".to_owned()
+                    }
+                    _ if !saved => {
+                        reason = "Restart required: no usable saved provider session.".to_owned()
+                    }
+                    _ => {}
                 }
                 self.update(
                     id,
@@ -1130,6 +1307,9 @@ impl Service {
             _ => bail!("Unknown worker action"),
         }
     }
+}
+fn cooldown_key(worker: &Value) -> String {
+    format!("cooldown:{}", s(worker, "id"))
 }
 fn number_argument(a: &Value) -> Result<i64> {
     let n = a["number"]
@@ -1327,7 +1507,12 @@ async fn handler(State(service): State<Arc<Service>>, request: Request<Body>) ->
                     .collect::<Vec<_>>();
                 return Ok((
                     200,
-                    json!({"repos":service.all("repos")?,"workers":workers,"jobs":jobs,"draining":service.get("state","drain")?.is_some_and(|x|x.as_bool()==Some(true))}),
+                    json!({
+                        "repos": service.all("repos")?,
+                        "workers": workers,
+                        "jobs": jobs,
+                        "draining": service.get("state", "drain")?.is_some_and(|x| x.as_bool() == Some(true)),
+                    }),
                 ));
             }
             if method != "POST" {
@@ -1471,31 +1656,51 @@ pub async fn start_service_with_github(
 ) -> Result<ServiceHandle> {
     let (started, ready) = tokio::sync::oneshot::channel();
     let (commands, mut receiver) = tokio::sync::mpsc::unbounded_channel::<ServiceCommand>();
-    let thread = std::thread::Builder::new().name("crow-service".into()).spawn(move || -> Result<()> {
-        let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-            Ok(runtime) => runtime,
-            Err(error) => { let _ = started.send(Err(anyhow!(error))); return Ok(()); }
-        };
-        runtime.block_on(async move {
-            let running = match start_on_runtime(config, root, github).await {
-                Ok(running) => running,
-                Err(error) => { let _ = started.send(Err(error)); return Ok(()); }
-            };
-            let cancel = running.cancel.clone();
-            if started.send(Ok((running.service.clone(), running.address, cancel.clone()))).is_err() { return running.close().await; }
-            let mut calls = tokio::task::JoinSet::new();
-            loop {
-                tokio::select! { biased;
-                    _ = cancel.cancelled() => break,
-                    command = receiver.recv() => match command { Some(command) => { calls.spawn(command); }, None => break },
-                    _ = calls.join_next(), if !calls.is_empty() => {},
+    let thread = std::thread::Builder::new()
+        .name("crow-service".into())
+        .spawn(move || -> Result<()> {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = started.send(Err(anyhow!(error)));
+                    return Ok(());
                 }
-            }
-            cancel.cancel();
-            while calls.join_next().await.is_some() {}
-            running.close().await
-        })
-    })?;
+            };
+            runtime.block_on(async move {
+                let running = match start_on_runtime(config, root, github).await {
+                    Ok(running) => running,
+                    Err(error) => {
+                        let _ = started.send(Err(error));
+                        return Ok(());
+                    }
+                };
+                let cancel = running.cancel.clone();
+                let ready = (running.service.clone(), running.address, cancel.clone());
+                if started.send(Ok(ready)).is_err() {
+                    return running.close().await;
+                }
+                let mut calls = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => break,
+                        command = receiver.recv() => match command {
+                            Some(command) => {
+                                calls.spawn(command);
+                            }
+                            None => break,
+                        },
+                        _ = calls.join_next(), if !calls.is_empty() => {},
+                    }
+                }
+                cancel.cancel();
+                while calls.join_next().await.is_some() {}
+                running.close().await
+            })
+        })?;
     match ready.await {
         Ok(Ok((service, address, cancel))) => Ok(ServiceHandle {
             service,
@@ -1539,7 +1744,16 @@ async fn start_on_runtime(
         s(j, "state") == "reviewing"
             || (restored && ["queued", "retrying"].contains(&s(j, "state")))
     }) {
-        store.update_job(s(j,"id"),&json!({"state":"paused","autoRecover":!restored,"reason":if restored{"Backup restored. Resume after checking worker availability."}else{"Service restarted; waiting for the worker to reconnect."}}),None)?;
+        let reason = if restored {
+            "Backup restored. Resume after checking worker availability."
+        } else {
+            "Service restarted; waiting for the worker to reconnect."
+        };
+        store.update_job(
+            s(j, "id"),
+            &json!({"state":"paused","autoRecover":!restored,"reason":reason}),
+            None,
+        )?;
     }
     if restored {
         std::fs::remove_file(root.join("restore-pending.json"))?;
@@ -1567,15 +1781,47 @@ async fn start_on_runtime(
         Ok(())
     });
     let mut tasks = Vec::new();
-    for kind in 0..3 {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Background {
+        Events,
+        Publication,
+        DeliveryAudit,
+    }
+    for task in [
+        Background::Events,
+        Background::Publication,
+        Background::DeliveryAudit,
+    ] {
         let service = service.clone();
         let cancel = cancel.clone();
         tasks.push(tokio::spawn(async move {
-            let duration=if kind==2{n(&service.config,"auditIntervalMs").max(1) as u64}else{1000};
-            let mut interval=tokio::time::interval(Duration::from_millis(duration));interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            // Event and publication processing begin on the first scheduled tick.
-            if kind!=2 {interval.tick().await;}
-            loop {tokio::select! {biased; _=cancel.cancelled()=>break,_=interval.tick()=>{let result=match kind {0=>service.tick().await,1=>service.publish_tick().await,_=>service.audit().await};if let Err(e)=result{eprintln!("Service task deferred: {e}");}}}}
+            let period = match task {
+                Background::DeliveryAudit => n(&service.config, "auditIntervalMs").max(1) as u64,
+                _ => 1000,
+            };
+            let mut interval = tokio::time::interval(Duration::from_millis(period));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Events and publication begin on the first scheduled tick; the
+            // delivery audit also runs immediately to repair missed webhooks.
+            if task != Background::DeliveryAudit {
+                interval.tick().await;
+            }
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    _ = interval.tick() => {
+                        let result = match task {
+                            Background::Events => service.tick().await,
+                            Background::Publication => service.publish_tick().await,
+                            Background::DeliveryAudit => service.audit().await,
+                        };
+                        if let Err(e) = result {
+                            eprintln!("Service task deferred: {e}");
+                        }
+                    }
+                }
+            }
         }));
     }
     if b(&config["catchUp"], "enabled") {
@@ -2043,6 +2289,43 @@ mod tests {
         f.close().await;
     }
     #[tokio::test]
+    async fn comparison_change_retries_when_the_replacement_cannot_be_queued() {
+        let f = Fixture::new().await;
+        let first = f.prepared().await;
+        let changed = json!({"head":"a".repeat(40),"base":"e".repeat(40),"target":"main","targetSha":"f".repeat(40)});
+        let report =
+            |j: &Value| json!({"id":j["id"],"lease":j["lease"],"comparison":changed.clone()});
+        // A later lease of the same job finds a new merge base while GitHub is down.
+        f.handle
+            .service
+            .update(s(&first, "id"), json!({"state":"queued"}), None)
+            .unwrap();
+        let j = f.claim().await;
+        f.github.fail_pr.store(true, Ordering::Relaxed);
+        assert_eq!(
+            f.worker("comparison", report(&j)).await.unwrap()["cancel"],
+            true
+        );
+        let retried = f.job(s(&j, "id"));
+        assert_eq!(retried["state"], "queued");
+        assert!(n(&retried, "nextAt") > now());
+        // Once GitHub answers, the replacement is queued and this job retires.
+        f.handle
+            .service
+            .update(s(&j, "id"), json!({"nextAt":0}), None)
+            .unwrap();
+        let j = f.claim().await;
+        assert_eq!(
+            f.worker("comparison", report(&j)).await.unwrap()["cancel"],
+            true
+        );
+        assert_eq!(f.job(s(&j, "id"))["state"], "superseded");
+        let latest = f.handle.service.latest("owner/project#1").unwrap().unwrap();
+        assert_ne!(latest["id"], j["id"]);
+        assert_eq!(latest["state"], "queued");
+        f.close().await;
+    }
+    #[tokio::test]
     async fn supersession_invalidates_old_lease_and_waits_for_running_process() {
         let f = Fixture::new().await;
         let old = f.queue().await;
@@ -2379,16 +2662,99 @@ mod tests {
             .unwrap();
         let j = f.claim().await;
         let deadline = now() + 900000;
+        let key = format!("cooldown:{}", s(&j, "worker"));
         f.handle
             .service
-            .db(|db| db.put("state", "cooldown", &json!(deadline)))
+            .db(|db| db.put("state", &key, &json!(deadline)))
             .unwrap();
         f.worker("failed",json!({"id":j["id"],"lease":j["lease"],"kind":"transient","session":"12345678-abcd-abcd-abcd-123456789012"})).await.unwrap();
         assert_eq!(f.job(s(&j, "id"))["state"], "retrying");
         assert_eq!(
-            f.handle.service.get("state", "cooldown").unwrap().unwrap(),
+            f.handle.service.get("state", &key).unwrap().unwrap(),
             deadline
         );
+        assert!(f.handle.service.get("state", "cooldown").unwrap().is_none());
+        f.close().await;
+    }
+    #[tokio::test]
+    async fn reviews_keep_the_provider_their_worker_reported() {
+        // An older worker reports no provider; the service host's setting must not be used.
+        let f = Fixture::new().await;
+        f.queue().await;
+        let j = f.claim().await;
+        assert!(j["settings"].get("provider").is_none(), "{}", j["settings"]);
+        // Once started, a review without a recorded provider stays on Codex.
+        f.handle
+            .service
+            .update(s(&j, "id"), json!({"state":"queued"}), None)
+            .unwrap();
+        assert_eq!(f.claim().await["settings"]["provider"], "codex");
+        f.close().await;
+        let f = Fixture::new().await;
+        f.queue().await;
+        let defaults = json!({"provider":"claude","model":"opus","effort":"high"});
+        let j = f
+            .worker("next", json!({"active":[],"defaults":defaults}))
+            .await
+            .unwrap()["job"]
+            .clone();
+        assert_eq!(j["settings"]["provider"], "claude");
+        assert_eq!(f.job(s(&j, "id"))["settings"]["provider"], "claude");
+        assert!(
+            f.worker("next", json!({"active":[],"defaults":{"provider":"other"}}))
+                .await
+                .is_err()
+        );
+        f.close().await;
+    }
+    #[test]
+    fn eligibility_ignores_author_case_and_skips_drafts() {
+        let alice = json!({"state":"open","user":{"login":"alice"}});
+        assert!(eligible(&json!({"authors":["ALICE"]}), &alice));
+        assert!(!eligible(&json!({"authors":["bob"]}), &alice));
+        assert!(!eligible(
+            &json!({"policy":"everyone"}),
+            &json!({"state":"open","draft":true})
+        ));
+        assert!(!eligible(
+            &json!({"policy":"everyone"}),
+            &json!({"state":"closed"})
+        ));
+    }
+    #[tokio::test]
+    async fn paused_reasons_name_the_command_that_works() {
+        let f = Fixture::new().await;
+        let session = "12345678-abcd-abcd-abcd-123456789012";
+        let restart = json!({"repo":"owner/project","number":1});
+        let j = f.prepared().await;
+        // Authentication failed before the provider saved a session: resume is refused.
+        f.worker(
+            "failed",
+            json!({"id":j["id"],"lease":j["lease"],"kind":"auth"}),
+        )
+        .await
+        .unwrap();
+        assert!(s(&f.job(s(&j, "id")), "reason").contains("then restart this review"));
+        assert!(f.handle.admin("resume", &restart).await.is_err());
+        f.handle.admin("restart", &restart).await.unwrap();
+        let j = f.claim().await;
+        f.worker(
+            "failed",
+            json!({"id":j["id"],"lease":j["lease"],"kind":"auth","session":session}),
+        )
+        .await
+        .unwrap();
+        assert!(s(&f.job(s(&j, "id")), "reason").contains("then resume this review"));
+        f.handle.admin("resume", &restart).await.unwrap();
+        let j = f.claim().await;
+        // A rejected saved session always needs a restart.
+        f.worker(
+            "failed",
+            json!({"id":j["id"],"lease":j["lease"],"kind":"restart","session":session}),
+        )
+        .await
+        .unwrap();
+        assert!(s(&f.job(s(&j, "id")), "reason").starts_with("Restart required"));
         f.close().await;
     }
     #[tokio::test]

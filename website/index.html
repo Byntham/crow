@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="description" content="Install Crow, a self-hosted GitHub pull request reviewer that uses your Codex subscription.">
+    <meta name="description" content="Install Crow, a self-hosted GitHub pull request reviewer that uses your Codex or Claude Code subscription.">
     <title>Install Crow</title>
     <style>
       :root { color-scheme: light dark; font-family: system-ui, sans-serif; line-height: 1.6; }
@@ -18,10 +18,10 @@
   <body>
     <main>
       <h1>Install Crow</h1>
-      <p>Crow reviews GitHub pull requests on a machine you control, using your Codex subscription. It runs in the background and leaves its reviews on GitHub.</p>
+      <p>Crow reviews GitHub pull requests on a machine you control, using your Codex or Claude Code subscription. It runs in the background and leaves its reviews on GitHub.</p>
       <p>On an Ubuntu or compatible Linux machine with x64 or ARM64 architecture, run:</p>
       <pre><code>curl -fsSL https://birdapp.dev/install.sh | sh</code></pre>
-      <p>The installer downloads the native executable, verifies its checksum, and offers to start guided setup. Node, pnpm, and Docker are not required. Setup may offer to install Git, Codex, and a tunnel client when they are missing.</p>
+      <p>The installer downloads the native executable, verifies its checksum, and offers to start guided setup. Docker is not required. Setup may offer to install Git, Codex or Claude Code, and a tunnel client when they are missing.</p>
       <p>Keep this terminal open for setup. On a headless machine, open the printed authentication links in a browser on your desktop.</p>
       <p>You can <a href="/install.sh">read the installer</a> before running it. To install now and configure Crow later:</p>
       <pre><code>curl -fsSL https://birdapp.dev/install.sh | sh -s -- --no-setup
@@ -32,7 +32,7 @@ crow setup</code></pre>
       <p>Download the archive for your machine and the checksum file into the same directory. Verify the checksum before extracting and running <code>./crow setup</code>:</p>
       <pre><code>sha256sum --check --ignore-missing SHA256SUMS</code></pre>
       <p>Stop if verification fails. Setup installs the permanent <code>crow</code> command.</p>
-      <p>Each installation runs independently. This website serves downloads; it does not receive your repositories, Codex credentials, or review traffic.</p>
+      <p>Each installation runs independently. This website serves downloads; it does not receive your repositories, provider credentials, or review traffic.</p>
     </main>
     <footer>
       <p>Guided installation supports glibc distributions such as Ubuntu and Debian. The Crow executable is static; Alpine Linux, macOS, and Windows remain unsupported installation platforms. Crow is under active development.</p>

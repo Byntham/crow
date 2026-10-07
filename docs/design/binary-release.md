@@ -1,6 +1,6 @@
 # Native binary releases
 
-Crow releases contain a Rust executable with bundled SQLite and rustls for HTTPS. Git, Codex, and the selected ingress client remain separate programs. Linux x64 and arm64 release executables statically link musl, so their startup does not depend on the build host's glibc version. Ubuntu 20.04 and Debian 11 remain supported. Guided installation supports glibc distributions because the separately installed tools have their own platform requirements. Alpine, macOS, and Windows remain outside the supported installation configuration.
+Crow releases contain a Rust executable with bundled SQLite and rustls for HTTPS. Git, the review provider (Codex or Claude Code), and the selected ingress client remain separate programs. Linux x64 and arm64 release executables statically link musl, so their startup does not depend on the build host's glibc version. Ubuntu 20.04 and Debian 11 remain supported. Guided installation supports glibc distributions because the separately installed tools have their own platform requirements. Alpine, macOS, and Windows remain outside the supported installation configuration.
 
 ## Build and release
 

@@ -436,7 +436,7 @@ async fn runtime_tool_policy_and_delegation() -> Result<()> {
     let root = fixture.directory.path();
     let instruction = root.join("codex/AGENTS.md");
     fs::write(&instruction, "CROW_UNRELATED_INSTRUCTION_SENTINEL")?;
-    let rejection = provider::provider_environment(&fixture.job["settings"], root)
+    let rejection = provider::environment(&fixture.job["settings"], root)
         .err()
         .context("Global instruction guard accepted unrelated instructions")?;
     ensure!(provider::classify_error(&rejection).kind == "config");

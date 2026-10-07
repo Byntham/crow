@@ -619,13 +619,18 @@ pub async fn update(config: &Value, root: &Path) -> Result<Value> {
 }
 
 pub async fn update_availability(root: &Path) -> Result<Value> {
+    const DAY: i64 = 86_400_000;
+    const HOUR: i64 = 3_600_000;
     let file = root.join("update-status.json");
     let previous = util::read_json(&file).ok().flatten().unwrap_or(Value::Null);
     let now = util::now();
-    if previous["checkedAt"]
-        .as_i64()
-        .is_some_and(|at| at <= now && now - at < 86_400_000)
-    {
+    let recent = |key: &str, age: i64| {
+        previous[key]
+            .as_i64()
+            .is_some_and(|at| at <= now && now - at < age)
+    };
+    // A failed check is retried hourly instead of being remembered as current.
+    if recent("checkedAt", DAY) || recent("failedAt", HOUR) {
         let mut result = previous;
         if let Some(map) = result.as_object_mut() {
             map.insert("cached".into(), json!(true));
@@ -633,11 +638,22 @@ pub async fn update_availability(root: &Path) -> Result<Value> {
         return Ok(result);
     }
     let check = install::check_update(env!("CARGO_PKG_VERSION")).await?;
-    let warning = check["warning"].as_str();
-    let mut result = json!({"checkedAt":now,"available":if warning.is_some() {previous["available"].clone()} else {check["available"].clone()},"version":check.get("version").or_else(||previous.get("version")).cloned().unwrap_or(Value::Null),"cached":warning.is_some() && !previous.is_null()});
-    if let Some(warning) = warning {
-        result["warning"] = json!(warning);
-    }
+    let result = match check["warning"].as_str() {
+        None => json!({
+            "checkedAt": now,
+            "available": check["available"],
+            "version": check["version"],
+            "cached": false,
+        }),
+        Some(warning) => json!({
+            "checkedAt": previous["checkedAt"],
+            "failedAt": now,
+            "available": previous["available"],
+            "version": previous["version"],
+            "cached": !previous.is_null(),
+            "warning": warning,
+        }),
+    };
     let _ = util::atomic(&file, &result);
     Ok(result)
 }
@@ -758,15 +774,13 @@ pub async fn doctor(config: &Value, root: &Path, runtime: bool) -> Result<Value>
         .await;
         check_result(&mut checks, "subscription authentication", auth);
         if runtime {
-            let diagnostics = async {
-                let result = crate::provider::diagnostics(&config["worker"], root, true).await?;
-                if result["ok"] != true {
-                    bail!("{result}");
-                }
-                Ok(result)
+            match crate::provider::diagnostics(&config["worker"], root, true).await {
+                // Keep failed capability checks structured for --format json.
+                Ok(result) => checks.push(
+                    json!({"name":"review runtime","ok":result["ok"] == true,"detail":result}),
+                ),
+                Err(error) => check_result(&mut checks, "review runtime", Err(error)),
             }
-            .await;
-            check_result(&mut checks, "review runtime", diagnostics);
         }
     }
     let persistent = async {

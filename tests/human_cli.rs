@@ -58,6 +58,10 @@ impl Fixture {
     }
 
     async fn run(&self, args: &[&str]) -> Result<Output> {
+        self.run_with(args, &[]).await
+    }
+
+    async fn run_with(&self, args: &[&str], env: &[(&str, &str)]) -> Result<Output> {
         let binary = std::env::var("CROW_TEST_BINARY")
             .unwrap_or_else(|_| env!("CARGO_BIN_EXE_crow").to_owned());
         Ok(tokio::time::timeout(
@@ -67,6 +71,7 @@ impl Fixture {
                 .env("CROW_HOME", self.root.path())
                 .env("PATH", "")
                 .env("NO_COLOR", "1")
+                .envs(env.iter().copied())
                 .output(),
         )
         .await??)
@@ -210,6 +215,92 @@ async fn config_accepts_plain_model_names_and_redacts_credentials() -> Result<()
     assert_eq!(redacted["worker"]["model"], "review-model");
     assert_eq!(redacted["adminToken"], "[hidden]");
     assert_eq!(redacted["worker"]["token"], "[hidden]");
+    Ok(())
+}
+
+#[tokio::test]
+async fn switching_provider_clears_provider_specific_models() -> Result<()> {
+    let status = json!({
+        "repos": [
+            {"name": "owner/api", "settings": {"model": "gpt-review"}},
+            {"name": "owner/web", "settings": {}},
+            {"name": "owner/docs", "settings": {"subagents": {"mode": "configured", "model": "gpt-mini", "effort": "low"}}},
+        ],
+        "workers": [],
+        "jobs": [],
+        "draining": false,
+    });
+    let fixture = Fixture::new("service", status).await?;
+    let mut saved = config::load(fixture.root.path())?;
+    saved["worker"]["model"] = json!("gpt-review");
+    saved["worker"]["effort"] = json!("high");
+    saved["worker"]["subagents"] =
+        json!({"mode":"configured","max":4,"model":"gpt-mini","effort":"low"});
+    config::save(fixture.root.path(), &saved)?;
+    // Choosing the current provider keeps the model.
+    stdout(&fixture.run(&["config", "worker.provider", "codex"]).await?);
+    assert_eq!(
+        config::load(fixture.root.path())?["worker"]["model"],
+        "gpt-review"
+    );
+    let human = stdout(
+        &fixture
+            .run(&["config", "worker.provider", "claude"])
+            .await?,
+    );
+    assert!(human.contains("crow login"), "{human}");
+    assert!(human.contains("owner/api"), "{human}");
+    assert!(human.contains("owner/docs"), "{human}");
+    assert!(!human.contains("owner/web"), "{human}");
+    let saved = config::load(fixture.root.path())?;
+    assert_eq!(saved["worker"]["provider"], "claude");
+    assert!(saved["worker"]["model"].is_null());
+    assert!(saved["worker"]["effort"].is_null());
+    assert_eq!(
+        saved["worker"]["subagents"],
+        json!({"mode":"inherit","max":4})
+    );
+    for value in ["gemini", "null"] {
+        let output = fixture.run(&["config", "worker.provider", value]).await?;
+        assert!(!output.status.success(), "accepted {value}");
+    }
+    assert_eq!(
+        config::load(fixture.root.path())?["worker"]["provider"],
+        "claude"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn switching_a_worker_to_claude_saves_the_executable_path() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new("worker", empty_status()).await?;
+    let home = tempfile::tempdir()?;
+    let home = home.path().to_str().unwrap();
+    // Without Claude Code, the switch is refused and the provider is unchanged.
+    let missing = fixture
+        .run_with(&["config", "worker.provider", "claude"], &[("HOME", home)])
+        .await?;
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("claude.ai/install.sh"));
+    assert!(config::load(fixture.root.path())?["worker"]["provider"] != "claude");
+    let bin = tempfile::tempdir()?;
+    let claude = bin.path().join("claude");
+    std::fs::write(&claude, "#!/bin/sh\necho '2.1.289 (Claude Code)'\n")?;
+    std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755))?;
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+    stdout(
+        &fixture
+            .run_with(
+                &["config", "worker.provider", "claude"],
+                &[("HOME", home), ("PATH", &path)],
+            )
+            .await?,
+    );
+    let saved = config::load(fixture.root.path())?;
+    assert_eq!(saved["worker"]["provider"], "claude");
+    assert_eq!(saved["worker"]["claude"], json!(claude));
     Ok(())
 }
 

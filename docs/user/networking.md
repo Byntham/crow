@@ -22,7 +22,7 @@ Choose `cloudflare` and enter a hostname in a Cloudflare-managed DNS zone, such 
 
 Crow guides `cloudflared tunnel login`; open its authorization URL on your desktop. It creates a named tunnel, records its credentials, adds the DNS route, and installs a separate persistent user service for `cloudflared`. Temporary quick tunnels are not used because the GitHub App needs a stable webhook URL.
 
-This implementation uses Cloudflare's locally managed tunnel workflow. Its browser login creates an account certificate in `~/.cloudflared`, which has broader tunnel/DNS capabilities than an individual tunnel token. Keep that file private. Crow copies the tunnel-specific credential into its private state directory. HTTPS requests pass through Cloudflare; your Codex authentication stays on your worker.
+This implementation uses Cloudflare's locally managed tunnel workflow. Its browser login creates an account certificate in `~/.cloudflared`, which has broader tunnel/DNS capabilities than an individual tunnel token. Keep that file private. Crow copies the tunnel-specific credential into its private state directory. HTTPS requests pass through Cloudflare; your provider login stays on your worker.
 
 Cloudflare DNS must already manage the selected zone. Crow does not purchase domains or change nameservers. See [Cloudflare's local tunnel guide](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/local-management/create-local-tunnel/).
 

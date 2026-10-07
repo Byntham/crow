@@ -40,6 +40,8 @@ struct Active {
     cancel: CancellationToken,
     done: watch::Receiver<bool>,
 }
+/// Settings that select a child's provider and its executable and state directory.
+const PROVIDER_FIELDS: &[&str] = &["provider", "codex", "codexHome", "claude", "claudeHome"];
 fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
@@ -97,7 +99,7 @@ fn valid_saved(v: &Value) -> bool {
         && matches!(s["retry"]["mode"].as_str(), Some("fixed" | "progressive"))
         && s["retry"]["count"].is_number()
         && s["retry"]["delayMs"].is_number()
-        && ["codex", "codexHome"]
+        && PROVIDER_FIELDS
             .iter()
             .all(|k| s.get(*k).is_none_or(Value::is_string))
         && [
@@ -172,16 +174,55 @@ async fn atomic(path: &Path, value: &Value) -> Result<()> {
     }
     result
 }
-pub fn tools() -> Value {
-    Value::Array(delegation_tools())
-}
-pub fn delegation_tools() -> Vec<Value> {
+/// MCP definitions for the delegation tools served to a parent reviewer.
+pub fn tools() -> Vec<Value> {
+    let tool = |name: &str, description: &str, properties: Value, required: &[&str]| {
+        json!({
+            "name": name,
+            "description": description,
+            "inputSchema": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+                "additionalProperties": false,
+            },
+        })
+    };
+    let id = json!({"id": {"type": "string"}});
     vec![
-        json!({"name":"start_review_task","description":"Delegate a bounded independent code-inspection task. Model, reasoning, permissions and concurrency are fixed by Crow. Await relevant results before returning the consolidated report.","properties":{"task":{"type":"string"}},"required":["task"]}),
-        json!({"name":"review_task_status","description":"Read saved delegated task states and complete reports. Paused tasks need explicit resume.","properties":{"id":{"type":"string"}}}),
-        json!({"name":"resume_review_task","description":"Resume a paused task from its saved session after nextAttemptAt. Retry limits are enforced by Crow.","properties":{"id":{"type":"string"}},"required":["id"]}),
-        json!({"name":"restart_review_task","description":"Replace a paused task without a saved session. Retains its task, settings and failure budget.","properties":{"id":{"type":"string"}},"required":["id"]}),
-        json!({"name":"wait_review_task","description":"Wait briefly for a delegated task and return its state and complete report when available.","properties":{"id":{"type":"string"},"timeoutMs":{"type":"integer","minimum":1,"maximum":30000}},"required":["id"]}),
+        tool(
+            "start_review_task",
+            "Delegate a bounded independent code-inspection task. Model, reasoning, permissions and concurrency are fixed by Crow. Await relevant results before returning the consolidated report.",
+            json!({"task": {"type": "string"}}),
+            &["task"],
+        ),
+        tool(
+            "review_task_status",
+            "Read saved delegated task states and complete reports. Paused tasks need explicit resume.",
+            id.clone(),
+            &[],
+        ),
+        tool(
+            "resume_review_task",
+            "Resume a paused task from its saved session after nextAttemptAt. Retry limits are enforced by Crow.",
+            id.clone(),
+            &["id"],
+        ),
+        tool(
+            "restart_review_task",
+            "Replace a paused task without a saved session. Retains its task, settings and failure budget.",
+            id,
+            &["id"],
+        ),
+        tool(
+            "wait_review_task",
+            "Wait briefly for a delegated task and return its state and complete report when available.",
+            json!({
+                "id": {"type": "string"},
+                "timeoutMs": {"type": "integer", "minimum": 1, "maximum": 30000},
+            }),
+            &["id"],
+        ),
     ]
 }
 impl Delegation {
@@ -268,13 +309,31 @@ impl Delegation {
                     task["consecutiveFailures"] = json!(0);
                     task["outputFailures"] = json!(0);
                     remove(&mut task, &["nextAttemptAt"]);
+                    let parent = &this.inner.context["job"]["settings"];
+                    let provider = |s: &Value| s["provider"].as_str().unwrap_or("codex").to_owned();
+                    if provider(&task["settings"]) != provider(parent) {
+                        // Sessions belong to one provider; the task can only restart.
+                        for field in PROVIDER_FIELDS {
+                            match parent.get(*field) {
+                                Some(v) => task["settings"][*field] = v.clone(),
+                                None => remove(&mut task["settings"], &[field]),
+                            }
+                        }
+                        remove(&mut task, &["session"]);
+                    }
                     let next = effective(&this.inner.context["job"]["settings"]);
                     let previous = selection(&task["settings"]);
                     if next != previous {
                         if task.get("settingsHistory").is_none() {
                             task["settingsHistory"] = json!([]);
                         }
-                        task["settingsHistory"].as_array_mut().unwrap().push(json!({"resumeEpoch":epoch,"changedAt":now(),"previous":previous,"next":next}));
+                        let change = json!({
+                            "resumeEpoch": epoch,
+                            "changedAt": now(),
+                            "previous": previous,
+                            "next": next,
+                        });
+                        task["settingsHistory"].as_array_mut().unwrap().push(change);
                         task["settings"]["model"] = next["model"].clone();
                         task["settings"]["effort"] = next["effort"].clone();
                     }
@@ -326,7 +385,17 @@ impl Delegation {
         let active = state.active.contains_key(id);
         let operator = t["requiresOperator"].as_bool().unwrap_or(false);
         let has_session = t["session"].as_str().is_some_and(|s| !s.is_empty());
-        let mut view = json!({"id":id,"state":if active {json!("running")} else {t["state"].clone()},"task":t["task"],"model":t["settings"]["model"],"effort":t["settings"]["effort"],"requiresOperator":!active && operator,"canResume":!active && t["state"] == "paused" && has_session && !operator,"canRestart":!active && t["state"] == "paused" && !has_session && !operator});
+        let paused = !active && t["state"] == "paused" && !operator;
+        let mut view = json!({
+            "id": id,
+            "state": if active { json!("running") } else { t["state"].clone() },
+            "task": t["task"],
+            "model": t["settings"]["model"],
+            "effort": t["settings"]["effort"],
+            "requiresOperator": !active && operator,
+            "canResume": paused && has_session,
+            "canRestart": paused && !has_session,
+        });
         if let Some(v) = t.get("replacement") {
             view["replacement"] = v.clone();
         }
@@ -552,7 +621,7 @@ impl Delegation {
         Ok(view)
     }
     pub async fn call(&self, name: &str, input: &Value) -> Result<Value> {
-        let definitions = delegation_tools();
+        let definitions = tools();
         let definition = definitions
             .iter()
             .find(|d| d["name"] == name)
@@ -564,7 +633,7 @@ impl Delegation {
         })?;
         ensure!(
             args.keys()
-                .all(|k| definition["properties"].get(k).is_some()),
+                .all(|k| definition["inputSchema"]["properties"].get(k).is_some()),
             "Unsupported delegated-task arguments; model and reasoning are controlled by Crow"
         );
         if name == "wait_review_task" {
@@ -639,14 +708,31 @@ impl Delegation {
             );
             let parent = &self.inner.context["job"]["settings"];
             let selected = effective(parent);
-            let mut settings = json!({"model":selected["model"],"effort":selected["effort"],"timeoutMs":parent["timeoutMs"].as_u64().unwrap_or(0),"retry":parent.get("retry").cloned().unwrap_or(json!({"mode":"fixed","count":10,"delayMs":5000})),"subagents":{"mode":"inherit","max":0}});
-            for field in ["codex", "codexHome"] {
-                if let Some(v) = parent.get(field).filter(|v| v.is_string()) {
-                    settings[field] = v.clone();
+            let retry = parent
+                .get("retry")
+                .cloned()
+                .unwrap_or(json!({"mode":"fixed","count":10,"delayMs":5000}));
+            let mut settings = json!({
+                "model": selected["model"],
+                "effort": selected["effort"],
+                "timeoutMs": parent["timeoutMs"].as_u64().unwrap_or(0),
+                "retry": retry,
+                "subagents": {"mode": "inherit", "max": 0},
+            });
+            for field in PROVIDER_FIELDS {
+                if let Some(v) = parent.get(*field).filter(|v| v.is_string()) {
+                    settings[*field] = v.clone();
                 }
             }
             let id = task_id();
-            let task = json!({"id":id,"task":text,"settings":settings,"state":"queued","createdAt":now(),"operatorResumeEpoch":self.inner.epoch});
+            let task = json!({
+                "id": id,
+                "task": text,
+                "settings": settings,
+                "state": "queued",
+                "createdAt": now(),
+                "operatorResumeEpoch": self.inner.epoch,
+            });
             self.inner
                 .state
                 .lock()
@@ -682,7 +768,18 @@ impl Delegation {
         );
         self.check_retry(id).await?;
         let replacement = task_id();
-        let next = json!({"id":replacement,"task":task["task"],"settings":task["settings"],"state":"queued","createdAt":now(),"consecutiveFailures":task["consecutiveFailures"].as_u64().unwrap_or(0),"outputFailures":task["outputFailures"].as_u64().unwrap_or(0),"replaces":id,"operatorResumeEpoch":self.inner.epoch});
+        // The replacement keeps the predecessor's failure budget.
+        let next = json!({
+            "id": replacement,
+            "task": task["task"],
+            "settings": task["settings"],
+            "state": "queued",
+            "createdAt": now(),
+            "consecutiveFailures": task["consecutiveFailures"].as_u64().unwrap_or(0),
+            "outputFailures": task["outputFailures"].as_u64().unwrap_or(0),
+            "replaces": id,
+            "operatorResumeEpoch": self.inner.epoch,
+        });
         self.inner
             .state
             .lock()
@@ -1077,8 +1174,12 @@ mod tests {
         ctx["job"]["settings"]["subagents"] =
             json!({"mode":"configured","max":2,"model":"child-model","effort":"low"});
         ctx["job"]["settings"]["codexProxy"] = json!({"url":"http://proxy"});
+        ctx["job"]["settings"]["provider"] = json!("claude");
+        ctx["job"]["settings"]["claudeHome"] = json!("/state/claude");
         let run: Runner = Arc::new(|job, _, _, _, _, _| {
             Box::pin(async move {
+                assert_eq!(job["settings"]["provider"], "claude");
+                assert_eq!(job["settings"]["claudeHome"], "/state/claude");
                 assert_eq!(job["settings"]["model"], "child-model");
                 assert_eq!(job["settings"]["subagents"]["max"], 0);
                 assert_eq!(job["settings"]["detached"], false);
@@ -1146,6 +1247,30 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+    #[tokio::test]
+    async fn provider_change_on_resume_drops_foreign_child_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = context(tmp.path(), 1);
+        let d = Delegation::init_with_runner(ctx.clone(), waiting_runner())
+            .await
+            .unwrap();
+        let mut task = paused_task(&d, Some("codex-session")).await;
+        task["settings"]["codexHome"] = json!("/state/codex");
+        atomic(&d.inner.dir.join("ab12.json"), &task).await.unwrap();
+        let mut resumed = ctx;
+        resumed["job"]["resumeEpoch"] = json!(1);
+        resumed["job"]["settings"]["provider"] = json!("claude");
+        resumed["job"]["settings"]["claudeHome"] = json!("/state/claude");
+        let d = Delegation::init_with_runner(resumed, waiting_runner())
+            .await
+            .unwrap();
+        let task = d.task("ab12").unwrap();
+        assert_eq!(task["settings"]["provider"], "claude");
+        assert_eq!(task["settings"]["claudeHome"], "/state/claude");
+        assert!(task["settings"].get("codexHome").is_none());
+        assert!(task.get("session").is_none());
+        assert_eq!(d.view("ab12").unwrap()["canRestart"], true);
     }
     #[tokio::test]
     async fn epoch_resets_budget_and_changes_settings_once() {

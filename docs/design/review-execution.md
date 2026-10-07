@@ -1,6 +1,6 @@
 # Review execution decisions
 
-These decisions were confirmed during the design interview. They describe intended behavior, not the current implementation or a complete implementation plan.
+These decisions describe how Crow runs reviews.
 
 Each worker allows three concurrent PR reviews by default, configurable by the operator. Within each review, the reviewer may delegate analysis to parallel subagents. The initial limit is eight simultaneous subagents per review, also configurable. Eight is a ceiling, not a target: the reviewer should delegate only as much work as is useful. The reviewer combines the results into one report.
 
@@ -14,7 +14,7 @@ Paused reviews resume on the original worker using its local provider session. S
 
 ## Review execution
 
-The Codex integration uses `codex exec` with subscription authentication. Crow supplies inspection tools and manages delegated child sessions to enforce model and execution policies. Installed-runtime probes verify parent/child interruption and saved-session continuation with local synthetic responses; live subscription refresh still needs validation. See ADR 0008 and `docs/design/runtime-validation.md`.
+Each worker uses one provider: Codex through `codex exec`, or Claude Code through `claude -p`, both with subscription authentication. Crow supplies the inspection tools and manages delegated child sessions to enforce model and execution policies for either provider. See ADR 0008 (Codex), ADR 0009 (Claude Code), and [runtime validation](runtime-validation.md).
 
 A newer PR revision supersedes an unfinished review of an older revision. Crow cancels obsolete work and queues the latest revision. Reports identify the commit actually reviewed.
 
@@ -28,11 +28,11 @@ During initial setup, Crow selects and displays the authenticated provider's rep
 
 Worker-wide model and reasoning defaults support per-repository overrides. Subagent settings have exactly two modes: Inherit, the default, uses the main reviewer's model and reasoning level; Configured uses the operator's separate subagent model and reasoning settings. The reviewer does not independently choose or override these settings. Crow must verify enforcement, account for provider custom agent configurations that can override spawn settings, and record actual selections.
 
-Crow obtains available model choices and their supported reasoning levels from the provider integration rather than maintaining a model catalog in this repository. Discovery must use the subscription-authenticated provider and must not require a separately billed API key. For Codex, the documented app-server `model/list` interface supplies model identifiers, display names, defaults, and supported reasoning efforts. It can serve discovery while `codex exec` continues to run reviews. The CLI also documents an experimental `debug models` command, whose raw JSON schema is not established as stable. The returned catalog reflects the authenticated runtime's view, not a guarantee of fresh entitlement validation.
+Crow obtains available model choices and their supported reasoning levels from the provider integration rather than maintaining a model catalog in this repository. Discovery must use the subscription-authenticated provider and must not require a separately billed API key. For Codex, the app-server `model/list` interface supplies model identifiers, display names, defaults, and supported reasoning efforts. For Claude Code, the SDK `initialize` handshake reports model aliases, the models they resolve to, and supported effort levels. The returned catalog reflects the authenticated runtime's view, not a guarantee of fresh entitlement validation.
 
 If refreshing the catalog fails, Crow explicitly notifies the operator that the current list could not be retrieved and displays the last successfully retrieved list, marked as cached. Existing reviews may continue with their configured models. Without a cached list, setup reports discovery as unavailable and offers a retry. Crow must not invent model choices or silently substitute a model.
 
-Crow captures model and reasoning settings when a review starts and preserves them during automatic recovery. Changes to defaults apply to new reviews. The operator may explicitly resume a paused review with different settings while retaining saved context where the provider supports it. Exact Codex exec behavior requires integration verification. Record effective settings and intentional changes with the review metadata.
+Crow captures model and reasoning settings when a review starts and preserves them during automatic recovery. Changes to defaults apply to new reviews. The operator may explicitly resume a paused review with different settings while retaining saved context where the provider supports it. Record effective settings and intentional changes with the review metadata.
 
 ## Enrollment and recovery
 
@@ -50,7 +50,7 @@ Later summaries represent earlier findings through links rather than posting ide
 
 Keep this presentation brief. A label such as "Earlier findings not reassessed" with links is sufficient; repeated explanatory disclaimers are unnecessary.
 
-This is a reporting requirement, not a requirement to supply all earlier findings to the model on every review. Crow preserves earlier GitHub comments and represents them in subsequent summaries so an agent reading the latest report does not mistake silence for resolution. Missing or unavailable history must not be silently interpreted as resolved findings. The mechanism for tracking and reconciling finding history remains to be designed.
+This is a reporting requirement, not a requirement to supply all earlier findings to the model on every review. Crow preserves earlier GitHub comments and represents them in subsequent summaries so an agent reading the latest report does not mistake silence for resolution. Missing or unavailable history must not be silently interpreted as resolved findings. Each finding has a stable identifier derived from its path and title, and summaries link earlier findings that the new report does not repeat.
 
 ## Review guidance
 
@@ -84,7 +84,7 @@ The default transient-failure recovery strategy is fixed interval: ten consecuti
 
 Both strategies count retries after the initial attempt and measure each delay from the preceding failure, not from the start of the review. Attempts for the same review must not overlap. Small random staggering and longer provider-requested waits can extend the nominal interval. Exhausting the retry allowance leaves the saved review paused. A separate interruption after confirmed successful progress can receive a fresh allowance; simply restarting a process or reconnecting does not establish successful progress. Waiting reviews release their active slot after their processes stop. Common provider outages share a cooldown and delay new starts. Semantic output errors, authentication failures, and exhausted subscription quota need their own recovery policies rather than blindly using the transient-outage schedule.
 
-Official Codex documentation supports continuing an explicitly identified saved session with `exec resume`. Resumable reviews cannot use the prototype's `--ephemeral` option. Crow must validate resumed output; schema behavior on resume, graceful interruption, subagent cleanup, and concurrent native subscription-authentication refresh require verification with the chosen runtime. Copied authentication caches are not an established solution to concurrent refresh.
+Both providers continue an explicitly identified saved session: Codex with `exec resume`, Claude Code with `--resume`. Crow validates resumed output the same way as new output and refuses to continue if the provider reports a different session. Copied authentication caches are not an established solution to concurrent token refresh, so each installation keeps one login per provider.
 
 ## Local data retention
 
@@ -98,15 +98,15 @@ GitHub receives concise operational explanations. Detailed errors and diagnostic
 
 ## Installation and updates
 
-Crow reuses the operator's existing official Codex installation. If Codex is absent, setup may install the latest official release from OpenAI. A special Crow-managed Codex version is not desired. Reusing the installation must not inadvertently apply unrelated global AGENTS.md or other personal agent configuration to a review. Crow supplies explicit invocation settings and trusted target-branch instructions. Isolation must be validated for primary, subagent, and resumed sessions. Runtime probes showed that invocation settings alone do not suppress personal global instructions. Crow therefore uses a separate settings/session directory with one subscription login while continuing to use the same installed executable. This login does not replace the operator's usual Codex login.
+Crow reuses the operator's existing Codex or Claude Code installation. If it is absent, setup may install the latest official release: Codex's standalone package from OpenAI, or Claude Code with Anthropic's installer. A special Crow-managed provider version is not desired. Reusing the installation must not inadvertently apply unrelated global AGENTS.md or other personal agent configuration to a review. Crow supplies explicit invocation settings and trusted target-branch instructions. Isolation must be validated for primary, subagent, and resumed sessions. Runtime probes showed that invocation settings alone do not suppress personal global instructions. Crow therefore uses a separate settings/session directory with one subscription login while continuing to use the same installed executable. This login does not replace the operator's usual login.
 
-Crow updates are explicit through `crow update`, with notifications when an update is available. Updating stops accepting new work, lets active reviews finish, and then updates and restarts the service. Crow must not silently replace an existing user-managed Codex installation.
+Crow updates are explicit through `crow update`, with notifications when an update is available. Updating stops accepting new work, lets active reviews finish, and then updates and restarts the service. Crow must not silently replace a user-managed provider installation.
 
 ## Connection-service storage and hosting
 
 The connection service retains account and worker associations, author policy, durable jobs, completion tracking, and GitHub status identifiers. Checkouts, provider authentication, saved review sessions, and detailed model output stay on workers. Webhook bodies can contain private PR descriptions and comments; the service extracts and durably stores the information needed for processing, then discards raw payloads. Short operational logs use a seven-day default retention period.
 
-Each user hosts their own Crow installation, including a connection service, durable storage, worker, and GitHub App. The operator's own installation runs on gibo. Separate native services preserve their roles without requiring rented compute or Docker. Other installations do not depend on gibo. The earlier shared-service default is superseded by ADR 0007.
+Each user hosts their own Crow installation, including a connection service, durable storage, worker, and GitHub App. Separate native services preserve their roles without requiring rented compute or Docker. No installation depends on another operator's machine. The earlier shared-service default is superseded by ADR 0007.
 
 One guided Crow setup flow supports both components together, connection-service-only setup, and worker-only setup. It configures the selected services, storage, persistent startup, and public HTTPS route wherever automation is available. The operator should not have to deploy the service separately or manually assemble its networking for the recommended path. Necessary provider account sign-ins and GitHub ownership/installation choices can occur through browser steps within that flow. Setup must be well documented, including headless use and deployments with components on separate machines.
 

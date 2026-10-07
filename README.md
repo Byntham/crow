@@ -1,6 +1,6 @@
 # Crow
 
-Crow reviews GitHub pull requests on your own Linux machine, using your Codex subscription. It responds on GitHub with advisory inline findings and a summary intended for coding agents.
+Crow reviews GitHub pull requests on your own Linux machine, using your Codex (ChatGPT) or Claude Code (Claude) subscription. It responds on GitHub with advisory inline findings and a summary intended for coding agents.
 
 Each operator runs an independent installation. There is no shared Crow backend, required Docker installation, Marketplace listing, or separately billed API-key fallback.
 
@@ -14,7 +14,7 @@ curl -fsSL https://birdapp.dev/install.sh | sh
 
 The installer downloads and verifies the Linux binary, installs a permanent command, and offers to start setup. Downloads are public; access to Crow's private source repository is not required. The executable is compiled from Rust, so users do not need a language runtime or a checkout. See [installation](docs/user/install.md) for install-only mode and the source installation alternative.
 
-Setup installs the executable and defaults to running both the connection service and worker on this machine. It guides Tailscale Funnel, creation or connection of your own GitHub App, repository selection, a separate Codex subscription login, and persistent systemd startup. Missing supported Linux dependencies can be installed with your confirmation. Browser steps print URLs you can open on a separate desktop. No browser is required on the host.
+Setup installs the executable and defaults to running both the connection service and worker on this machine. It guides Tailscale Funnel, creation or connection of your own GitHub App, repository selection, the choice of review provider and a separate subscription login for it, and persistent systemd startup. Missing supported Linux dependencies can be installed with your confirmation. Browser steps print URLs you can open on a separate desktop. No browser is required on the host.
 
 One GitHub App connects to one Crow service. You can assign different repositories to different workers; each worker receives a read-only GitHub token for the repository it is reviewing. See [connecting an existing App](docs/user/networking.md#connect-an-existing-github-app).
 
@@ -57,10 +57,8 @@ cargo build --locked --release --bin crow
 bash scripts/build-release.sh
 ```
 
-Application code lives in `src/`. One executable runs the CLI, connection service, worker, and private inspection MCP subprocess. SQLite is bundled; HTTPS uses rustls. The official Codex CLI remains a separate executable. `cargo run --bin crow -- help` lists commands. Source and downloaded installations use the same native executable lifecycle.
+Application code lives in `src/`. One executable runs the CLI, connection service, worker, and private inspection MCP subprocess. SQLite is bundled; HTTPS uses rustls. The Codex and Claude Code CLIs remain separate executables; `src/provider/` drives them. `cargo run --bin crow -- help` lists commands. Source and downloaded installations use the same native executable lifecycle.
 
-See the [Rust migration decisions](docs/design/rust-migration.md), [binary release design](docs/design/binary-release.md), and [runtime validation](docs/design/runtime-validation.md).
+See the [architecture](docs/design/architecture.md), [review execution](docs/design/review-execution.md), [setup and deployment](docs/design/setup-and-deployment.md), [binary release](docs/design/binary-release.md), and [runtime validation](docs/design/runtime-validation.md) documents, and the [decision records](docs/adr/).
 
-Tests use local fixtures and simulated provider/GitHub responses. They do not publish comments or run provider inference. Live subscription refresh, provider behavior across interruptions, and networking account authorization still require validation on an enrolled installation. Capability checks do not prove those live behaviors. See [runtime validation](docs/design/runtime-validation.md) for what the actual CLI probes establish.
-
-The accepted product behavior and implementation sequence are in [the design documents](docs/design/implementation-plan.md).
+Tests use local fixtures, including fake Codex and Claude Code executables, and simulated GitHub responses. They do not publish comments or run provider inference. Live subscription refresh, provider behavior across interruptions, and networking account authorization still require validation on an enrolled installation. See [runtime validation](docs/design/runtime-validation.md) for what has been checked against the real CLIs.

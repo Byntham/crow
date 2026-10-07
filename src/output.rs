@@ -31,9 +31,14 @@ pub fn render(command: &str, value: &Value) -> String {
         "stop" => "Crow stopped. Run crow start when you are ready.".into(),
         "service-restart" => "Crow restarted with the saved configuration.".into(),
         "config-set" => {
-            let key = value["key"].as_str().unwrap_or("");
-            if key.is_empty() { "Configuration saved.\nRun crow service-restart to apply it.".into() }
-            else { format!("Saved {}.\nRun crow service-restart to apply it.", clean(key)) }
+            let saved = match value["key"].as_str().filter(|k| !k.is_empty()) {
+                Some(key) => format!("Saved {}.", clean(key)),
+                None => "Configuration saved.".into(),
+            };
+            match value["note"].as_str() {
+                Some(note) => format!("{saved}\n{}\nRun crow service-restart to apply it.", clean(note)),
+                None => format!("{saved}\nRun crow service-restart to apply it."),
+            }
         }
         _ => {
             let mut text = String::new();
@@ -419,11 +424,6 @@ fn diagnostic(out: &mut String, check: &Value, depth: usize) {
         clean(check["name"].as_str().unwrap_or("Check"))
     );
     let detail = &check["detail"];
-    // Older services encode failed runtime diagnostics as a JSON string.
-    let parsed = detail
-        .as_str()
-        .and_then(|s| serde_json::from_str::<Value>(s).ok());
-    let detail = parsed.as_ref().unwrap_or(detail);
     if detail["checks"].is_array() {
         for child in list(&detail["checks"]) {
             diagnostic(out, child, depth + 1);
@@ -441,19 +441,21 @@ fn diagnostic(out: &mut String, check: &Value, depth: usize) {
             out.push_str("  New reviews are on hold. Run crow undrain to resume.\n");
         }
     } else if detail["type"].is_string() {
-        let _ = writeln!(
-            out,
-            "  {}{}",
-            if detail["type"] == "chatgpt" {
-                "ChatGPT subscription"
-            } else {
-                "Account proxy"
-            },
-            detail["email"]
-                .as_str()
-                .map(|s| format!(", {}", clean(s)))
-                .unwrap_or_default()
-        );
+        let account = match detail["type"].as_str() {
+            Some("chatgpt") => "ChatGPT subscription",
+            Some("claude.ai" | "oauth_token") => "Claude subscription",
+            Some("proxy") => "Account proxy",
+            _ => "Signed in",
+        };
+        let plan = detail["planType"]
+            .as_str()
+            .map(|s| format!(" ({})", clean(s)))
+            .unwrap_or_default();
+        let email = detail["email"]
+            .as_str()
+            .map(|s| format!(", {}", clean(s)))
+            .unwrap_or_default();
+        let _ = writeln!(out, "  {account}{plan}{email}");
     } else if detail["service"] == "crow" {
         out.push_str("  Crow is reachable.\n");
     } else {
@@ -895,14 +897,18 @@ mod tests {
         assert!(output.contains("1 hour"));
     }
     #[test]
-    fn diagnostics_decode_nested_failures() {
-        let runtime = json!({"ok":false,"checks":[{"name":"Codex version","ok":false,"detail":"Upgrade Codex"}]});
+    fn diagnostics_render_nested_failures_and_accounts() {
+        let runtime = json!({"ok":false,"checks":[{"name":"Claude Code executable","ok":false,"detail":"Update Claude Code"}]});
         let output = render(
             "doctor",
-            &json!({"ok":false,"checks":[{"name":"review runtime","ok":false,"detail":runtime.to_string()}]}),
+            &json!({"ok":false,"checks":[
+                {"name":"review runtime","ok":false,"detail":runtime},
+                {"name":"subscription authentication","ok":true,"detail":{"type":"claude.ai","planType":"max"}},
+            ]}),
         );
-        assert!(output.contains("[FAIL] Codex version"));
-        assert!(output.contains("Upgrade Codex"));
+        assert!(output.contains("[FAIL] Claude Code executable"));
+        assert!(output.contains("Update Claude Code"));
+        assert!(output.contains("Claude subscription (max)"));
         assert!(!output.contains("{\""));
     }
     #[test]

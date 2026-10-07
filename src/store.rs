@@ -74,8 +74,23 @@ impl Store {
             .map(|row| Ok(serde_json::from_str(&row?)?))
             .collect()
     }
+    /// The most recently created job for a pull request key.
+    pub fn latest_job(&self, key: &str) -> Result<Option<Value>> {
+        self.db
+            .query_row(
+                "SELECT value FROM records WHERE kind='jobs' AND json_extract(value,'$.key')=? ORDER BY rowid DESC LIMIT 1",
+                [key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|encoded| Ok(serde_json::from_str(&encoded)?))
+            .transpose()
+    }
     pub fn put(&self, kind: &str, key: &str, value: &Value) -> Result<()> {
-        self.db.execute("INSERT INTO records VALUES(?,?,?) ON CONFLICT(kind,id) DO UPDATE SET value=excluded.value",params![kind,key,serde_json::to_string(value)?])?;
+        self.db.execute(
+            "INSERT INTO records VALUES(?,?,?) ON CONFLICT(kind,id) DO UPDATE SET value=excluded.value",
+            params![kind, key, serde_json::to_string(value)?],
+        )?;
         Ok(())
     }
     pub fn delete(&self, kind: &str, key: &str) -> Result<()> {
@@ -141,41 +156,88 @@ impl Store {
         value["name"] = json!(name);
         self.put("repos", &name, &value)
     }
+    /// Queue a review of the PR's current revision. A request for the revision
+    /// already pending is coalesced; a manual request reopens it if paused or
+    /// held. A new revision, or an explicit restart, supersedes the active job.
     pub fn queue(&self, repo: &Value, pr: &Value, options: &Value) -> Result<Value> {
         self.tx(|store| {
-            let name = field(repo,"name")?; let number = pr["number"].as_u64().context("Invalid PR number")?;
-            let head = field(&pr["head"],"sha")?; let target = field(&pr["base"],"ref")?;
+            let name = field(repo, "name")?;
+            let number = pr["number"].as_u64().context("Invalid PR number")?;
+            let head = field(&pr["head"], "sha")?;
+            let target = field(&pr["base"], "ref")?;
             let key = format!("{name}#{number}");
-            let manual = options["manual"].as_bool().unwrap_or(false);
-            let restart = options["restart"].as_bool().unwrap_or(false);
-            let held = options["held"].as_bool().unwrap_or(false);
-            let encoded: Option<String> = store.db.query_row("SELECT value FROM records WHERE kind='jobs' AND json_extract(value,'$.key')=? AND COALESCE(json_extract(value,'$.state'),'') NOT IN ('completed','superseded','cancelled') ORDER BY rowid LIMIT 1",[&key],|row| row.get(0)).optional()?;
+            let flag = |name: &str| options[name].as_bool().unwrap_or(false);
+            let (manual, restart, held) = (flag("manual"), flag("restart"), flag("held"));
+            let encoded: Option<String> = store
+                .db
+                .query_row(
+                    "SELECT value FROM records WHERE kind='jobs' AND json_extract(value,'$.key')=?
+                     AND COALESCE(json_extract(value,'$.state'),'') NOT IN ('completed','superseded','cancelled')
+                     ORDER BY rowid LIMIT 1",
+                    [&key],
+                    |row| row.get(0),
+                )
+                .optional()?;
             if let Some(encoded) = encoded {
                 let mut active: Value = serde_json::from_str(&encoded)?;
                 if active["head"] == head && active["target"] == target && !restart {
-                    if manual && matches!(active["state"].as_str(),Some("paused" | "held")) {
-                        active["resumeEpoch"] = json!(active["resumeEpoch"].as_u64().unwrap_or(0).saturating_add(1));
-                        let usable = active["state"] == "held" || !truthy(&active["startedAt"]) || truthy(&active["session"]);
-                        let resumable = usable || truthy(&active["report"]);
+                    if manual && matches!(active["state"].as_str(), Some("paused" | "held")) {
+                        let epoch = active["resumeEpoch"].as_u64().unwrap_or(0);
+                        active["resumeEpoch"] = json!(epoch.saturating_add(1));
+                        // Work that started without saving a session cannot be continued.
+                        let resumable = active["state"] == "held"
+                            || !truthy(&active["startedAt"])
+                            || truthy(&active["session"])
+                            || truthy(&active["report"]);
                         active["state"] = json!(if resumable { "queued" } else { "paused" });
-                        active["reason"] = if resumable { Value::Null } else { json!("Restart required: no saved provider session") };
-                        active["retries"] = json!(0); active["nextAt"] = json!(0);
-                        if truthy(&options["trigger"]) { active["trigger"] = options["trigger"].clone(); }
-                        store.put("jobs",field(&active,"id")?,&active)?;
+                        active["reason"] = if resumable {
+                            Value::Null
+                        } else {
+                            json!("Restart required: no saved provider session")
+                        };
+                        active["retries"] = json!(0);
+                        active["nextAt"] = json!(0);
+                        if truthy(&options["trigger"]) {
+                            active["trigger"] = options["trigger"].clone();
+                        }
+                        store.put("jobs", field(&active, "id")?, &active)?;
                     }
                     return Ok(active);
                 }
-                active["state"] = json!("superseded"); active["updatedAt"] = json!(now());
-                store.put("jobs",field(&active,"id")?,&active)?;
+                active["state"] = json!("superseded");
+                active["updatedAt"] = json!(now());
+                store.put("jobs", field(&active, "id")?, &active)?;
             }
             let timestamp = now();
-            let mut job = json!({"id":id(),"key":key,"repo":name,"number":number,"head":head,"target":target,"worker":repo["worker"],
-                "state":if held {"held"} else {"queued"},"manual":manual,"restart":restart,"priority":if held {0} else if manual {2} else {1},
-                "resumeEpoch":0,"createdAt":timestamp,"updatedAt":timestamp,"retries":0,"nextAt":0,"session":null,"report":null});
-            if let Some(trigger) = options.get("trigger") { job["trigger"] = trigger.clone(); }
-            store.put("jobs",field(&job,"id")?,&job)?; Ok(job)
+            let mut job = json!({
+                "id": id(),
+                "key": key,
+                "repo": name,
+                "number": number,
+                "head": head,
+                "target": target,
+                "worker": repo["worker"],
+                "state": if held { "held" } else { "queued" },
+                "manual": manual,
+                "restart": restart,
+                "priority": if held { 0 } else if manual { 2 } else { 1 },
+                "resumeEpoch": 0,
+                "createdAt": timestamp,
+                "updatedAt": timestamp,
+                "retries": 0,
+                "nextAt": 0,
+                "session": null,
+                "report": null,
+            });
+            if let Some(trigger) = options.get("trigger") {
+                job["trigger"] = trigger.clone();
+            }
+            store.put("jobs", field(&job, "id")?, &job)?;
+            Ok(job)
         })
     }
+    /// Lease the highest-priority due job for a worker, skipping jobs and PRs it
+    /// already has active.
     pub fn claim(
         &self,
         worker: &str,
@@ -184,19 +246,36 @@ impl Store {
     ) -> Result<Option<Value>> {
         self.tx(|store| {
             let timestamp = now();
-            let encoded: Option<String> = store.db.query_row("SELECT value FROM records WHERE kind='jobs'
-                AND json_extract(value,'$.worker')=? AND json_extract(value,'$.state') IN ('queued','retrying')
-                AND COALESCE(json_extract(value,'$.nextAt'),0)<=?
-                AND json_extract(value,'$.id') NOT IN (SELECT value FROM json_each(?))
-                AND json_extract(value,'$.key') NOT IN (SELECT value FROM json_each(?))
-                ORDER BY COALESCE(json_extract(value,'$.priority'),0) DESC,rowid LIMIT 1",
-                params![worker,timestamp,serde_json::to_string(exclude_ids)?,serde_json::to_string(exclude_keys)?],|row| row.get(0)).optional()?;
-            let Some(encoded) = encoded else { return Ok(None); };
+            let encoded: Option<String> = store
+                .db
+                .query_row(
+                    "SELECT value FROM records WHERE kind='jobs'
+                     AND json_extract(value,'$.worker')=? AND json_extract(value,'$.state') IN ('queued','retrying')
+                     AND COALESCE(json_extract(value,'$.nextAt'),0)<=?
+                     AND json_extract(value,'$.id') NOT IN (SELECT value FROM json_each(?))
+                     AND json_extract(value,'$.key') NOT IN (SELECT value FROM json_each(?))
+                     ORDER BY COALESCE(json_extract(value,'$.priority'),0) DESC,rowid LIMIT 1",
+                    params![
+                        worker,
+                        timestamp,
+                        serde_json::to_string(exclude_ids)?,
+                        serde_json::to_string(exclude_keys)?
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(encoded) = encoded else {
+                return Ok(None);
+            };
             let mut job: Value = serde_json::from_str(&encoded)?;
-            job["state"] = json!("reviewing"); job["lease"] = json!(id());
-            if job["startedAt"].is_null() { job["startedAt"] = json!(timestamp); }
+            job["state"] = json!("reviewing");
+            job["lease"] = json!(id());
+            if job["startedAt"].is_null() {
+                job["startedAt"] = json!(timestamp);
+            }
             job["updatedAt"] = json!(timestamp);
-            store.put("jobs",field(&job,"id")?,&job)?; Ok(Some(job))
+            store.put("jobs", field(&job, "id")?, &job)?;
+            Ok(Some(job))
         })
     }
     pub fn update_job(&self, key: &str, patch: &Value, lease: Option<&str>) -> Result<Value> {
@@ -248,27 +327,6 @@ impl Store {
             Ok(())
         })
     }
-}
-pub fn eligible(repo: &Value, pr: &Value) -> bool {
-    pr["state"] == "open"
-        && !truthy(&pr["draft"])
-        && (repo["policy"] == "everyone"
-            || repo["authors"].as_array().is_some_and(|authors| {
-                authors.iter().any(|author| {
-                    author
-                        .as_str()
-                        .zip(pr["user"]["login"].as_str())
-                        .is_some_and(|(a, b)| a.to_lowercase() == b.to_lowercase())
-                })
-            }))
-}
-pub fn comparison_key(value: &Value) -> String {
-    format!(
-        "{}:{}:{}",
-        value["head"].as_str().unwrap_or("undefined"),
-        value["target"].as_str().unwrap_or("undefined"),
-        value["base"].as_str().unwrap_or("undefined")
-    )
 }
 pub fn retry_delay(retry: &Value, attempt: u64, provider_wait: u64) -> u64 {
     let schedule = [5000, 15000, 30000, 60000, 120000, 300000];
@@ -526,18 +584,10 @@ mod tests {
         }
     }
     #[test]
-    fn retry_and_policy_boundaries() {
+    fn retry_boundaries() {
         let retry = json!({"mode":"progressive"});
         assert!((5000..5500).contains(&retry_delay(&retry, 0, 0)));
         assert!((300000..300500).contains(&retry_delay(&retry, u64::MAX, 0)));
         assert_eq!(retry_delay(&retry, 1, u64::MAX), u64::MAX);
-        assert!(eligible(
-            &json!({"authors":["ALICE"]}),
-            &json!({"state":"open","user":{"login":"alice"}})
-        ));
-        assert!(!eligible(
-            &json!({"policy":"everyone"}),
-            &json!({"state":"open","draft":true})
-        ));
     }
 }
