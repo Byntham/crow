@@ -627,10 +627,24 @@ pub async fn diagnostics(worker: &Value) -> Result<Option<Value>> {
     };
     let rootless = host["security"]["rootless"] == true;
     checks.push(json!({"name":"Rootless Podman","ok":rootless,"detail":if rootless {"Podman runs as this user."} else {"Crow requires rootless Podman; run it as your normal user."}}));
-    let controllers: Vec<&str> = host["cgroupControllers"]
-        .as_array()
-        .map(|a| a.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
+    // Podman reports the controllers of its own cgroup. With systemd, containers
+    // run under the user's service manager, so check what it delegates.
+    let delegated = (host["cgroupManager"] == "systemd")
+        .then(|| {
+            let uid = unsafe { libc::getuid() };
+            std::fs::read_to_string(format!(
+                "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/cgroup.controllers"
+            ))
+            .ok()
+        })
+        .flatten();
+    let controllers: Vec<&str> = match &delegated {
+        Some(text) => text.split_whitespace().collect(),
+        None => host["cgroupControllers"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default(),
+    };
     let missing: Vec<_> = ["cpu", "memory", "pids"]
         .into_iter()
         .filter(|c| !controllers.contains(c))
