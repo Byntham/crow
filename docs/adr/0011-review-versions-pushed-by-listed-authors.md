@@ -9,13 +9,13 @@ Author policy names whose PRs Crow reviews, and reviews use the operator's subsc
 
 ## Decision
 
-For repositories with a selected author list, Crow reviews a new version automatically only when a listed author pushed it. The pusher comes from GitHub's repository activity for the PR's head branch, which records the authenticated user behind each push, force push and branch creation. Webhooks, catch-up, base-branch updates and dispatch all apply the check. A version pushed by anyone else is not reviewed, and the PR's status comment says who pushed it. If a listed author pushes again on top, Crow reviews the PR again, including the earlier commits.
+For repositories with a selected author list, Crow reviews a new version automatically only when a listed author pushed it. The pusher comes from GitHub's repository activity for the PR's head branch, which records the authenticated user behind each push, force push and branch creation. Webhooks, catch-up, base-branch updates and re-queues of superseded versions apply the check whenever they queue a version; Crow looks pushes up only for those decisions and for experiments. A version pushed by anyone else is not reviewed, and the PR's status comment says who pushed it. If a listed author pushes again on top, Crow reviews the PR again, including the earlier commits.
 
 Runtime experiments (ADR 0010) need more: every push since the branch was created must come from a listed author, and GitHub must list both that creation and the push of the current head. Otherwise the review is inspection-only.
 
 A requester can still ask for a review with `/crow review` or `crow review`. That is a deliberate choice, and such a review never runs code unless every push qualifies.
 
-When Crow cannot confirm who pushed, it does not review automatically. This happens when GitHub refuses the lookup, for example for a private fork the App cannot read, or still has not listed the push after a few minutes. GitHub usually lists a push about a second after it, so a webhook that finds it missing is retried with backoff before Crow gives up. A transient GitHub failure is retried like any other, rather than counted as unconfirmed. A version that was already admitted, requested or reviewed keeps that state when later webhooks arrive for it.
+When Crow cannot confirm who pushed, it does not review automatically. This happens when GitHub refuses the lookup, for example for a private fork the App cannot read, lists the push without an account, or neither lists the push nor answers within the webhook's retries, about half a minute. GitHub usually lists a push about a second after it. A version that was already queued, requested or reviewed keeps that state when later webhooks arrive for it. At dispatch, a failed lookup only makes the review inspection-only.
 
 The operator can opt out per repository with `crow policy owner/repo --pushers anyone`. Reviews and experiments then follow the PR author alone. Repositories that review everyone are not affected.
 
