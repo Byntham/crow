@@ -219,20 +219,27 @@ pub fn cleanup_at(root: &Path, jobs: &[Value], days: f64, now: f64) -> Result<Va
         }
     }
     if !sessions.is_empty() {
-        let action = || -> Result<()> {
+        // Each provider's sessions are cleaned independently, so a problem with
+        // one provider's directory does not keep the other's transcripts.
+        let codex = || -> Result<()> {
             let codex = root.join("codex");
             if directory(&codex)? {
                 walk(&codex.join("sessions"), &sessions)?;
                 walk(&codex.join("archived_sessions"), &sessions)?;
             }
+            Ok(())
+        };
+        let claude = || -> Result<()> {
             let claude = root.join("claude");
             if directory(&claude)? {
                 walk_claude(&claude.join("projects"), &sessions)?;
             }
             Ok(())
         };
-        if let Err(e) = action() {
-            warnings.push(e.to_string());
+        for result in [codex(), claude()] {
+            if let Err(e) = result {
+                warnings.push(e.to_string());
+            }
         }
     }
     let mut seen = HashSet::new();
@@ -307,6 +314,22 @@ mod tests {
                 .exists()
         );
         assert!(root.join("claude/.credentials.json").exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn claude_cleanup_runs_when_codex_directory_is_unusable() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        file(root, "codex", "not a directory");
+        file(
+            root,
+            &format!("claude/projects/-review-done/{SESSION}.jsonl"),
+            "owned",
+        );
+        let jobs = vec![json!({"id":"done","state":"completed","updatedAt":0,"session":SESSION})];
+        let r = cleanup_at(root, &jobs, 7.0, 1e10).unwrap();
+        assert_eq!(r["warnings"].as_array().unwrap().len(), 1, "{r}");
+        assert!(!root.join("claude/projects/-review-done").exists());
     }
     #[test]
     fn delegated_sessions_respect_live_references() {

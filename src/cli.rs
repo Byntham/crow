@@ -579,6 +579,10 @@ async fn configured_command(format: OutputFormat, command: Command, root: &Path)
                 "worker.provider"
                     if config["worker"]["provider"].as_str().unwrap_or("codex") != value =>
                 {
+                    if value == "claude" && worker {
+                        config["worker"]["claude"] =
+                            json!(setup::verified_claude(&config["worker"]).await?);
+                    }
                     // Model names are provider-specific; keep reviews from using a stale one.
                     let worker = &mut config["worker"];
                     worker["model"] = Value::Null;

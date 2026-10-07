@@ -1600,13 +1600,7 @@ async fn ensure_codex(config: &mut Value, root: &Path) -> Result<()> {
 /// absolute path is saved so the background service finds the same executable;
 /// the installer's launcher link keeps working across Claude Code updates.
 async fn ensure_claude(config: &mut Value, root: &Path) -> Result<()> {
-    let configured = config["worker"]["claude"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("claude")
-        .to_owned();
-    let mut found = find_executable(&configured);
-    if found.is_none() {
+    if locate_claude(&config["worker"]).is_none() {
         if !confirm(
             "Claude Code is missing. Install it with the official installer from claude.ai?",
             true,
@@ -1628,16 +1622,33 @@ async fn ensure_claude(config: &mut Value, root: &Path) -> Result<()> {
             .error_for_status()?;
         util::atomic_bytes(&script, &response.bytes().await?)?;
         operations::run("bash", &[&script.to_string_lossy()], true).await?;
-        found = find_executable(&configured)
-            .or_else(|| user_home().ok().map(|home| home.join(".local/bin/claude")));
     }
-    let path = found.context("Claude Code was not found after installation.")?;
+    config["worker"]["claude"] = json!(verified_claude(&config["worker"]).await?);
+    config::save(root, config)
+}
+/// The configured Claude Code executable, found on PATH or where the official
+/// installer puts it.
+fn locate_claude(worker: &Value) -> Option<PathBuf> {
+    let configured = worker["claude"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("claude");
+    find_executable(configured).or_else(|| {
+        let installed = user_home().ok()?.join(".local/bin/claude");
+        (configured == "claude" && installed.is_file()).then_some(installed)
+    })
+}
+/// The absolute path of a working official Claude Code CLI. The background
+/// service may not share this shell's PATH, so callers save this path.
+pub(crate) async fn verified_claude(worker: &Value) -> Result<PathBuf> {
+    let path = locate_claude(worker).context(
+        "Claude Code was not found. Install it with\n  curl -fsSL https://claude.ai/install.sh | bash\nor run crow setup.",
+    )?;
     let version = operations::run(&path.to_string_lossy(), &["--version"], false).await?;
     if !version.contains("Claude Code") {
         bail!("{} is not the official Claude Code CLI.", path.display());
     }
-    config["worker"]["claude"] = json!(path);
-    config::save(root, config)
+    Ok(path)
 }
 /// Resolve a command name the way a shell would, without following links.
 fn find_executable(command: &str) -> Option<PathBuf> {
