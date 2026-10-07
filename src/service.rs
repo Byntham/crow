@@ -1129,7 +1129,19 @@ impl Service {
         let id = s(job, "id");
         let lease = s(job, "lease");
         let assigned = self.repo(s(job, "repo"))?;
-        let (pr, api_token) = self.refresh(&assigned, n(job, "number")).await?;
+        let (mut pr, api_token) = self.refresh(&assigned, n(job, "number")).await?;
+        // Pushes decide experiments. Look them up with the other GitHub calls,
+        // before the ownership and enrollment recheck; a failed lookup makes the
+        // review inspection-only rather than holding it back.
+        if checks_pushers(&assigned) {
+            pr = match self.with_pushes(&assigned, pr.clone(), &api_token).await {
+                Ok(pr) => pr,
+                Err(e) => {
+                    eprintln!("Could not read who pushed PR #{}: {e:#}", n(job, "number"));
+                    patch(pr, &json!({"pushes": null}))
+                }
+            };
+        }
         let token = self.github.checkout_token(&assigned).await?;
         if !self.owns(id, lease, "reviewing")? {
             return Ok(Value::Null);
@@ -1171,18 +1183,11 @@ impl Service {
         let fork = !pr["head"]["repo"]
             .as_str()
             .is_some_and(|name| name.eq_ignore_ascii_case(s(&repo, "name")));
-        let mut execution_allowed = s(&repo, "policy") != "everyone" && !fork;
-        if execution_allowed && checks_pushers(&repo) {
-            // A failed lookup makes the review inspection-only rather than
-            // holding it back.
-            execution_allowed = match self.with_pushes(&repo, pr.clone(), &api_token).await {
-                Ok(pr) => every_push_by_authors(&repo, &pr),
-                Err(e) => {
-                    eprintln!("Could not read who pushed PR #{}: {e}", n(&pr, "number"));
-                    false
-                }
-            };
-        }
+        // Pushes looked up under an earlier policy are absent, which withholds
+        // experiments rather than allowing them.
+        let execution_allowed = s(&repo, "policy") != "everyone"
+            && !fork
+            && (!checks_pushers(&repo) || every_push_by_authors(&repo, &pr));
         Ok(json!({
             "job": patch(job.clone(), &json!({"settings": settings})),
             "pr": pr,
@@ -3434,6 +3439,35 @@ mod tests {
             "Not pushed by a listed author"
         );
         assert!(s(&latest(&f), "reason").contains("could not confirm"));
+        f.close().await;
+    }
+    #[tokio::test]
+    async fn authorization_revoked_during_the_push_lookup_cancels_dispatch() {
+        let f = Fixture::new().await;
+        let j = f.queue().await;
+        let gate = Gate::new();
+        *f.github.pushes_gate.lock().unwrap() = Some(gate.clone());
+        let service = f.handle.service.clone();
+        let worker = service
+            .get("workers", s(&f.config["worker"], "id"))
+            .unwrap()
+            .unwrap();
+        let claim = tokio::spawn(f.handle.execute(async move {
+            service
+                .worker_action("next", &json!({"active":[]}), worker)
+                .await
+        }));
+        gate.wait().await;
+        f.handle
+            .admin(
+                "config-repo",
+                &json!({"repo":"owner/project","authors":["bob"]}),
+            )
+            .await
+            .unwrap();
+        gate.open();
+        assert!(claim.await.unwrap().unwrap().is_null());
+        assert_ne!(f.job(s(&j, "id"))["state"], "reviewing");
         f.close().await;
     }
     #[test]
