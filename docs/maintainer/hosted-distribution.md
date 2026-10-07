@@ -1,6 +1,6 @@
 # Hosted distribution
 
-The hosted installer and binary downloads are live while the source repository stays private. Nothing in a pull request deploys the site or publishes binaries. The R2 bucket, Pages project, domains, and workflow credentials are configured; use the publication and deployment workflows below for updates. Resource-creation instructions are retained for recovery.
+The hosted installer and binary downloads are live, and each published version also has a GitHub release with the same files. Nothing in a pull request deploys the site or publishes binaries. The R2 bucket, Pages project, domains, and workflow credentials are configured; use the publication and deployment workflows below for updates. Resource-creation instructions are retained for recovery.
 
 | Resource                               | Name            | Public address                  |
 | -------------------------------------- | --------------- | ------------------------------- |
@@ -44,7 +44,7 @@ The Pages token needs no zone or DNS edit permissions. Cloudflare's Pages permis
 
 ## Build without publishing
 
-`.github/workflows/release.yml` builds and tests Linux x64 and ARM64 on native Ubuntu runners. It runs for pull requests, matching version tags, and manual dispatch, and uploads private GitHub Actions artifacts. PR builds validate the proposed merge; publication requires a separate tag or manual build of the reviewed source commit. It never creates a GitHub release or uploads to Cloudflare.
+`.github/workflows/release.yml` builds and tests Linux x64 and ARM64 on native Ubuntu runners. It runs for pull requests, matching version tags, and manual dispatch, and uploads GitHub Actions artifacts. PR builds validate the proposed merge; publication requires a separate tag or manual build of the reviewed source commit. It never creates a GitHub release or uploads to Cloudflare.
 
 The build artifacts are `crow-linux-x64` and `crow-linux-arm64`. Each contains its archive, `SHA256SUMS`, and `build-metadata.json` recording the source commit, archive hash, version, architecture, Rust target, and the packaged executable's actual `--version` output. Artifacts expire after seven days. Publish within that window or build a new version. Rebuilding an existing version can change its archive bytes and must not overwrite an already published version.
 
@@ -57,6 +57,7 @@ Workflows with `workflow_dispatch` normally need to exist on the repository's de
 3. Manually run **Publish hosted Crow binaries**, selecting the reviewed workflow revision. Supply the run ID, source commit, version without `v`, and confirmation `publish VERSION`, for example `publish 0.2.0`.
 4. Approve the `public-release` environment deployment if environment reviewers are configured.
 5. Inspect the completed workflow summary and the public download URLs.
+6. Create a GitHub release titled `Crow VERSION` with tag `vVERSION` on the build commit. Describe the changes since the previous published version, and attach the two archives and `SHA256SUMS` downloaded from the public URLs, so both places offer the same bytes. Pushing the tag runs the build workflow again, which checks the tag against `Cargo.toml`.
 
 The publishing job verifies that the selected run belongs to this repository, used `.github/workflows/release.yml`, completed successfully, and built the exact supplied source commit. It downloads artifacts from that run only. It checks both checksums, metadata, safe archive entries, and ELF CPU architecture without executing binaries in the credentialed job.
 
@@ -97,7 +98,7 @@ curl -fsS https://downloads.birdapp.dev/latest.txt
 
 Both mutable files must have cache headers that require a fresh response. Verify the page and installer in a clean Ubuntu VM with an interactive terminal before advertising installation. Test that a desktop browser can complete the headless machine's setup links. Do not enable a test review during setup.
 
-Pages deployment and binary publication are independent, manual operations. Draft PRs never publish automatically. Downloading public Crow binaries does not grant access to the private source repository.
+Pages deployment and binary publication are independent, manual operations. Draft PRs never publish automatically.
 
 ## References
 
