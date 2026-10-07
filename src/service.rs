@@ -1112,16 +1112,26 @@ impl Service {
                 if !j["comparison"].is_null()
                     && comparison_key(&j["comparison"]) != comparison_key(&c)
                 {
-                    // Queue the replacement first: if GitHub is unavailable, this job
-                    // stays leased and the worker's failure report schedules a retry.
-                    self.enqueue(
-                        &self.repo(s(&j, "repo"))?,
-                        n(&j, "number"),
-                        &json!({"restart":true}),
-                    )
-                    .await?;
+                    // Queue the replacement before retiring this job. If GitHub is
+                    // unavailable, requeue this job instead; its next lease finds
+                    // the changed comparison again.
+                    let replacement = self
+                        .enqueue(
+                            &self.repo(s(&j, "repo"))?,
+                            n(&j, "number"),
+                            &json!({"restart":true}),
+                        )
+                        .await;
                     if self.owns(id, lease, "reviewing")? {
-                        self.update(id, json!({"state":"superseded"}), Some(lease))?;
+                        let change = match replacement {
+                            Ok(_) => json!({"state":"superseded"}),
+                            Err(_) => json!({
+                                "state": "queued",
+                                "nextAt": now() + 30000,
+                                "reason": "GitHub connection failed; the changed comparison will be queued on retry.",
+                            }),
+                        };
+                        self.update(id, change, Some(lease))?;
                     }
                     return Ok(json!({"cancel":true}));
                 }
@@ -2276,6 +2286,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), 401);
+        f.close().await;
+    }
+    #[tokio::test]
+    async fn comparison_change_retries_when_the_replacement_cannot_be_queued() {
+        let f = Fixture::new().await;
+        let first = f.prepared().await;
+        let changed = json!({"head":"a".repeat(40),"base":"e".repeat(40),"target":"main","targetSha":"f".repeat(40)});
+        let report =
+            |j: &Value| json!({"id":j["id"],"lease":j["lease"],"comparison":changed.clone()});
+        // A later lease of the same job finds a new merge base while GitHub is down.
+        f.handle
+            .service
+            .update(s(&first, "id"), json!({"state":"queued"}), None)
+            .unwrap();
+        let j = f.claim().await;
+        f.github.fail_pr.store(true, Ordering::Relaxed);
+        assert_eq!(
+            f.worker("comparison", report(&j)).await.unwrap()["cancel"],
+            true
+        );
+        let retried = f.job(s(&j, "id"));
+        assert_eq!(retried["state"], "queued");
+        assert!(n(&retried, "nextAt") > now());
+        // Once GitHub answers, the replacement is queued and this job retires.
+        f.handle
+            .service
+            .update(s(&j, "id"), json!({"nextAt":0}), None)
+            .unwrap();
+        let j = f.claim().await;
+        assert_eq!(
+            f.worker("comparison", report(&j)).await.unwrap()["cancel"],
+            true
+        );
+        assert_eq!(f.job(s(&j, "id"))["state"], "superseded");
+        let latest = f.handle.service.latest("owner/project#1").unwrap().unwrap();
+        assert_ne!(latest["id"], j["id"]);
+        assert_eq!(latest["state"], "queued");
         f.close().await;
     }
     #[tokio::test]
