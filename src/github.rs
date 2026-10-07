@@ -339,11 +339,14 @@ impl GitHub {
                 .map(|reset| {
                     (reset * 1000 - chrono::Utc::now().timestamp_millis()).max(1000) as u64
                 });
+            // A secondary rate limit may name no delay; GitHub asks for at least a minute.
+            let unnamed = matches!(status.as_u16(), 403 | 429).then_some(60_000);
             let retry_after = header("retry-after")
                 .and_then(|h| h.parse::<f64>().ok())
                 .filter(|v| v.is_finite() && *v > 0.0)
                 .map(|v| (v * 1000.0) as u64)
                 .or(reset)
+                .or(unnamed)
                 .unwrap_or(0);
             return Err(GitHubError {
                 message: format!(
@@ -1128,6 +1131,16 @@ mod tests {
             (50_000..=61_000).contains(&error.retry_after),
             "{}",
             error.retry_after
+        );
+        // A secondary rate limit may name no delay at all: wait the minute GitHub asks for.
+        m.push(403, HeaderMap::new(), json!({}));
+        let error = gh
+            .request("/rate", Some("token"), "GET", None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<GitHubError>().unwrap().retry_after,
+            60_000
         );
         assert!(
             m.calls.lock().unwrap()[1]

@@ -174,12 +174,11 @@ fn error_status(e: &anyhow::Error) -> u16 {
     e.downcast_ref::<GitHubError>().map_or(400, |e| e.status)
 }
 /// GitHub refused a request for good, for example with a 404 for a private
-/// fork the App cannot read, or a 451 for one taken down. A 403 is final
-/// unless it is a rate limit, which carries a retry delay.
+/// fork the App cannot read, or a 451 for one taken down. A 403 may be a
+/// secondary rate limit, even without rate-limit headers, so it is retried.
 fn refused(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<GitHubError>().is_some_and(|e| {
-        matches!(e.status, 404 | 410 | 422 | 451) || (e.status == 403 && e.retry_after == 0)
-    })
+    e.downcast_ref::<GitHubError>()
+        .is_some_and(|e| matches!(e.status, 404 | 410 | 422 | 451))
 }
 fn retry_after(e: &anyhow::Error) -> i64 {
     e.downcast_ref::<GitHubError>()
@@ -357,7 +356,9 @@ impl Service {
         } else if array(&repo["excluded"]).contains(&json!(number)) {
             return Ok(json!({"skipped":"Initial backlog excluded"}));
         }
-        if b(opts, "manual") || !checks_pushers(&repo) {
+        // Requested versions, and versions already admitted before a restart,
+        // need no lookup.
+        if b(opts, "manual") || b(opts, "admitted") || !checks_pushers(&repo) {
             return self.db(|db| db.queue(&repo, &pr, opts));
         }
         // A version already queued or under review needs no new lookup; a later
@@ -1318,7 +1319,7 @@ impl Service {
                         .enqueue(
                             &self.repo(s(&j, "repo"))?,
                             n(&j, "number"),
-                            &json!({"restart":true,"manual":b(&j, "manual")}),
+                            &json!({"restart":true,"manual":b(&j, "manual"),"admitted":!b(&j, "manual")}),
                         )
                         .await;
                     if self.owns(id, lease, "reviewing")? {
@@ -3181,9 +3182,30 @@ mod tests {
                 retry_after,
             })
         };
-        assert!(refused(&error(404, 0)) && refused(&error(451, 0)) && refused(&error(403, 0)));
-        assert!(!refused(&error(403, 60_000)) && !refused(&error(429, 0)));
-        assert!(!refused(&error(502, 0)));
+        assert!(refused(&error(404, 0)) && refused(&error(451, 0)));
+        assert!(!refused(&error(403, 0)) && !refused(&error(403, 60_000)));
+        assert!(!refused(&error(429, 0)) && !refused(&error(502, 0)));
+
+        // A merge-base change restarts an admitted review without a new lookup,
+        // so even a refused one leaves the replacement queued.
+        let f = Fixture::new().await;
+        let first = f.prepared().await;
+        f.handle
+            .service
+            .update(s(&first, "id"), json!({"state":"queued"}), None)
+            .unwrap();
+        let j = f.claim().await;
+        f.github.fail_pushes.lock().unwrap().insert(1, 404);
+        let changed = json!({"head":"a".repeat(40),"base":"e".repeat(40),"target":"main","targetSha":"f".repeat(40)});
+        let report = json!({"id":j["id"],"lease":j["lease"],"comparison":changed});
+        assert_eq!(
+            f.worker("comparison", report).await.unwrap()["cancel"],
+            true
+        );
+        let latest = f.handle.service.latest("owner/project#1").unwrap().unwrap();
+        assert_ne!(latest["id"], j["id"]);
+        assert_eq!(latest["state"], "queued");
+        f.close().await;
 
         // One PR's failed lookup skips that PR, not the whole catch-up.
         let f = Fixture::new().await;
