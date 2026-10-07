@@ -170,9 +170,9 @@ fn comment_body(j: &Value, saved: &Value) -> String {
     let state = s(j, "state");
     let head = report::commit(s(j, "repo"), s(j, "head"));
     let report = saved["report"].as_str();
-    if let Some(report) =
-        report.filter(|_| state == "completed" && saved["reportHead"] == j["head"])
-    {
+    // The same commit may have been reviewed against another base or target.
+    let current = saved["reportComparison"].as_str() == Some(&comparison_key(&j["comparison"]));
+    if let Some(report) = report.filter(|_| state == "completed" && current) {
         return format!(
             "<!-- crow-status:v1 -->\n### {} on {head}\n\n{report}",
             s(saved, "outcome")
@@ -890,6 +890,7 @@ impl Service {
                     "report": report::report_body(j, &records, &published)?,
                     "outcome": report::outcome(&j["report"]),
                     "reportHead": j["head"],
+                    "reportComparison": comparison_key(&j["comparison"]),
                     "published": published,
                 }),
             );
@@ -4102,19 +4103,22 @@ mod tests {
     #[test]
     fn comment_shows_any_other_state_above_the_folded_report() {
         let a = "a".repeat(40);
-        let saved =
-            json!({"report":"REPORT","outcome":"🟡 3 findings","reportHead":a,"url":COMMENT});
-        let mut j = json!({"repo":"owner/project","head":a,"state":"completed","trigger":"Pull request updated","reviewUrl":COMMENT});
+        let saved = json!({"report":"REPORT","outcome":"🟡 3 findings","reportHead":a,"reportComparison":comparison_key(&comparison()),"url":COMMENT});
+        let mut j = json!({"repo":"owner/project","head":a,"comparison":comparison(),"state":"completed","trigger":"Pull request updated","reviewUrl":COMMENT});
         assert_eq!(
             comment_body(&j, &saved),
             format!(
                 "<!-- crow-status:v1 -->\n### 🟡 3 findings on [`aaaaaaa`](https://github.com/owner/project/commit/{a})\n\nREPORT"
             )
         );
+        // An earlier review of the same commit against another target.
+        j["comparison"]["target"] = json!("develop");
+        let body = comment_body(&j, &saved);
+        assert!(body.starts_with("<!-- crow-status:v1 -->\n### ✅ Reviewed [`aaaaaaa`]"));
+        assert!(body.contains("</sub>\n\nCrow reviewed this commit earlier. Its report is in this comment's edit history.\n\n<details>"));
         j["head"] = json!("d".repeat(40));
         let body = comment_body(&j, &saved);
         assert!(body.starts_with("<!-- crow-status:v1 -->\n### ✅ Reviewed [`ddddddd`]"));
-        assert!(body.contains("</sub>\n\nCrow reviewed this commit earlier. Its report is in this comment's edit history.\n\n<details>"));
         j["state"] = json!("reviewing");
         j["startedAt"] = json!(1_791_355_500_000i64);
         j["updatedAt"] = json!(1);
