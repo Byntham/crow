@@ -454,7 +454,17 @@ impl Service {
         }
         let pr = match self.admission(&repo, &pr, &token).await {
             Admission::Admit => return self.place(&repo, &pr, opts, false),
-            Admission::Verify => return self.place(&repo, &pr, opts, true),
+            Admission::Verify => {
+                // A version already reviewed, say on request, keeps that status
+                // rather than waiting to be confirmed again.
+                if let Some(completed) = self
+                    .latest(&key)?
+                    .filter(|j| same(j) && s(j, "state") == "completed")
+                {
+                    return Ok(completed);
+                }
+                return self.place(&repo, &pr, opts, true);
+            }
             Admission::Skip(pr) => pr,
         };
         if let Some(newer) = self.newer(&repo, &pr)? {
@@ -1232,8 +1242,9 @@ impl Service {
             let change = if (lookup_failed && age < LOOKUP_WINDOW_MS)
                 || (unlisted && age < LISTING_WINDOW_MS)
             {
+                // The review never started, so it stays resumable if paused.
                 let reason = "Confirming with GitHub who pushed this version.";
-                json!({"state":"queued","nextAt":now() + 30000,"reason":reason,"verifySince":since})
+                json!({"state":"queued","nextAt":now() + 30000,"reason":reason,"verifySince":since,"startedAt":null})
             } else {
                 json!({"state":"cancelled","autoRecover":false,"reason":pusher_reason(&pr)})
             };
@@ -3393,6 +3404,12 @@ mod tests {
         let waiting = f.job(&id);
         assert_eq!(waiting["state"], "queued");
         assert!(s(&waiting, "reason").contains("Confirming"), "{waiting}");
+        // Waiting is not starting: paused now, the version can still resume.
+        assert!(waiting["startedAt"].is_null(), "{waiting}");
+        let number = json!({"repo":"owner/project","number":1});
+        f.handle.admin("pause", &number).await.unwrap();
+        f.handle.admin("resume", &number).await.unwrap();
+        assert_eq!(f.job(&id)["state"], "queued");
         // Once GitHub lists alice's push, the review goes ahead.
         *f.github.pushes.lock().unwrap() = None;
         f.handle
@@ -3442,6 +3459,12 @@ mod tests {
             .update(id, json!({"state":"completed"}), None)
             .unwrap();
         let edited = json!({"event":true,"trigger":"Pull request edited"});
+        assert_eq!(
+            enqueue(&f, edited.clone()).await.unwrap()["id"],
+            requested["id"]
+        );
+        // Also when GitHub cannot answer the lookup for now.
+        f.github.fail_pushes.lock().unwrap().insert(1, 502);
         assert_eq!(enqueue(&f, edited).await.unwrap()["id"], requested["id"]);
         let latest = f.handle.service.latest("owner/project#1").unwrap().unwrap();
         assert_eq!(latest["id"], requested["id"]);
