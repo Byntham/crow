@@ -165,6 +165,12 @@ fn review_settings(v: &Value) -> Value {
 fn error_status(e: &anyhow::Error) -> u16 {
     e.downcast_ref::<GitHubError>().map_or(400, |e| e.status)
 }
+/// GitHub refused a request for good, for example for a private fork the App
+/// cannot read, rather than failing for now.
+fn refused(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<GitHubError>()
+        .is_some_and(|e| e.retry_after == 0 && matches!(e.status, 403 | 404 | 410 | 422))
+}
 fn retry_after(e: &anyhow::Error) -> i64 {
     e.downcast_ref::<GitHubError>()
         .map_or(0, |e| e.retry_after.min(i64::MAX as u64) as i64)
@@ -252,28 +258,39 @@ impl Service {
     async fn refresh(&self, repo: &Value, number: i64, wait: bool) -> Result<(Value, String)> {
         let token = self.github.token(repo).await?;
         let pr = self.github.pr(repo, number, &token).await?;
-        Ok((self.with_pushes(repo, pr, &token, wait).await, token))
+        Ok((self.with_pushes(repo, pr, &token, wait).await?, token))
     }
-    async fn with_pushes(&self, repo: &Value, mut pr: Value, token: &str, wait: bool) -> Value {
+    /// Transient GitHub failures are errors, so events and dispatch retry them
+    /// as they do any other GitHub failure.
+    async fn with_pushes(
+        &self,
+        repo: &Value,
+        mut pr: Value,
+        token: &str,
+        wait: bool,
+    ) -> Result<Value> {
         if !checks_pushers(repo) {
-            return pr;
+            return Ok(pr);
         }
         for attempt in 0..3 {
-            // Without the pushes the pusher is unconfirmed, which withholds
-            // automatic reviews and experiments rather than allowing them.
             pr["pushes"] = match self.github.pushes(repo, &pr, token).await {
                 Ok(pushes) => json!(pushes),
-                Err(e) => {
-                    eprintln!("Could not read who pushed PR #{}: {e}", n(&pr, "number"));
+                // The pusher stays unconfirmed, which withholds automatic reviews.
+                Err(e) if refused(&e) => {
+                    eprintln!(
+                        "GitHub refused to list pushes for PR #{}: {e}",
+                        n(&pr, "number")
+                    );
                     json!([])
                 }
+                Err(e) => return Err(e),
             };
             if !wait || head_pusher(&pr).is_some() || attempt == 2 {
                 break;
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        pr
+        Ok(pr)
     }
     async fn enqueue(&self, repo: &Value, number: i64, opts: &Value) -> Result<Value> {
         ensure!(number > 0, "Invalid pull request number");
@@ -304,13 +321,22 @@ impl Service {
             return Ok(json!({"skipped":"Initial backlog excluded"}));
         }
         if !b(opts, "manual") && !pushed_by_author(&repo, &pr) {
-            // Show the skipped version on the PR's status. An explicit request stands.
-            let job = self.db(|db| db.queue(&repo, &pr, opts))?;
-            if !b(&job, "manual") {
-                let skipped =
-                    json!({"state":"cancelled","autoRecover":false,"reason":pusher_reason(&pr)});
-                self.update(s(&job, "id"), skipped, None)?;
+            // A version already admitted, or requested, keeps its review; a later
+            // webhook for it, such as a title edit, changes nothing.
+            let key = format!("{}#{number}", s(&repo, "name"));
+            if let Some(active) = self.latest(&key)?.filter(|j| {
+                ACTIVE.contains(&s(j, "state"))
+                    && j["head"] == pr["head"]["sha"]
+                    && j["target"] == pr["base"]["ref"]
+            }) {
+                return Ok(active);
             }
+            // Show the skipped version on the PR's status. The new job has no
+            // lease, and nothing runs between queueing and cancelling it.
+            let job = self.db(|db| db.queue(&repo, &pr, opts))?;
+            let skipped =
+                json!({"state":"cancelled","autoRecover":false,"reason":pusher_reason(&pr)});
+            self.update(s(&job, "id"), skipped, None)?;
             return Ok(json!({"skipped":"Not pushed by a listed author"}));
         }
         self.db(|db| db.queue(&repo, &pr, opts))
@@ -366,7 +392,7 @@ impl Service {
             .collect();
         let mut admitted = Vec::new();
         for pr in fresh {
-            let pr = self.with_pushes(&repo, pr.clone(), &token, false).await;
+            let pr = self.with_pushes(&repo, pr.clone(), &token, false).await?;
             if pushed_by_author(&repo, &pr) {
                 admitted.push(pr);
             }
@@ -460,7 +486,9 @@ impl Service {
                         && eligible(&current, pr)
                         && !array(&current["excluded"]).contains(&pr["number"])
                 }) {
-                    let pr = self.with_pushes(&current, pr.clone(), &token, false).await;
+                    let pr = self
+                        .with_pushes(&current, pr.clone(), &token, false)
+                        .await?;
                     if pushed_by_author(&current, &pr) {
                         self.db(|db| db.queue(&current, &pr, &json!({})))?;
                     }
@@ -2064,6 +2092,8 @@ mod tests {
         prs: Mutex<Vec<Value>>,
         /// Pushes to every PR branch; by default alice created it and pushed the head.
         pushes: Mutex<Option<Vec<Value>>>,
+        /// HTTP status for failing push lookups.
+        fail_pushes: Mutex<Option<u16>>,
         reviews: Mutex<Vec<Value>>,
         published: Mutex<Vec<Value>>,
         pr_gate: Mutex<Option<Arc<Gate>>>,
@@ -2127,6 +2157,15 @@ mod tests {
             Ok(prs)
         }
         async fn pushes(&self, _: &Value, pr: &Value, _: &str) -> Result<Vec<Value>> {
+            if let Some(status) = *self.fail_pushes.lock().unwrap() {
+                let message = "GitHub activity failed".to_owned();
+                return Err(GitHubError {
+                    message,
+                    status,
+                    retry_after: 0,
+                }
+                .into());
+            }
             if let Some(pushes) = self.pushes.lock().unwrap().clone() {
                 return Ok(pushes);
             }
@@ -2950,6 +2989,57 @@ mod tests {
             .db(|db| db.enroll(&repo).map(|_| ()))
             .unwrap();
         assert_eq!(f.queue().await["state"], "queued");
+        f.close().await;
+    }
+    #[tokio::test]
+    async fn push_lookup_failures_retry_and_never_cancel_an_admitted_review() {
+        let head = "a".repeat(40);
+        let edited = json!({"event":true,"trigger":"Pull request edited"});
+        let enqueue = |f: &Fixture, options: Value| {
+            let service = f.handle.service.clone();
+            f.handle.execute(async move {
+                service
+                    .enqueue(&service.repo("owner/project")?, 1, &options)
+                    .await
+            })
+        };
+
+        // alice's version is admitted and under review.
+        let f = Fixture::new().await;
+        let queued = f.queue().await;
+        assert_eq!(f.claim().await["id"], queued["id"]);
+        let id = s(&queued, "id");
+        // A title edit while GitHub fails: the event retries, the review goes on.
+        *f.github.fail_pushes.lock().unwrap() = Some(502);
+        assert!(enqueue(&f, edited.clone()).await.is_err());
+        assert_eq!(f.job(id)["state"], "reviewing");
+        // Even another pusher for the same version leaves the admitted review alone.
+        *f.github.fail_pushes.lock().unwrap() = None;
+        *f.github.pushes.lock().unwrap() =
+            Some(vec![json!({"type":"push","actor":"bob","after":head})]);
+        assert_eq!(enqueue(&f, edited).await.unwrap()["id"], queued["id"]);
+        assert_eq!(f.job(id)["state"], "reviewing");
+        f.close().await;
+
+        // A failed lookup at dispatch retries instead of cancelling.
+        let f = Fixture::new().await;
+        let queued = f.queue().await;
+        *f.github.fail_pushes.lock().unwrap() = Some(502);
+        assert!(f.worker("next", json!({"active":[]})).await.is_err());
+        let job = f.job(s(&queued, "id"));
+        assert_eq!(job["state"], "queued");
+        assert!(s(&job, "reason").contains("dispatch will retry"), "{job}");
+        f.close().await;
+
+        // GitHub refusing for good, as for a private fork, leaves the pusher unconfirmed.
+        let f = Fixture::new().await;
+        *f.github.fail_pushes.lock().unwrap() = Some(404);
+        assert_eq!(f.queue().await["skipped"], "Not pushed by a listed author");
+        let status = f.handle.service.latest("owner/project#1").unwrap().unwrap();
+        assert!(
+            s(&status, "reason").contains("could not confirm"),
+            "{status}"
+        );
         f.close().await;
     }
     #[test]

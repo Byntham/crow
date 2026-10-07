@@ -495,13 +495,11 @@ impl GitHubApi for GitHub {
     }
     async fn pushes(&self, _: &Value, pr: &Value, token: &str) -> Result<Vec<Value>> {
         // GitHub records the authenticated user behind each push, unlike Git's
-        // author fields, which anyone can set.
-        let head = pr["head"]["repo"]
-            .as_str()
-            .context("The PR's head repository is gone")?;
-        let branch = pr["head"]["ref"]
-            .as_str()
-            .context("The PR has no head branch")?;
+        // author fields, which anyone can set. A deleted fork has no pushes to read.
+        let (Some(head), Some(branch)) = (pr["head"]["repo"].as_str(), pr["head"]["ref"].as_str())
+        else {
+            return Ok(Vec::new());
+        };
         let reference: String =
             url::form_urlencoded::byte_serialize(format!("refs/heads/{branch}").as_bytes())
                 .collect();

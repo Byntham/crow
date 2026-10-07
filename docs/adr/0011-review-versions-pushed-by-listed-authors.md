@@ -15,7 +15,7 @@ Runtime experiments (ADR 0010) need more: every push since the branch was create
 
 A requester can still ask for a review with `/crow review` or `crow review`. That is a deliberate choice, and such a review never runs code unless every push qualifies.
 
-When Crow cannot confirm who pushed, it does not review automatically. This happens when GitHub lists a push late, when the lookup fails, or when the App cannot read a private fork. GitHub usually lists a push about a second after it, so webhook-triggered checks retry for a few seconds.
+When Crow cannot confirm who pushed, it does not review automatically. This happens when GitHub never lists the push, or refuses the lookup, for example for a private fork the App cannot read. GitHub usually lists a push about a second after it, so webhook-triggered checks retry for a few seconds. A transient GitHub failure is retried like any other, rather than counted as unconfirmed. A version that was already admitted keeps its review when later webhooks arrive for it.
 
 The operator can opt out per repository with `crow policy owner/repo --pushers anyone`. Reviews and experiments then follow the PR author alone. Repositories that review everyone are not affected.
 
