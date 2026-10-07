@@ -1,7 +1,8 @@
 //! One experiment container: rootless Podman, a non-root user that maps to a
-//! subordinate host UID, no capabilities, a read-only root filesystem, verified
-//! cgroup limits, and no network unless it is a setup container using the gateway.
-use super::{Limits, gateway::Gateway};
+//! subordinate host UID, no capabilities, no new namespaces, a read-only root
+//! filesystem, verified cgroup limits, and no network unless it is a setup
+//! container using the gateway.
+use super::{Limits, gateway::Gateway, seccomp};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::{
@@ -47,7 +48,7 @@ pub(super) struct Run<'a> {
     pub name: String,
     pub review: &'a str,
     pub image: &'a str,
-    /// Private directory for temporary files such as the gateway socket.
+    /// Private directory for the seccomp profile and the gateway socket.
     pub scratch: &'a Path,
     /// Tar archive unpacked into /workspace first.
     pub workspace: &'a Path,
@@ -88,6 +89,13 @@ impl Sandbox<'_> {
     /// Run one experiment. Sandbox failures become an `error` outcome rather
     /// than an `Err`, so the receipt records them.
     pub async fn run(&self, run: Run<'_>, cancel: &CancellationToken) -> Outcome {
+        let profile = run.scratch.join("seccomp.profile");
+        let written = seccomp::profile(self.podman, self.env)
+            .await
+            .and_then(|p| crate::util::atomic(&profile, &p));
+        if let Err(e) = written {
+            return Outcome::sandbox_error(format!("Seccomp profile: {e:#}"));
+        }
         let gateway = if run.snapshot.is_some() {
             match Gateway::start_in(run.scratch) {
                 Ok(gateway) => Some(gateway),
@@ -101,6 +109,7 @@ impl Sandbox<'_> {
             &run.name,
             run.review,
             run.image,
+            &profile,
             gateway.as_ref().map(Gateway::directory),
         );
         let guard = Container {
@@ -130,9 +139,17 @@ impl Sandbox<'_> {
             }
             Err(e) => return Outcome::sandbox_error(format!("Container start: {e:#}")),
         }
+        // A prepared workspace is archived as `workspace/...`. Stripping that top
+        // entry leaves the mount itself alone, which the container user cannot change.
+        let strip = if run.restore.is_some() {
+            " --strip-components=1"
+        } else {
+            ""
+        };
         let check = format!(
-            "{}\ntar -xf - --delay-directory-restore -C /workspace && mkdir -p /workspace/.home",
-            limits_check(self.limits)
+            "{}\n{}\ntar -xf - --delay-directory-restore{strip} -C /workspace && mkdir -p /workspace/.home",
+            limits_check(self.limits),
+            seccomp::CHECK
         );
         let exec = |script: &str| -> Vec<String> {
             ["exec", "--interactive", &run.name, "/bin/sh", "-c", script]
@@ -143,7 +160,7 @@ impl Sandbox<'_> {
             Ok(unpacked) if unpacked.success => {}
             Ok(unpacked) => {
                 return Outcome::sandbox_error(format!(
-                    "Could not verify limits or unpack the workspace: {}",
+                    "Could not verify the sandbox or unpack the workspace: {}",
                     unpacked.stderr.trim()
                 ));
             }
@@ -219,13 +236,13 @@ impl Sandbox<'_> {
                 &run.name,
                 "tar",
                 "--mode=u+rwX",
-                "--exclude=./.home/.npm",
-                "--exclude=./.home/.cache",
+                "--exclude=workspace/.home/.npm",
+                "--exclude=workspace/.home/.cache",
                 "-cf",
                 "-",
                 "-C",
-                "/workspace",
-                ".",
+                "/",
+                "workspace",
             ]
             .map(str::to_owned)
             .to_vec();
@@ -285,6 +302,7 @@ pub(super) fn container_args(
     name: &str,
     review: &str,
     image: &str,
+    seccomp: &Path,
     gateway: Option<&Path>,
 ) -> Vec<String> {
     let lifetime = limits.timeout_seconds + OVERHEAD_SECONDS;
@@ -302,6 +320,7 @@ pub(super) fn container_args(
         "--image-volume=ignore".into(),
         "--cap-drop=ALL".into(),
         "--security-opt=no-new-privileges".into(),
+        format!("--security-opt=seccomp={}", seccomp.display()),
         format!("--user={USER}"),
         "--pid=private".into(),
         "--ipc=private".into(),
@@ -545,13 +564,15 @@ mod tests {
     #[test]
     fn containers_are_isolated_and_bounded() {
         let limits = Limits::default();
-        let args = container_args(&limits, "crow-x-1", "review1", "image:tag", None);
+        let profile = Path::new("/s/seccomp.profile");
+        let args = container_args(&limits, "crow-x-1", "review1", "image:tag", profile, None);
         for flag in [
             "--rm",
             "--network=none",
             "--read-only",
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
+            "--security-opt=seccomp=/s/seccomp.profile",
             "--user=1000:1000",
             "--pull=never",
             "--image-volume=ignore",
@@ -569,6 +590,7 @@ mod tests {
             "crow-x-2",
             "review1",
             "image:tag",
+            profile,
             Some(Path::new("/g")),
         );
         assert!(setup.contains(&"--volume=/g:/run/crow-downloads:ro,Z".to_owned()));

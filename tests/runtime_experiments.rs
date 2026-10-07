@@ -152,6 +152,10 @@ async fn experiments_prepare_reuse_and_account_for_every_attempt() {
     let runs: Vec<_> = calls.iter().filter(|c| c[0] == "run").collect();
     assert_eq!(runs.len(), 4);
     for run in &runs {
+        assert!(
+            run.iter().any(|a| a.starts_with("--security-opt=seccomp=")),
+            "seccomp profile missing from {run:?}"
+        );
         for flag in [
             "--network=none",
             "--user=1000:1000",

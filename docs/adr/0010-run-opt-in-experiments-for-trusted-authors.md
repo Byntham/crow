@@ -15,7 +15,7 @@ Upgrades never enable execution. An installation without the setting behaves exa
 
 ## Sandbox
 
-Experiments run in rootless Podman on the worker. Each attempt starts a fresh container from Crow's managed image, which the worker builds from a fixed Containerfile. Containers run as a non-root user, which rootless Podman maps to a subordinate host UID rather than the operator's own account. They have no capabilities, no privilege escalation, a read-only root filesystem, bounded tmpfs scratch space, and verified cgroup limits on memory, CPU and processes. Tests have no network and no host mounts.
+Experiments run in rootless Podman on the worker. Each attempt starts a fresh container from Crow's managed image, which the worker builds from a fixed Containerfile. Containers run as a non-root user, which rootless Podman maps to a subordinate host UID rather than the operator's own account. They have no capabilities, no privilege escalation, a seccomp profile that blocks creating namespaces, a read-only root filesystem, bounded tmpfs scratch space, and verified cgroup limits on memory, CPU and processes. Tests have no network and no host mounts.
 
 Setup commands, which install dependencies, reach a fixed list of public package registries through a gateway in the worker. The gateway checks the requested host, the TLS server name and the resolved addresses, and bounds connections and traffic. TLS stays end to end, so the gateway cannot see paths or uploads; setup code can still send data to an allowed registry or bucket. A successful setup saves the workspace so later tests in the same review can reuse it; Crow restores the pinned source over it before each test.
 

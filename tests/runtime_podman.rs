@@ -61,6 +61,28 @@ fn source(root: &Path) -> Value {
     json!({"dir": bare, "head": head, "base": base, "target": "main", "targetSha": base})
 }
 
+/// Tries each way to create a user namespace, then starts an ordinary thread.
+const NAMESPACE_PROBE: &str = r#"python3 - <<'EOF'
+import ctypes, errno, os, platform, threading
+libc = ctypes.CDLL(None, use_errno=True)
+CLONE_NEWUSER = 0x10000000
+try:
+    os.unshare(CLONE_NEWUSER)
+    print("unshare allowed")
+except OSError:
+    print("unshare blocked")
+clone = {"x86_64": 56, "aarch64": 220}[platform.machine()]
+pid = libc.syscall(clone, CLONE_NEWUSER | 17, 0, 0, 0, 0)
+if pid == 0:
+    os._exit(0)
+print("clone allowed" if pid > 0 else "clone blocked")
+libc.syscall(435, 0, 0)
+print("clone3 blocked" if ctypes.get_errno() == errno.ENOSYS else "clone3 allowed")
+thread = threading.Thread(target=print, args=("thread ok",))
+thread.start()
+thread.join()
+EOF"#;
+
 async fn run(execution: &Execution, tool: &str, revision: &str, command: &str) -> Value {
     let args = json!({"revision": revision, "command": command, "purpose": command});
     execution.call(tool, &args).await.unwrap()
@@ -103,12 +125,20 @@ async fn real_podman_isolates_experiments() {
     assert!(output.contains("CapEff:\t0000000000000000"), "{output}");
     assert!(output.contains("NoNewPrivs:\t1"), "{output}");
 
-    // The root filesystem is read-only, tests have no network, and code cannot
-    // create a user namespace, the usual route to kernel privilege escalation.
+    // Code cannot create a user namespace, the usual route to kernel privilege
+    // escalation, but ordinary threads still work.
+    let args = json!({"revision": "head", "command": NAMESPACE_PROBE, "purpose": "namespaces"});
+    let namespaces = execution.call("run_experiment", &args).await.unwrap();
+    assert!(passed(&namespaces), "{namespaces}");
+    assert_eq!(
+        namespaces["stdout"],
+        "unshare blocked\nclone blocked\nclone3 blocked\nthread ok\n"
+    );
+
+    // The root filesystem is read-only and tests have no network.
     for probe in [
         "touch /etc/crow-probe",
         "curl -sS --max-time 10 https://registry.npmjs.org/",
-        "python3 -c 'import os; os.unshare(os.CLONE_NEWUSER)'",
     ] {
         let blocked = run(&execution, "run_experiment", "head", probe).await;
         assert_eq!(blocked["status"], "failed", "{probe}: {blocked}");

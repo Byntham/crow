@@ -5,6 +5,7 @@
 mod gateway;
 pub mod image;
 mod sandbox;
+mod seccomp;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -603,6 +604,15 @@ pub async fn diagnostics(worker: &Value) -> Result<Option<Value>> {
             "cgroup v2 with cpu, memory and pids delegated to this user.".to_owned()
         } else {
             format!("Needs cgroup v2 with cpu, memory and pids delegated to this user; missing: {}", missing.join(", "))
+        },
+    }));
+    let seccomp = seccomp::profile(&config.podman, &env).await;
+    checks.push(json!({
+        "name": "Namespace blocking",
+        "ok": seccomp.is_ok(),
+        "detail": match seccomp {
+            Ok(_) => "Crow's seccomp profile, derived from Podman's default, blocks new namespaces.".to_owned(),
+            Err(e) => format!("{e:#}"),
         },
     }));
     let ready = image::exists(&config.podman, &env).await.unwrap_or(false);

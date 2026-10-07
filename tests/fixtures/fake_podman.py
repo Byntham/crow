@@ -17,12 +17,24 @@ def workspace(name):
     return os.path.join(state, "containers", name)
 
 
-def extract(target):
+def extract(target, strip=False):
     with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as archive:
-        archive.extractall(target, filter="data")
+        for member in archive:
+            if strip:  # --strip-components=1 skips the top entry itself
+                if "/" not in member.name:
+                    continue
+                member.name = member.name.split("/", 1)[1]
+            archive.extract(member, target, filter="data")
 
 
 command = args[0]
+if command == "info":  # the default seccomp profile Crow derives its own from
+    profile = os.path.join(state, "seccomp.json")
+    with open(profile, "w") as out:
+        json.dump({"defaultAction": "SCMP_ACT_ERRNO", "syscalls": [
+            {"names": ["read", "clone", "clone3", "unshare"], "action": "SCMP_ACT_ALLOW"}]}, out)
+    print(profile)
+    sys.exit(0)
 if command == "image" and args[1] == "exists":
     sys.exit(0 if os.path.exists(os.path.join(state, "image")) else 1)
 if command == "run":
@@ -40,11 +52,11 @@ if command == "exec":
         sys.exit(0)
     if program[0] == "tar":  # snapshot export
         with tarfile.open(fileobj=sys.stdout.buffer, mode="w|") as archive:
-            archive.add(target, arcname=".")
+            archive.add(target, arcname="workspace")
         sys.exit(0)
     script = program[2]
-    if "tar -xf -" in script:  # limits check and unpack
-        extract(target)
+    if "tar -xf -" in script:  # sandbox checks and unpack
+        extract(target, strip="--strip-components=1" in script)
         sys.exit(0)
     script = script.split("# Crow setup command\n", 1)[-1]
     sys.exit(subprocess.run(["/bin/sh", "-c", script], cwd=target).returncode)
