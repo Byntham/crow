@@ -517,14 +517,15 @@ impl GitHubApi for GitHub {
                 .request_headers(&path, Some(token), "GET", None)
                 .await?;
             for entry in data.as_array().context("Unexpected GitHub activity")? {
-                let kind = string(&entry["activity_type"])?;
+                // Keep entries of unknown shape: their actor still has to qualify.
+                let kind = entry["activity_type"].as_str();
                 pushes.push(json!({
                     "type": kind,
                     "actor": entry["actor"]["login"].as_str(),
                     "after": entry["after"].as_str(),
                 }));
                 // Older activity belongs to an earlier branch with this name.
-                if kind == "branch_creation" {
+                if kind == Some("branch_creation") {
                     return Ok(pushes);
                 }
             }
@@ -1140,7 +1141,12 @@ mod tests {
                 .parse()
                 .unwrap(),
         );
-        m.push(200, headers, json!([entry("push", "alice", "a1")]));
+        // An entry without a type is kept, so its actor still has to qualify.
+        m.push(
+            200,
+            headers,
+            json!([entry("push", "alice", "a1"), {"actor":{"login":"carol"},"after":"d1"}]),
+        );
         // Activity before the branch's creation belongs to an earlier branch.
         m.json(json!([
             entry("force_push", "bob", "b1"),
@@ -1152,6 +1158,7 @@ mod tests {
             pushes,
             vec![
                 json!({"type":"push","actor":"alice","after":"a1"}),
+                json!({"type":null,"actor":"carol","after":"d1"}),
                 json!({"type":"force_push","actor":"bob","after":"b1"}),
                 json!({"type":"branch_creation","actor":"alice","after":"c1"}),
             ]

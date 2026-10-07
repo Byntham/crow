@@ -165,11 +165,11 @@ fn review_settings(v: &Value) -> Value {
 fn error_status(e: &anyhow::Error) -> u16 {
     e.downcast_ref::<GitHubError>().map_or(400, |e| e.status)
 }
-/// GitHub refused a request for good, for example for a private fork the App
-/// cannot read, rather than failing for now.
+/// GitHub refused a request for good, for example with a 404 for a private
+/// fork the App cannot read. A 403 can be a spent rate limit, so it is retried.
 fn refused(e: &anyhow::Error) -> bool {
     e.downcast_ref::<GitHubError>()
-        .is_some_and(|e| e.retry_after == 0 && matches!(e.status, 403 | 404 | 410 | 422))
+        .is_some_and(|e| matches!(e.status, 404 | 410 | 422))
 }
 fn retry_after(e: &anyhow::Error) -> i64 {
     e.downcast_ref::<GitHubError>()
@@ -390,11 +390,13 @@ impl Service {
                     })
             })
             .collect();
+        // A failed lookup skips that PR until its next event, not the whole scan.
         let mut admitted = Vec::new();
         for pr in fresh {
-            let pr = self.with_pushes(&repo, pr.clone(), &token, false).await?;
-            if pushed_by_author(&repo, &pr) {
-                admitted.push(pr);
+            match self.with_pushes(&repo, pr.clone(), &token, false).await {
+                Ok(pr) if pushed_by_author(&repo, &pr) => admitted.push(pr),
+                Ok(_) => {}
+                Err(e) => eprintln!("Catch-up skipped PR #{}: {e}", n(pr, "number")),
             }
         }
         let fresh = admitted;
@@ -2092,8 +2094,8 @@ mod tests {
         prs: Mutex<Vec<Value>>,
         /// Pushes to every PR branch; by default alice created it and pushed the head.
         pushes: Mutex<Option<Vec<Value>>>,
-        /// HTTP status for failing push lookups.
-        fail_pushes: Mutex<Option<u16>>,
+        /// HTTP status for failing push lookups, by PR number.
+        fail_pushes: Mutex<HashMap<i64, u16>>,
         reviews: Mutex<Vec<Value>>,
         published: Mutex<Vec<Value>>,
         pr_gate: Mutex<Option<Arc<Gate>>>,
@@ -2157,7 +2159,7 @@ mod tests {
             Ok(prs)
         }
         async fn pushes(&self, _: &Value, pr: &Value, _: &str) -> Result<Vec<Value>> {
-            if let Some(status) = *self.fail_pushes.lock().unwrap() {
+            if let Some(&status) = self.fail_pushes.lock().unwrap().get(&n(pr, "number")) {
                 let message = "GitHub activity failed".to_owned();
                 return Err(GitHubError {
                     message,
@@ -3010,11 +3012,11 @@ mod tests {
         assert_eq!(f.claim().await["id"], queued["id"]);
         let id = s(&queued, "id");
         // A title edit while GitHub fails: the event retries, the review goes on.
-        *f.github.fail_pushes.lock().unwrap() = Some(502);
+        f.github.fail_pushes.lock().unwrap().insert(1, 502);
         assert!(enqueue(&f, edited.clone()).await.is_err());
         assert_eq!(f.job(id)["state"], "reviewing");
         // Even another pusher for the same version leaves the admitted review alone.
-        *f.github.fail_pushes.lock().unwrap() = None;
+        f.github.fail_pushes.lock().unwrap().clear();
         *f.github.pushes.lock().unwrap() =
             Some(vec![json!({"type":"push","actor":"bob","after":head})]);
         assert_eq!(enqueue(&f, edited).await.unwrap()["id"], queued["id"]);
@@ -3024,7 +3026,7 @@ mod tests {
         // A failed lookup at dispatch retries instead of cancelling.
         let f = Fixture::new().await;
         let queued = f.queue().await;
-        *f.github.fail_pushes.lock().unwrap() = Some(502);
+        f.github.fail_pushes.lock().unwrap().insert(1, 502);
         assert!(f.worker("next", json!({"active":[]})).await.is_err());
         let job = f.job(s(&queued, "id"));
         assert_eq!(job["state"], "queued");
@@ -3033,13 +3035,58 @@ mod tests {
 
         // GitHub refusing for good, as for a private fork, leaves the pusher unconfirmed.
         let f = Fixture::new().await;
-        *f.github.fail_pushes.lock().unwrap() = Some(404);
+        f.github.fail_pushes.lock().unwrap().insert(1, 404);
         assert_eq!(f.queue().await["skipped"], "Not pushed by a listed author");
         let status = f.handle.service.latest("owner/project#1").unwrap().unwrap();
         assert!(
             s(&status, "reason").contains("could not confirm"),
             "{status}"
         );
+        f.close().await;
+        // A spent rate limit also answers 403, so only 404, 410 and 422 are final.
+        let error = |status| {
+            let message = String::new();
+            anyhow::Error::from(GitHubError {
+                message,
+                status,
+                retry_after: 0,
+            })
+        };
+        assert!(refused(&error(404)) && refused(&error(422)));
+        assert!(!refused(&error(403)) && !refused(&error(429)) && !refused(&error(502)));
+
+        // One PR's failed lookup skips that PR, not the whole catch-up.
+        let f = Fixture::new().await;
+        f.github.prs.lock().unwrap().push(pr(2));
+        f.github.fail_pushes.lock().unwrap().insert(1, 502);
+        assert_eq!(f.catch_up(false).await, json!({"queued":1,"held":0}));
+        assert!(
+            f.handle
+                .service
+                .latest("owner/project#2")
+                .unwrap()
+                .is_some()
+        );
+        f.close().await;
+
+        // A requested review merged into a paused automatic one stays requested,
+        // so the dispatch check for automatic reviews does not cancel it.
+        let f = Fixture::new().await;
+        let queued = f.queue().await;
+        let id = s(&queued, "id");
+        f.handle
+            .service
+            .update(id, json!({"state":"paused"}), None)
+            .unwrap();
+        *f.github.pushes.lock().unwrap() =
+            Some(vec![json!({"type":"push","actor":"bob","after":head})]);
+        let requested = enqueue(&f, json!({"manual":true,"requester":"alice"}))
+            .await
+            .unwrap();
+        assert_eq!(requested["id"], queued["id"]);
+        assert_eq!(requested["manual"], true);
+        assert_eq!(f.claim().await["id"], queued["id"]);
+        assert_eq!(f.job(id)["state"], "reviewing");
         f.close().await;
     }
     #[test]
