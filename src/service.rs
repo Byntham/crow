@@ -841,14 +841,8 @@ impl Service {
             s(j, "repo"),
             n(j, "number")
         );
-        // Check that the report fits before posting anything. No review link
-        // is longer than this one.
-        let longest = format!("{pr_url}#pullrequestreview-{}", u64::MAX);
-        report::report_body(
-            j,
-            &report::record_findings(&j["report"], history.clone(), &anchored, Some(&longest)),
-            &report::add_published(&saved["published"], j, Some(&longest)),
-        )?;
+        // Check that the report fits before posting anything.
+        report::report_body(j, &history, &saved["published"])?;
         if review.is_none()
             && self
                 .get("jobs", s(j, "id"))?
@@ -4135,7 +4129,15 @@ mod tests {
     }
     #[tokio::test]
     async fn completed_comparison_is_reconstructed_only_from_own_bot_marker() {
-        for (bot, comment) in [(42, true), (99, true), (42, false), (99, false)] {
+        let cases = [
+            (42, "comment", true),
+            (99, "comment", false),
+            (42, "review", true),
+            (99, "review", false),
+            // Inline comments posted before the comment holds the report.
+            (42, "inline", false),
+        ];
+        for (bot, place, reviewed) in cases {
             let f = Fixture::new().await;
             f.queue().await;
             let j = f.claim().await;
@@ -4143,9 +4145,12 @@ mod tests {
                 j.clone(),
                 &json!({"comparison":comparison(),"settings":review_settings(&f.config["worker"]),"report":{"summary":"Earlier review","findings":[]}}),
             );
-            let body = report::report_body(&saved, &[], &json!({})).unwrap();
+            let body = match place {
+                "inline" => report::review_body(&saved, &[], COMMENT),
+                _ => report::report_body(&saved, &[], &json!({})).unwrap(),
+            };
             // Reports live in the PR comment; earlier releases posted reviews.
-            if comment {
+            if place == "comment" {
                 let body = comment_body(&j, &json!({"report":body}));
                 f.github
                     .comments
@@ -4164,11 +4169,11 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 result.get("skip").and_then(Value::as_bool).unwrap_or(false),
-                bot == 42
+                reviewed
             );
             assert_eq!(
                 f.job(s(&j, "id"))["state"],
-                if bot == 42 { "completed" } else { "reviewing" }
+                if reviewed { "completed" } else { "reviewing" }
             );
             f.close().await;
         }

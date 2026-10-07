@@ -326,12 +326,29 @@ fn history_row(job: &Value, published: &Value) -> Option<String> {
 /// after this report, linked to the inline comments that raised them, and
 /// `published` the reports in its history row, this one last.
 pub fn report_body(job: &Value, records: &[Value], published: &Value) -> Result<String> {
+    // Validation bounds the report without links, so leave them out when they
+    // would make the comment too long for GitHub.
+    for links in [true, false] {
+        let body = render(job, records, published, links);
+        if units(&body) <= 59_000 {
+            return Ok(body);
+        }
+    }
+    Err(output(
+        "Invalid final review report: rendered findings are too large for GitHub",
+    ))
+}
+
+fn render(job: &Value, records: &[Value], published: &Value, links: bool) -> String {
     let c = &job["comparison"];
     let repo = string(&job["repo"]);
     let head = string(&c["head"]);
     let mut blocks: Vec<_> = ranked(&job["report"])
         .into_iter()
         .map(|f| {
+            if !links {
+                return finding_block(f, &location(f));
+            }
             let mut at = format!(
                 "[{}](https://github.com/{repo}/blob/{head}/{}#L{})",
                 location(f),
@@ -361,7 +378,10 @@ pub fn report_body(job: &Value, records: &[Value], published: &Value) -> Result<
         .iter()
         .filter(|r| !current.contains(string(&r["id"])))
         .count();
-    let mut row: Vec<_> = history_row(job, published).into_iter().collect();
+    let mut row: Vec<_> = history_row(job, published)
+        .filter(|_| links)
+        .into_iter()
+        .collect();
     if earlier > 0 {
         row.push(format!(
             "{} not rechecked",
@@ -394,13 +414,7 @@ pub fn report_body(job: &Value, records: &[Value], published: &Value) -> Result<
     // When the review finished.
     about.extend(when(job["updatedAt"].as_i64().unwrap_or(0)));
     blocks.push(format!("<sub>{}</sub>", about.join(" · ")));
-    let body = format!("{}\n{}", marker(&meta(job)), blocks.join("\n\n"));
-    if units(&body) > 59_000 {
-        return Err(output(
-            "Invalid final review report: rendered findings are too large for GitHub",
-        ));
-    }
-    Ok(body)
+    format!("{}\n{}", marker(&meta(job)), blocks.join("\n\n"))
 }
 
 /// Findings from most to least severe; equal ones keep the reviewer's order.
@@ -413,9 +427,11 @@ fn ranked(report: &Value) -> Vec<&Value> {
 /// The body of the review that carries a report's inline comments.
 pub fn review_body(job: &Value, anchored: &[&Value], comment: &str) -> String {
     let icon = worst(anchored.iter().map(|f| string(&f["severity"]))).map_or("", |s| severity(s).0);
+    // Only the comment publishes the report, so this marker names just the job
+    // and can't count as a reviewed comparison.
     format!(
         "{}\n{icon} {} on {}. [Crow's comment]({comment}) has the full report.",
-        marker(&meta(job)),
+        marker(&json!({"job":job["id"]})),
         plural(anchored.len(), "new finding"),
         commit(string(&job["repo"]), string(&job["comparison"]["head"]))
     )
@@ -667,7 +683,7 @@ mod tests {
         let r = report();
         let f = &r["findings"][0];
         let body = review_body(&job(), &[f], "https://example.com/comment");
-        assert_eq!(metadata(&body).unwrap()["job"], "job1");
+        assert_eq!(metadata(&body).unwrap(), json!({"job":"job1"}));
         assert!(body.ends_with(&format!(
             "\n🟠 1 new finding on [`aaaaaaa`](https://github.com/owner/project/commit/{}). [Crow's comment](https://example.com/comment) has the full report.",
             "a".repeat(40)
@@ -691,6 +707,41 @@ mod tests {
             .collect();
         let error = validate_report(&json!({"summary":"Complete","findings":fs})).unwrap_err();
         assert_eq!(error.downcast_ref::<OutputError>().unwrap().kind, "output");
+    }
+    #[test]
+    fn links_are_left_out_when_they_would_not_fit() {
+        let mut job = job();
+        job["repo"] = json!(format!("{}/{}", "o".repeat(39), "r".repeat(100)));
+        let fs: Vec<_> = (0..90)
+            .map(|i| {
+                let mut f = finding();
+                f["title"] = json!(format!("Issue {i}"));
+                f["path"] = json!(format!("src/{}.rs", "p".repeat(60)));
+                f["body"] = json!("y".repeat(250));
+                f
+            })
+            .collect();
+        job["report"] =
+            validate_report(&json!({"summary":"x".repeat(6000),"findings":fs})).unwrap();
+        let mut records: Vec<_> = findings(&job["report"])
+            .iter()
+            .map(|f| json!({"id":f["id"],"url":"https://example.com/thread"}))
+            .collect();
+        records.push(json!({"id":"earlier","url":null}));
+        let mut published = add_published(&json!({}), &job, None);
+        published = add_published(
+            &published,
+            &json!({"id":"next","comparison":job["comparison"],"report":job["report"]}),
+            None,
+        );
+        assert!(units(&render(&job, &records, &published, true)) > 59_000);
+        let body = report_body(&job, &records, &published).unwrap();
+        assert!(units(&body) <= 59_000);
+        assert!(
+            !body.contains("/blob/") && !body.contains("[Thread]") && !body.contains("reviews**")
+        );
+        assert!(body.contains(&format!("\n\n`src/{}.rs:2`\n\n", "p".repeat(60))));
+        assert!(body.contains("\n\n1 earlier finding not rechecked\n\n<sub>"));
     }
     #[test]
     fn history_row_has_a_dot_for_each_recent_review() {

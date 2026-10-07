@@ -44,7 +44,7 @@ Startup and recovery catch-up are enabled by default and can be disabled. Repeat
 
 A completed review identifies its repository, PR, reviewed head commit, target branch, and comparison base. Advancing the head or changing the comparison requires another review. An unrelated target-branch commit that leaves the comparison unchanged does not alone require a rerun.
 
-Reports visibly identify the reviewed commit, target branch, and comparison base, with full revision identifiers in machine-readable completion metadata. Crow recognizes completion using the markers in its own authenticated PR comment and review records. Failed or cancelled attempts are not completed reviews; successful clean reviews are.
+Reports visibly identify the reviewed commit, target branch, and comparison base, with full revision identifiers in machine-readable completion metadata. Crow recognizes completion using the marker in its own authenticated PR comment, or in the review records that earlier releases published. Failed or cancelled attempts are not completed reviews; successful clean reviews are.
 
 Later summaries represent earlier findings through links rather than posting identical inline comments again. Omission from a new review must not imply that an earlier finding was fixed. A summary may identify a finding as still present or fixed when it has actually been reassessed; otherwise it must describe its current status as unverified. GitHub marking a comment outdated is not evidence of a fix.
 
