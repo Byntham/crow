@@ -82,8 +82,8 @@ fn eligible(repo: &Value, pr: &Value) -> bool {
             || matches_login(&repo["authors"], s(&pr["user"], "login")))
 }
 /// A version queued before GitHub confirmed its pusher waits this long, from
-/// when it was queued, for GitHub to list the push. GitHub usually lists one
-/// about a second after it.
+/// its first check at dispatch, for GitHub to list the push. GitHub usually
+/// lists one about a second after it.
 const LISTING_WINDOW_MS: i64 = 5 * 60_000;
 /// ...and this long for push lookups to stop failing.
 const LOOKUP_WINDOW_MS: i64 = 60 * 60_000;
@@ -321,6 +321,9 @@ impl Service {
         if b(options, "manual") || b(options, "admitted") {
             return Ok(Some(self.db(|db| db.queue(repo, pr, options))?));
         }
+        if b(options, "verify") {
+            return Ok(Some(self.queue_unverified(repo, pr, options)?));
+        }
         Ok(match self.admission(repo, pr, token).await {
             Admission::Admit => Some(self.db(|db| db.queue(repo, pr, options))?),
             Admission::Verify => Some(self.queue_unverified(repo, pr, options)?),
@@ -355,13 +358,17 @@ impl Service {
         self.update(s(&job, "id"), json!({"verifyPusher": true}), None)
     }
     /// Requeue the PR after `job` was superseded. The same version keeps the
-    /// job's admission or request, so it needs no lookup. A new version is left
-    /// to its own event if the lookup fails.
+    /// job's request, admission or pending verification, so it needs no
+    /// lookup. A new version is left to its own event if the lookup fails.
     async fn succeed(&self, repo: &Value, pr: &Value, token: &str, job: &Value) -> Option<Value> {
-        let options = if job["head"] == pr["head"]["sha"] {
-            json!({"manual": b(job, "manual"), "admitted": !b(job, "manual")})
-        } else {
+        let options = if job["head"] != pr["head"]["sha"] {
             json!({})
+        } else if b(job, "manual") {
+            json!({"manual": true})
+        } else if b(job, "verifyPusher") {
+            json!({"verify": true})
+        } else {
+            json!({"admitted": true})
         };
         self.requeue(repo, pr, token, &options)
             .await
@@ -1167,13 +1174,19 @@ impl Service {
         // otherwise it is skipped like any other version.
         let unverified = b(job, "verifyPusher") && !b(job, "manual") && checks_pushers(&repo);
         if unverified && !pushed_by_author(&repo, &pr) {
-            let age = now() - n(job, "createdAt");
+            // The windows start at the first check, not when the version was
+            // queued, since a held or busy queue can delay that check.
+            let since = match n(job, "verifySince") {
+                0 => now(),
+                since => since,
+            };
+            let age = now() - since;
             let unlisted = pr["pushes"].is_array() && head_push(&pr).is_none();
             let change = if (lookup_failed && age < LOOKUP_WINDOW_MS)
                 || (unlisted && age < LISTING_WINDOW_MS)
             {
                 let reason = "Confirming with GitHub who pushed this version.";
-                json!({"state":"queued","nextAt":now() + 30000,"reason":reason})
+                json!({"state":"queued","nextAt":now() + 30000,"reason":reason,"verifySince":since})
             } else {
                 json!({"state":"cancelled","autoRecover":false,"reason":pusher_reason(&pr)})
             };
@@ -3339,7 +3352,7 @@ mod tests {
         let f = Fixture::new().await;
         *f.github.pushes.lock().unwrap() = Some(vec![earlier]);
         let queued = enqueue(&f, event.clone()).await.unwrap();
-        let old = json!({"createdAt": now() - LISTING_WINDOW_MS - 1000});
+        let old = json!({"verifySince": now() - LISTING_WINDOW_MS - 1000});
         f.handle
             .service
             .update(s(&queued, "id"), old, None)
@@ -3434,6 +3447,56 @@ mod tests {
         assert_eq!(f.job(s(&requested, "id"))["state"], "queued");
         f.close().await;
 
+        // An unverified version superseded at dispatch, here by a base-branch
+        // change, is requeued still unverified rather than as admitted.
+        let f = Fixture::new().await;
+        *f.github.pushes.lock().unwrap() = Some(vec![]);
+        let service = f.handle.service.clone();
+        let queued = f
+            .handle
+            .execute(async move {
+                let options = json!({"event":true,"trigger":"Pull request updated"});
+                service
+                    .enqueue(&service.repo("owner/project")?, 1, &options)
+                    .await
+            })
+            .await
+            .unwrap();
+        assert_eq!(queued["verifyPusher"], true);
+        f.github.prs.lock().unwrap()[0]["base"]["ref"] = json!("develop");
+        assert!(f.claim().await.is_null());
+        assert_eq!(f.job(s(&queued, "id"))["state"], "superseded");
+        let replacement = latest(&f);
+        assert_eq!(replacement["target"], "develop");
+        assert_eq!(replacement["verifyPusher"], true);
+        f.close().await;
+
+        // The windows start at the first check: a version that waited long in
+        // the queue still gets its full window when that check fails.
+        let f = Fixture::new().await;
+        f.github.fail_pushes.lock().unwrap().insert(1, 502);
+        let service = f.handle.service.clone();
+        let queued = f
+            .handle
+            .execute(async move {
+                let options = json!({"event":true,"trigger":"Pull request updated"});
+                service
+                    .enqueue(&service.repo("owner/project")?, 1, &options)
+                    .await
+            })
+            .await
+            .unwrap();
+        let old = json!({"createdAt": now() - 2 * LOOKUP_WINDOW_MS});
+        f.handle
+            .service
+            .update(s(&queued, "id"), old, None)
+            .unwrap();
+        assert!(f.claim().await.is_null());
+        let waiting = f.job(s(&queued, "id"));
+        assert_eq!(waiting["state"], "queued");
+        assert!(now() - n(&waiting, "verifySince") < 60_000, "{waiting}");
+        f.close().await;
+
         // A lookup that never succeeds, such as a fork's lasting 403, holds back no
         // events. The version waits at dispatch until the lookup window passes,
         // then is skipped.
@@ -3455,7 +3518,7 @@ mod tests {
         assert_eq!(queued["verifyPusher"], true);
         assert!(f.claim().await.is_null());
         assert_eq!(f.job(s(&queued, "id"))["state"], "queued");
-        let old = json!({"createdAt": now() - LOOKUP_WINDOW_MS - 1000, "nextAt": 0});
+        let old = json!({"verifySince": now() - LOOKUP_WINDOW_MS - 1000, "nextAt": 0});
         f.handle
             .service
             .update(s(&queued, "id"), old, None)
