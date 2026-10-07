@@ -14,8 +14,9 @@ pub struct OutputError {
 fn units(s: &str) -> usize {
     s.encode_utf16().count()
 }
-// ECMAScript trim includes BOM and excludes Unicode NEXT LINE.
-fn js_trim(s: &str) -> &str {
+// Finding IDs hash trimmed titles, so this whitespace set must stay fixed:
+// it includes the byte-order mark and excludes NEXT LINE (U+0085).
+fn trim_text(s: &str) -> &str {
     s.trim_matches(|c| matches!(c, '\u{0009}'..='\u{000d}' | '\u{0020}' | '\u{00a0}' | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}'))
 }
 fn string(v: &Value) -> &str {
@@ -46,7 +47,7 @@ pub fn validate_report(input: &Value) -> Result<Value> {
     let summary = input.get("summary").and_then(Value::as_str);
     let entries = input.get("findings").and_then(Value::as_array);
     if !input.is_object()
-        || summary.is_none_or(|s| js_trim(s).is_empty() || units(s) > 16_000)
+        || summary.is_none_or(|s| trim_text(s).is_empty() || units(s) > 16_000)
         || entries.is_none_or(|f| f.len() > 100)
     {
         bail!("Invalid final review report");
@@ -62,24 +63,24 @@ pub fn validate_report(input: &Value) -> Result<Value> {
                 entry["severity"].as_str(),
                 Some("critical" | "high" | "medium" | "low")
             )
-            || title.is_none_or(|s| js_trim(s).is_empty() || units(s) > 300)
-            || body.is_none_or(|s| js_trim(s).is_empty() || units(s) > 4_000)
+            || title.is_none_or(|s| trim_text(s).is_empty() || units(s) > 300)
+            || body.is_none_or(|s| trim_text(s).is_empty() || units(s) > 4_000)
             || line.is_none_or(|n| !n.is_finite() || n.fract() != 0.0 || n < 1.0)
             || path.is_none_or(|p| !crate::inspection::safe_path(p))
         {
             bail!("Invalid finding in final review report");
         }
         let mut f = entry.clone();
-        // JSON 2.0 is an integer in JavaScript; normalize it for GitHub anchors.
+        // Accept 2.0 as line 2 and store an integer for GitHub anchors.
         let n = line.unwrap();
         if n < u64::MAX as f64 {
             f["line"] = Value::from(n as u64);
         }
-        // Hash exactly the same JSON array as the JavaScript implementation.
+        // Finding IDs link published findings across reviews; keep this input stable.
         f["id"] = Value::String(
             crate::util::hash(&json!([
                 path.unwrap(),
-                js_trim(title.unwrap()).to_lowercase()
+                trim_text(title.unwrap()).to_lowercase()
             ]))[..20]
                 .into(),
         );
@@ -147,7 +148,7 @@ fn render_findings(report: &Value) -> String {
 pub fn report_body(job: &Value, history: &[Value], earlier_reviews: &[Value]) -> Result<String> {
     let c = &job["comparison"];
     let root = format!("https://github.com/{}", string(&job["repo"]));
-    // Missing JavaScript properties are omitted, while explicit nulls stay null.
+    // Omit missing metadata fields, but keep explicit nulls.
     let mut meta = serde_json::Map::new();
     for (key, value) in [
         ("job", job.get("id")),
@@ -279,7 +280,26 @@ pub fn inline_comments(report: &Value, patch: &str, history: &[Value]) -> Vec<Va
         }
     }
     let old: HashSet<_> = history.iter().map(|f| string(&f["id"])).collect();
-    findings(report).iter().filter(|f| !old.contains(string(&f["id"])) && changed.get(string(&f["path"])).is_some_and(|lines| f["line"].as_u64().is_some_and(|n| lines.contains(&n)))).map(|f| json!({"path":f["path"],"line":f["line"],"side":"RIGHT","body":format!("**{}: {}**\n\n{}",string(&f["severity"]),string(&f["title"]),string(&f["body"]))})).collect()
+    // Only new findings on added lines can be anchored as inline comments.
+    findings(report)
+        .iter()
+        .filter(|f| {
+            !old.contains(string(&f["id"]))
+                && changed
+                    .get(string(&f["path"]))
+                    .zip(f["line"].as_u64())
+                    .is_some_and(|(lines, n)| lines.contains(&n))
+        })
+        .map(|f| {
+            let body = format!(
+                "**{}: {}**\n\n{}",
+                string(&f["severity"]),
+                string(&f["title"]),
+                string(&f["body"])
+            );
+            json!({"path":f["path"],"line":f["line"],"side":"RIGHT","body":body})
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -325,7 +345,7 @@ mod tests {
         );
     }
     #[test]
-    fn finding_id_preserves_javascript_hash_and_line_independence() {
+    fn finding_id_is_stable_and_ignores_line() {
         let old = report();
         let mut f = finding();
         f["line"] = json!(20);
@@ -338,7 +358,7 @@ mod tests {
         );
     }
     #[test]
-    fn javascript_whitespace_and_float_encoded_integer_compatibility() {
+    fn whitespace_and_float_encoded_integers_match_published_reports() {
         assert!(validate_report(&json!({"summary":"\u{feff}","findings":[]})).is_err());
         assert!(validate_report(&json!({"summary":"\u{0085}","findings":[]})).is_ok());
         let mut f = finding();

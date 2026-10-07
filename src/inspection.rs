@@ -637,7 +637,7 @@ pub async fn guidance(source: &Value) -> Result<Value> {
         },
     )
     .await?;
-    // JavaScript sorted UTF-16 code units; retain persisted fingerprint order.
+    // Sort by UTF-16 code units: saved guidance fingerprints depend on this order.
     wanted.sort_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
     let mut files = Vec::new();
     for path in wanted {
@@ -799,55 +799,140 @@ pub async fn inspection_tool(source: &Value, name: &str, args: &Value) -> Result
     }
 }
 
-pub fn tools() -> Value {
-    json!([
-        {"name":"list_files","description":"List tracked files or every changed path including deletions. Follow nextOffset until null before treating the list as complete.","inputSchema":{"type":"object","properties":{"prefix":{"type":"string"},"changed_only":{"type":"boolean"},"offset":{"type":"integer","minimum":0},"count":{"type":"integer","minimum":1,"maximum":10000}},"required":[],"additionalProperties":false}},
-        {"name":"read_file","description":"Read numbered lines of a regular tracked file. Symlinks are never followed.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"revision":{"enum":["head","base"]},"start":{"type":"integer"},"count":{"type":"integer"}},"required":["path"],"additionalProperties":false}},
-        {"name":"diff","description":"Read the PR diff against its merge base. offset/count count Unicode characters. Follow nextOffset until null to read the complete comparison. Discover paths independently with list_files changed_only=true.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":0},"count":{"type":"integer","minimum":1,"maximum":200000}},"required":[],"additionalProperties":false}},
-        {"name":"search","description":"Search tracked source using a literal string. Does not execute repository code.","inputSchema":{"type":"object","properties":{"text":{"type":"string"},"path":{"type":"string"}},"required":["text"],"additionalProperties":false}}
-    ])
+pub fn tools() -> Vec<Value> {
+    let tool = |name: &str, description: &str, properties: Value, required: &[&str]| {
+        json!({
+            "name": name,
+            "description": description,
+            "inputSchema": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+                "additionalProperties": false,
+            },
+        })
+    };
+    let page = |maximum: u64| {
+        json!({
+            "offset": {"type": "integer", "minimum": 0},
+            "count": {"type": "integer", "minimum": 1, "maximum": maximum},
+        })
+    };
+    let mut list = page(10_000);
+    list["prefix"] = json!({"type": "string"});
+    list["changed_only"] = json!({"type": "boolean"});
+    let mut diff = page(200_000);
+    diff["path"] = json!({"type": "string"});
+    vec![
+        tool(
+            "list_files",
+            "List tracked files or every changed path including deletions. Follow nextOffset until null before treating the list as complete.",
+            list,
+            &[],
+        ),
+        tool(
+            "read_file",
+            "Read numbered lines of a regular tracked file. Symlinks are never followed.",
+            json!({
+                "path": {"type": "string"},
+                "revision": {"enum": ["head", "base"]},
+                "start": {"type": "integer"},
+                "count": {"type": "integer"},
+            }),
+            &["path"],
+        ),
+        tool(
+            "diff",
+            "Read the PR diff against its merge base. offset/count count Unicode characters. Follow nextOffset until null to read the complete comparison. Discover paths independently with list_files changed_only=true.",
+            diff,
+            &[],
+        ),
+        tool(
+            "search",
+            "Search tracked source using a literal string. Does not execute repository code.",
+            json!({"text": {"type": "string"}, "path": {"type": "string"}}),
+            &["text"],
+        ),
+    ]
 }
 
+/// Read one newline-terminated MCP message. The size bound keeps malformed
+/// input from exhausting memory. An empty result means end of input.
+async fn read_message(input: &mut (impl AsyncBufReadExt + Unpin)) -> Result<Vec<u8>> {
+    let mut line = Vec::new();
+    loop {
+        let chunk = input.fill_buf().await?;
+        if chunk.is_empty() {
+            return Ok(line);
+        }
+        let n = chunk
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(chunk.len(), |n| n + 1);
+        ensure!(
+            line.len() + n <= 4 * 1024 * 1024,
+            "MCP request exceeds 4 MiB"
+        );
+        let done = chunk[n - 1] == b'\n';
+        line.extend_from_slice(&chunk[..n]);
+        input.consume(n);
+        if done {
+            return Ok(line);
+        }
+    }
+}
+async fn call_tool(
+    source: &Value,
+    delegation: Option<&crate::delegation::Delegation>,
+    params: &Value,
+) -> Result<Value> {
+    let name = params["name"]
+        .as_str()
+        .ok_or_else(|| anyhow!("Invalid tool request"))?;
+    let empty = json!({});
+    let args = params
+        .get("arguments")
+        .filter(|v| !v.is_null())
+        .unwrap_or(&empty);
+    if let Some(delegation) = delegation
+        && crate::delegation::tools().iter().any(|t| t["name"] == name)
+    {
+        return delegation.call(name, args).await;
+    }
+    inspection_tool(source, name, args).await
+}
+fn tool_result(output: Result<Value>) -> Value {
+    match output {
+        Ok(value) => {
+            let text = value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string());
+            json!({"content": [{"type": "text", "text": text}]})
+        }
+        Err(e) => json!({"isError": true, "content": [{"type": "text", "text": e.to_string()}]}),
+    }
+}
+
+/// Serve the inspection tools, plus delegation for a parent review, over MCP stdio.
 pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) -> Result<()> {
     let source: Value = serde_json::from_slice(&tokio::fs::read(source_path).await?)?;
-    let context: Option<Value> = if let Some(path) = context_path {
-        Some(serde_json::from_slice(&tokio::fs::read(path).await?)?)
-    } else {
-        None
+    let context: Option<Value> = match context_path {
+        Some(path) => Some(serde_json::from_slice(&tokio::fs::read(path).await?)?),
+        None => None,
     };
-    let delegation = if let Some(context) = context.filter(|v| {
+    let delegation = match context.filter(|v| {
         v["job"]["settings"]["subagents"]["max"]
             .as_u64()
             .unwrap_or(0)
             > 0
     }) {
-        Some(crate::delegation::Delegation::init(context).await?)
-    } else {
-        None
+        Some(context) => Some(crate::delegation::Delegation::init(context).await?),
+        None => None,
     };
-    let mut definitions = tools().as_array().expect("tool array").clone();
+    let mut definitions = tools();
     if delegation.is_some() {
-        for mut tool in crate::delegation::tools()
-            .as_array()
-            .into_iter()
-            .flatten()
-            .cloned()
-        {
-            if tool.get("inputSchema").is_none() {
-                let props = tool
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("properties")
-                    .unwrap_or(json!({}));
-                let required = tool
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("required")
-                    .unwrap_or(json!([]));
-                tool["inputSchema"] = json!({"type":"object","properties":props,"required":required,"additionalProperties":false});
-            }
-            definitions.push(tool);
-        }
+        definitions.extend(crate::delegation::tools());
     }
     let mut stdin = BufReader::new(crate::process::NonblockingIo::stdin()?);
     let mut stdout = crate::process::NonblockingIo::stdout()?;
@@ -864,41 +949,51 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
         }
     };
     tokio::pin!(stop);
-    let result=async {
+    let result = async {
         loop {
-            // A bounded line reader prevents malformed MCP input from exhausting memory.
-            let mut line=Vec::new();
-            let read=async {loop {let chunk=stdin.fill_buf().await?; if chunk.is_empty(){break;} let n=chunk.iter().position(|b|*b==b'\n').map_or(chunk.len(),|n|n+1); ensure!(line.len()+n<=4*1024*1024,"MCP request exceeds 4 MiB"); let done=chunk[n-1]==b'\n'; line.extend_from_slice(&chunk[..n]); stdin.consume(n); if done {break;} } Ok::<_,anyhow::Error>(())};
-            tokio::select!{_=&mut stop=>break,result=read=>result?}
-            if line.is_empty(){break;}
-            let request: Value=match serde_json::from_slice(&line){Ok(v)=>v,Err(_)=>continue};
-            if !request.is_object() || request.get("id").is_none(){continue;}
-            let id=request["id"].clone();
-            let response=match request["method"].as_str(){
-                Some("initialize")=>json!({"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"crow-inspection","version":"1.0.0"}}}),
-                Some("tools/list")=>json!({"result":{"tools":definitions}}), Some("ping")=>json!({"result":{}}),
-                Some("tools/call")=>{
-                    let call=async {
-                        let params=&request["params"]; let name=params["name"].as_str().ok_or_else(||anyhow!("Invalid tool request"))?;
-                        let empty=json!({}); let args=params.get("arguments").filter(|v|!v.is_null()).unwrap_or(&empty);
-                        if let Some(delegate)=&delegation&& crate::delegation::tools().as_array().is_some_and(|ts|ts.iter().any(|t|t["name"]==name)){return delegate.call(name,args).await;}
-                        inspection_tool(&source,name,args).await
-                    };
-                    let output=tokio::select!{_=&mut stop=>break,result=call=>result};
-                    match output {Ok(value)=>json!({"result":{"content":[{"type":"text","text":value.as_str().map(str::to_owned).unwrap_or_else(||value.to_string())}]}}),Err(e)=>json!({"result":{"isError":true,"content":[{"type":"text","text":e.to_string()}]}})}
-                }
-                _=>json!({"error":{"code":-32601,"message":"Unsupported method"}}),
+            let line = tokio::select! {
+                _ = &mut stop => break,
+                line = read_message(&mut stdin) => line?,
             };
-            let mut response=response; response["jsonrpc"]="2.0".into(); response["id"]=id;
+            if line.is_empty() {
+                break;
+            }
+            // Notifications and malformed messages need no reply.
+            let Ok(request) = serde_json::from_slice::<Value>(&line) else {
+                continue;
+            };
+            if !request.is_object() || request.get("id").is_none() {
+                continue;
+            }
+            let mut response = match request["method"].as_str() {
+                Some("initialize") => json!({"result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "crow-inspection", "version": "1.0.0"},
+                }}),
+                Some("tools/list") => json!({"result": {"tools": definitions}}),
+                Some("ping") => json!({"result": {}}),
+                Some("tools/call") => {
+                    let output = tokio::select! {
+                        _ = &mut stop => break,
+                        output = call_tool(&source, delegation.as_ref(), &request["params"]) => output,
+                    };
+                    json!({"result": tool_result(output)})
+                }
+                _ => json!({"error": {"code": -32601, "message": "Unsupported method"}}),
+            };
+            response["jsonrpc"] = "2.0".into();
+            response["id"] = request["id"].clone();
             let write = async {
                 stdout.write_all(response.to_string().as_bytes()).await?;
                 stdout.write_all(b"\n").await?;
                 stdout.flush().await
             };
             tokio::select! { _ = &mut stop => break, result = write => result? }
-
-        } Ok::<_,anyhow::Error>(())
-    }.await;
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
     if let Some(delegation) = delegation {
         delegation.close().await;
     }

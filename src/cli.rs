@@ -78,7 +78,7 @@ The service receives GitHub events. Workers run reviews. Choose both for one mac
     Status,
     /// Check the installation and explain any problems.
     Doctor {
-        /// Also check Codex capabilities without running a review.
+        /// Also check the review provider's capabilities without running a review.
         #[arg(long)]
         runtime: bool,
     },
@@ -191,17 +191,20 @@ Continue later with crow resume owner/repo 42.")]
     /// Show settings, or change a setting on this machine.
     #[command(after_help = "Examples:
   crow config
+  crow config worker.provider claude
   crow config worker.model MODEL
   crow config worker.effort high
   crow config worker.concurrency 2
   crow config catchUp.enabled true
 
 Editable settings:
-  worker.model, worker.effort, worker.concurrency, worker.timeoutMs
+  worker.provider (codex or claude), worker.model, worker.effort
+  worker.concurrency, worker.timeoutMs
   worker.subagents, worker.retry (JSON objects)
   catchUp.enabled, catchUp.threshold, auditIntervalMs, retentionDays
 
-Choose the model and reasoning level from crow models.
+Choose the model and reasoning level from crow models. Changing the
+provider clears the model; run crow login and crow models next.
 Restart Crow after changes with crow service-restart.")]
     Config {
         /// Setting to change; omit to show current settings.
@@ -328,15 +331,20 @@ fn print(format: OutputFormat, command: &str, value: &Value) -> Result<()> {
 }
 
 fn setting_value(key: &str, input: &str) -> Result<Value> {
-    if ["worker.model", "worker.effort"].contains(&key) {
-        if input == "null" {
-            return Ok(Value::Null);
-        }
-        if input.starts_with('"') {
-            return serde_json::from_str(input)
-                .context("Use a model or reasoning level as plain text; see crow models");
-        }
-        return Ok(json!(input));
+    if ["worker.provider", "worker.model", "worker.effort"].contains(&key) {
+        let value = if input.starts_with('"') {
+            serde_json::from_str(input)
+                .context("Use a provider, model, or reasoning level as plain text")?
+        } else {
+            json!(input)
+        };
+        ensure!(
+            value
+                .as_str()
+                .is_some_and(|s| !s.trim().is_empty() && s != "null"),
+            "Choose a value listed by crow models, or codex or claude for worker.provider"
+        );
+        return Ok(value);
     }
     serde_json::from_str(input).with_context(|| format!("Invalid value for {key}. Use a number, true/false, or a JSON object. See crow config --help"))
 }
@@ -547,6 +555,7 @@ async fn configured_command(format: OutputFormat, command: Command, root: &Path)
             value,
         } => {
             let writable = [
+                "worker.provider",
                 "worker.concurrency",
                 "worker.model",
                 "worker.effort",
@@ -564,7 +573,62 @@ async fn configured_command(format: OutputFormat, command: Command, root: &Path)
                 writable.join(", ")
             );
             let value = setting_value(&key, value.as_deref().context("Missing setting value")?)?;
-            let receipt = json!({"key":key,"value":value});
+            let mut receipt = json!({"key":key,"value":value});
+            let worker = config["role"] != "service";
+            match key.as_str() {
+                "worker.provider"
+                    if config["worker"]["provider"].as_str().unwrap_or("codex") != value =>
+                {
+                    // Model names are provider-specific; keep reviews from using a stale one.
+                    let worker = &mut config["worker"];
+                    worker["model"] = Value::Null;
+                    worker["effort"] = Value::Null;
+                    if worker["subagents"]["mode"] == "configured" {
+                        let max = worker["subagents"]["max"].clone();
+                        worker["subagents"] = json!({"mode": "inherit", "max": max});
+                    }
+                    let mut note = "The review model was cleared. Run crow login, then choose one with crow config worker.model MODEL (see crow models).".to_owned();
+                    // Repository overrides name models of the previous provider.
+                    if config["role"] != "worker"
+                        && let Ok(status) = operations::admin(&config, "status", &Value::Null).await
+                    {
+                        let overridden: Vec<&str> = status["repos"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter(|repo| {
+                                ["model", "effort"].iter().any(|key| {
+                                    repo["settings"].get(*key).is_some_and(|v| !v.is_null())
+                                })
+                            })
+                            .filter_map(|repo| repo["name"].as_str())
+                            .collect();
+                        if !overridden.is_empty() {
+                            note.push_str(&format!(
+                                " These repositories override the model and need new settings with crow repo-config: {}.",
+                                overridden.join(", ")
+                            ));
+                        }
+                    }
+                    receipt["note"] = json!(note);
+                }
+                "worker.model" if worker => {
+                    // Keep the effort when the new model supports it; otherwise use its default.
+                    let catalog = provider::discover(&config["worker"], root).await?;
+                    let models = catalog["models"].as_array().map_or(&[][..], Vec::as_slice);
+                    let effort = config["worker"]["effort"].as_str().unwrap_or("");
+                    if let Some(model) = provider::find_model(models, value.as_str().unwrap_or(""))
+                        && !provider::supports_effort(model, effort)
+                    {
+                        config["worker"]["effort"] = model["defaultReasoningEffort"].clone();
+                        receipt["note"] = json!(format!(
+                            "Reasoning level set to {}, the model's default.",
+                            model["defaultReasoningEffort"].as_str().unwrap_or("")
+                        ));
+                    }
+                }
+                _ => {}
+            }
             let parts: Vec<_> = key.split('.').collect();
             if parts.len() == 2 {
                 config[parts[0]][parts[1]] = value;
@@ -626,7 +690,15 @@ async fn configured_command(format: OutputFormat, command: Command, root: &Path)
                 "Choose a paired worker with --worker ID. Run crow pair first."
             );
             let identity = setup::github_identity(false).await?;
-            let args = json!({"repo":util::repo_name(&repo)?,"githubToken":identity["token"],"worker":worker.map(Value::String).unwrap_or_else(||config["worker"]["id"].clone()),"policy":"selected","authors":[config["operator"]],"includeBacklog":include_backlog,"reenroll":reenroll});
+            let args = json!({
+                "repo": util::repo_name(&repo)?,
+                "githubToken": identity["token"],
+                "worker": worker.map(Value::String).unwrap_or_else(|| config["worker"]["id"].clone()),
+                "policy": "selected",
+                "authors": [config["operator"]],
+                "includeBacklog": include_backlog,
+                "reenroll": reenroll,
+            });
             let mut result = operations::admin(&config, "enroll", &args).await?;
             if format == OutputFormat::Text && include_backlog && !reenroll {
                 // Enrollment returns the original record, before catch-up clears exclusions.
@@ -1012,7 +1084,13 @@ mod tests {
             setting_value("worker.effort", r#""high""#).unwrap(),
             json!("high")
         );
-        assert_eq!(setting_value("worker.model", "null").unwrap(), Value::Null);
+        // A cleared model would make every review fail; choose another instead.
+        assert!(setting_value("worker.model", "null").is_err());
+        assert!(setting_value("worker.effort", " ").is_err());
+        assert_eq!(
+            setting_value("worker.provider", "claude").unwrap(),
+            json!("claude")
+        );
         assert_eq!(setting_value("worker.concurrency", "2").unwrap(), json!(2));
         assert_eq!(
             setting_value("catchUp.enabled", "true").unwrap(),

@@ -1,6 +1,6 @@
 //! Lease-aware review worker. Completed inference is persisted before publication.
 use crate::{
-    provider::{self, Callbacks},
+    provider::{self, Callback, Callbacks},
     retention::{valid_id, valid_session},
     util,
 };
@@ -402,8 +402,33 @@ fn saved_sessions(root: &Path) -> Result<BTreeMap<String, String>> {
 impl Shared {
     async fn status(&self) {
         let s = self.state.lock().await;
-        let active:Vec<Value>=s.active.iter().map(|(id,a)|json!({"id":id,"repo":a.repo,"number":a.number,"state":if a.cancel.is_cancelled(){"stopping"}else{"reviewing"}})).collect();
-        let value = json!({"version":1,"pid":std::process::id(),"updatedAt":util::now(),"state":if s.closed{"stopped"}else if s.draining{"draining"}else{"running"},"connection":if s.closed{"stopped"}else{s.connection},"active":active});
+        let active: Vec<Value> = s
+            .active
+            .iter()
+            .map(|(id, a)| {
+                let state = if a.cancel.is_cancelled() {
+                    "stopping"
+                } else {
+                    "reviewing"
+                };
+                json!({"id":id,"repo":a.repo,"number":a.number,"state":state})
+            })
+            .collect();
+        let state = if s.closed {
+            "stopped"
+        } else if s.draining {
+            "draining"
+        } else {
+            "running"
+        };
+        let value = json!({
+            "version": 1,
+            "pid": std::process::id(),
+            "updatedAt": util::now(),
+            "state": state,
+            "connection": if s.closed { "stopped" } else { s.connection },
+            "active": active,
+        });
         if util::atomic(&self.root.join("worker-status.json"), &value).is_err() {
             eprintln!("Worker status could not be saved; inspect local file permissions.");
         }
@@ -483,6 +508,118 @@ fn cancelled(cancel: &CancellationToken) -> Result<()> {
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 struct Restart(String);
+/// Load the target-branch guidance pinned for this review. A resumed review
+/// must continue under exactly the guidance it started with.
+async fn pinned_guidance(shared: &Shared, job: &Value, source: &Value) -> Result<Value> {
+    let file = shared
+        .root
+        .join("reviews")
+        .join(string(&job["id"])?)
+        .join("guidance.json");
+    let Some(fingerprint) = job["guidanceFingerprint"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+    else {
+        let mut rules = shared.backend.guidance(source).await?;
+        rules["targetSha"] = source["targetSha"].clone();
+        util::atomic(&file, &rules)?;
+        return Ok(rules);
+    };
+    let rules = match util::read_json(&file).ok().flatten() {
+        Some(saved) => saved,
+        None => {
+            let target = job["guidanceTargetSha"]
+                .as_str()
+                .or_else(|| job["comparison"]["targetSha"].as_str())
+                .ok_or_else(|| {
+                    Restart(
+                        "Original review guidance revision is unavailable. Restart required."
+                            .into(),
+                    )
+                })?;
+            let mut pinned = source.clone();
+            pinned["targetSha"] = json!(target);
+            let mut rules = shared.backend.guidance(&pinned).await.map_err(|_| {
+                Restart(
+                    "Original review guidance cannot be reconstructed. Restart required.".into(),
+                )
+            })?;
+            rules["targetSha"] = json!(target);
+            rules
+        }
+    };
+    if rules["fingerprint"] != fingerprint || util::hash(&rules["files"]) != fingerprint {
+        return Err(Restart(
+            "Saved review guidance does not match the original review. Restart required.".into(),
+        )
+        .into());
+    }
+    util::atomic(&file, &rules)?;
+    Ok(rules)
+}
+/// Report provider sessions and progress to the service; a `cancel` reply
+/// stops the review. Session IDs are also kept locally for lease recovery.
+fn review_callbacks(
+    shared: &Arc<Shared>,
+    job: &Value,
+    cancel: &CancellationToken,
+    session: &Arc<Mutex<Value>>,
+    token: &str,
+) -> Callbacks {
+    let on_session: Callback = {
+        let (shared, job, cancel, session) =
+            (shared.clone(), job.clone(), cancel.clone(), session.clone());
+        Arc::new(move |value: Value| {
+            let (shared, job, cancel, session) =
+                (shared.clone(), job.clone(), cancel.clone(), session.clone());
+            Box::pin(async move {
+                let id = string(&value)?.to_owned();
+                *session.lock().await = json!(id);
+                if valid_session(&id) {
+                    let key = string(&job["id"])?.to_owned();
+                    shared.state.lock().await.sessions.insert(key, id.clone());
+                }
+                let reply = shared.send(&job, "session", json!({"session":id})).await?;
+                if reply["cancel"] == true {
+                    cancel.cancel();
+                    shared.status().await;
+                }
+                Ok(())
+            })
+        })
+    };
+    let on_progress: Callback = {
+        let (shared, job, cancel, token) = (
+            shared.clone(),
+            job.clone(),
+            cancel.clone(),
+            token.to_owned(),
+        );
+        Arc::new(move |value: Value| {
+            let (shared, job, cancel, token) =
+                (shared.clone(), job.clone(), cancel.clone(), token.clone());
+            Box::pin(async move {
+                if value["type"] == "warning" {
+                    eprintln!(
+                        "The provider model list could not be refreshed; Crow is using its cached catalog. Run crow models for details."
+                    );
+                    let message = value["message"].as_str().unwrap_or("Provider warning");
+                    return shared.log(&job, message, &token);
+                }
+                let reply = shared.send(&job, "progress", json!({})).await?;
+                if reply["cancel"] == true {
+                    cancel.cancel();
+                    shared.status().await;
+                }
+                Ok(())
+            })
+        })
+    };
+    Callbacks {
+        on_session: Some(on_session),
+        on_progress: Some(on_progress),
+    }
+}
 async fn execute(shared: Arc<Shared>, work: Value, cancel: CancellationToken) {
     let mut job = work["job"].clone();
     let mut settings = shared.config["worker"]
@@ -495,7 +632,13 @@ async fn execute(shared: Arc<Shared>, work: Value, cancel: CancellationToken) {
         settings.extend(extra.clone());
     }
     job["settings"] = Value::Object(settings);
-    job["prContext"] = json!({"title":work["pr"]["title"].as_str().unwrap_or("").chars().take(1000).collect::<String>(),"body":work["pr"]["body"].as_str().unwrap_or("").chars().take(16000).collect::<String>()});
+    let text = |value: &Value, limit: usize| -> String {
+        value.as_str().unwrap_or("").chars().take(limit).collect()
+    };
+    job["prContext"] = json!({
+        "title": text(&work["pr"]["title"], 1000),
+        "body": text(&work["pr"]["body"], 16000),
+    });
     let session_value = Arc::new(Mutex::new(job["session"].clone()));
     let heartbeat_stop = CancellationToken::new();
     let _heartbeat_guard = heartbeat_stop.clone().drop_guard();
@@ -520,64 +663,80 @@ async fn execute(shared: Arc<Shared>, work: Value, cancel: CancellationToken) {
             }
         })
     };
-    let result:Result<()>=async {
+    let token = work["token"].as_str().unwrap_or("");
+    let result: Result<()> = async {
         cancelled(&cancel)?;
-        let source=shared.backend.checkout(&shared.root,&job,&work["pr"],work["token"].as_str().unwrap_or(""),cancel.clone()).await?;
+        let source = shared
+            .backend
+            .checkout(&shared.root, &job, &work["pr"], token, cancel.clone())
+            .await?;
         cancelled(&cancel)?;
-        let rules_file=shared.root.join("reviews").join(string(&job["id"])?).join("guidance.json");
-        let mut rules;
-        if let Some(fingerprint)=job["guidanceFingerprint"].as_str().filter(|s|!s.is_empty()) {
-            if let Some(saved)=util::read_json(&rules_file).ok().flatten(){rules=saved;}
-            else {
-                let target=job["guidanceTargetSha"].as_str().or_else(||job["comparison"]["targetSha"].as_str()).ok_or_else(||Restart("Original review guidance revision is unavailable. Restart required.".into()))?;
-                let mut pinned=source.clone();pinned["targetSha"]=json!(target);
-                rules=shared.backend.guidance(&pinned).await.map_err(|_|Restart("Original review guidance cannot be reconstructed. Restart required.".into()))?;
-                rules["targetSha"]=json!(target);
-            }
-            if rules["fingerprint"]!=fingerprint || util::hash(&rules["files"])!=fingerprint {return Err(Restart("Saved review guidance does not match the original review. Restart required.".into()).into());}
-        } else {rules=shared.backend.guidance(&source).await?;rules["targetSha"]=source["targetSha"].clone();}
-        util::atomic(&rules_file,&rules)?;cancelled(&cancel)?;
-        job["comparison"]=source.clone();job["guidanceFingerprint"]=rules["fingerprint"].clone();job["guidanceTargetSha"]=rules["targetSha"].clone();
-        let decision=shared.send(&job,"comparison",json!({"comparison":source,"guidanceFingerprint":rules["fingerprint"],"guidanceTargetSha":rules["targetSha"]})).await?;
-        if decision["cancel"]==true || decision["skip"]==true{return Ok(());}
+        let rules = pinned_guidance(&shared, &job, &source).await?;
         cancelled(&cancel)?;
-        let local=shared.root.join("reports").join(format!("{}.json",string(&job["id"])?));
-        let saved=util::read_json(&local).ok().flatten();
-        let mut report=job["report"].clone();
-        if report.is_null()&& let Some(saved)=saved&& ["head","base","target"].iter().all(|k|saved[k]==source[k]){report=saved["report"].clone();}
-        if report.is_null(){
-            let callbacks=Callbacks{
-                on_session:Some({let shared=shared.clone();let job=job.clone();let cancel=cancel.clone();let session_value=session_value.clone();Arc::new(move |value:Value| {let shared=shared.clone();let job=job.clone();let cancel=cancel.clone();let session_value=session_value.clone();Box::pin(async move {
-                    let session=string(&value)?.to_owned(); *session_value.lock().await=json!(session);
-                    if valid_session(&session){shared.state.lock().await.sessions.insert(string(&job["id"] )?.to_owned(),session.clone());}
-                    let result=shared.send(&job,"session",json!({"session":session})).await?;
-                    if result["cancel"]==true{cancel.cancel();shared.status().await;}
-                    Ok(())
-                })})}),
-                on_progress:Some({let shared=shared.clone();let job=job.clone();let cancel=cancel.clone();let token=work["token"].as_str().unwrap_or("").to_owned();Arc::new(move |value:Value|{let shared=shared.clone();let job=job.clone();let cancel=cancel.clone();let token=token.clone();Box::pin(async move {
-                    if value["type"]=="warning" {eprintln!("The provider model list could not be refreshed; Crow is using its cached catalog. Run crow models for details.");shared.log(&job,value["message"].as_str().unwrap_or("Provider warning"),&token)?;return Ok(());}
-                    let result=shared.send(&job,"progress",json!({})).await?;
-                    if result["cancel"]==true{cancel.cancel();shared.status().await;}
-                    Ok(())
-                })})}),
-            };
-            report=shared.backend.review(&shared.root,&job,&source,&rules,callbacks,cancel.clone()).await?;
+        job["comparison"] = source.clone();
+        job["guidanceFingerprint"] = rules["fingerprint"].clone();
+        job["guidanceTargetSha"] = rules["targetSha"].clone();
+        let comparison = json!({
+            "comparison": source,
+            "guidanceFingerprint": rules["fingerprint"],
+            "guidanceTargetSha": rules["targetSha"],
+        });
+        let decision = shared.send(&job, "comparison", comparison).await?;
+        if decision["cancel"] == true || decision["skip"] == true {
+            return Ok(());
         }
-        report=crate::report::validate_report(&report)?;
+        cancelled(&cancel)?;
+        // A report saved by an earlier lease is published without new inference.
+        let local = shared
+            .root
+            .join("reports")
+            .join(format!("{}.json", string(&job["id"])?));
+        let mut report = job["report"].clone();
+        if report.is_null()
+            && let Some(saved) = util::read_json(&local).ok().flatten()
+            && ["head", "base", "target"]
+                .iter()
+                .all(|k| saved[k] == source[k])
+        {
+            report = saved["report"].clone();
+        }
+        if report.is_null() {
+            let callbacks = review_callbacks(&shared, &job, &cancel, &session_value, token);
+            report = shared
+                .backend
+                .review(
+                    &shared.root,
+                    &job,
+                    &source,
+                    &rules,
+                    callbacks,
+                    cancel.clone(),
+                )
+                .await?;
+        }
+        report = crate::report::validate_report(&report)?;
         // A provider completion racing cancellation is still useful for the next lease.
-        util::atomic(&local,&json!({"head":source["head"],"base":source["base"],"target":source["target"],"report":report}))?;
+        let saved = json!({
+            "head": source["head"],
+            "base": source["base"],
+            "target": source["target"],
+            "report": report,
+        });
+        util::atomic(&local, &saved)?;
         cancelled(&cancel)?;
-        let patch=shared.backend.patch(&source,&report["findings"],cancel.clone()).await?;
+        let patch = shared
+            .backend
+            .patch(&source, &report["findings"], cancel.clone())
+            .await?;
         cancelled(&cancel)?;
-        shared.send(&job,"report",json!({"report":report,"patch":patch})).await?;
+        shared
+            .send(&job, "report", json!({"report":report,"patch":patch}))
+            .await?;
         Ok(())
-    }.await;
+    }
+    .await;
     if let Err(error) = result {
-        let _ = shared.log(
-            &job,
-            &format!("{error:#}"),
-            work["token"].as_str().unwrap_or(""),
-        );
+        let _ = shared.log(&job, &format!("{error:#}"), token);
         eprintln!(
             "Review {}#{} interrupted; see local logs.",
             job["repo"].as_str().unwrap_or(""),
@@ -614,6 +773,12 @@ async fn execute(shared: Arc<Shared>, work: Value, cancel: CancellationToken) {
 }
 async fn run_loop(shared: Arc<Shared>) {
     let mut defaults = Map::new();
+    // Installations configured before provider selection use Codex.
+    let provider = shared.config["worker"]
+        .get("provider")
+        .cloned()
+        .unwrap_or(json!("codex"));
+    defaults.insert("provider".into(), provider);
     for k in [
         "model",
         "effort",

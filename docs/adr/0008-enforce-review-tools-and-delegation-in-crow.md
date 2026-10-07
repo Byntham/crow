@@ -4,6 +4,8 @@ status: accepted
 
 # Enforce review tools and delegation in Crow
 
+This record covers Codex. ADR 0009 applies the same boundary to Claude Code.
+
 Crow runs the installed official Codex executable through `codex exec`. It supplies a dedicated subscription-authenticated Codex home and a controlled working directory. Source stays in a bare Git repository and is available only through Crow's inspection MCP tools. The provider receives no repository checkout from which to discover PR-controlled configuration or invoke repository scripts.
 
 On Codex 0.154.0, a local protocol probe found that setting `project_doc_max_bytes=0` did not suppress global AGENTS.md. The same probe found native subagent calls could override custom-role model settings. Crow therefore uses its own MCP delegation tools to start bounded child `codex exec` sessions with fixed settings. The parent decides which tasks to delegate, while Crow enforces Inherit or Configured model policy and the concurrent-task ceiling. Children cannot delegate again. Saved task state supports explicit continuation and replacement without treating interrupted work as completed.

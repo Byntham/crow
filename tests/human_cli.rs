@@ -214,6 +214,57 @@ async fn config_accepts_plain_model_names_and_redacts_credentials() -> Result<()
 }
 
 #[tokio::test]
+async fn switching_provider_clears_provider_specific_models() -> Result<()> {
+    let status = json!({
+        "repos": [
+            {"name": "owner/api", "settings": {"model": "gpt-review"}},
+            {"name": "owner/web", "settings": {}},
+        ],
+        "workers": [],
+        "jobs": [],
+        "draining": false,
+    });
+    let fixture = Fixture::new("service", status).await?;
+    let mut saved = config::load(fixture.root.path())?;
+    saved["worker"]["model"] = json!("gpt-review");
+    saved["worker"]["effort"] = json!("high");
+    saved["worker"]["subagents"] =
+        json!({"mode":"configured","max":4,"model":"gpt-mini","effort":"low"});
+    config::save(fixture.root.path(), &saved)?;
+    // Choosing the current provider keeps the model.
+    stdout(&fixture.run(&["config", "worker.provider", "codex"]).await?);
+    assert_eq!(
+        config::load(fixture.root.path())?["worker"]["model"],
+        "gpt-review"
+    );
+    let human = stdout(
+        &fixture
+            .run(&["config", "worker.provider", "claude"])
+            .await?,
+    );
+    assert!(human.contains("crow login"), "{human}");
+    assert!(human.contains("owner/api"), "{human}");
+    assert!(!human.contains("owner/web"), "{human}");
+    let saved = config::load(fixture.root.path())?;
+    assert_eq!(saved["worker"]["provider"], "claude");
+    assert!(saved["worker"]["model"].is_null());
+    assert!(saved["worker"]["effort"].is_null());
+    assert_eq!(
+        saved["worker"]["subagents"],
+        json!({"mode":"inherit","max":4})
+    );
+    for value in ["gemini", "null"] {
+        let output = fixture.run(&["config", "worker.provider", value]).await?;
+        assert!(!output.status.success(), "accepted {value}");
+    }
+    assert_eq!(
+        config::load(fixture.root.path())?["worker"]["provider"],
+        "claude"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn interrupted_app_connection_never_exposes_credentials_in_config_output() -> Result<()> {
     let fixture = Fixture::new("service", empty_status()).await?;
     let mut saved = config::load(fixture.root.path())?;

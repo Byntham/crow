@@ -68,7 +68,7 @@ pub fn https_url(value: &str) -> Result<String> {
     Ok(url.origin().ascii_serialization())
 }
 pub fn integer(value: &Value, min: i64, max: i64, name: &str) -> Result<i64> {
-    // JSON permits 1.0, and JavaScript treated that as an integer.
+    // Accept whole-number floats such as 1.0, which earlier releases wrote.
     let number = value
         .as_f64()
         .filter(|n| n.is_finite() && n.fract() == 0.0 && *n >= min as f64 && *n <= max as f64)
@@ -153,9 +153,26 @@ pub fn clean_env() -> HashMap<String, String> {
     }
     env
 }
+/// Environment for the operator's own host tools (systemctl, gh, tailscale).
+/// Their credentials and proxy settings pass through; provider and Git
+/// inspection processes use `clean_env` instead.
 pub fn host_env() -> HashMap<String, String> {
     let mut env = clean_env();
-    for key in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
+    for key in [
+        "XDG_RUNTIME_DIR",
+        "XDG_CONFIG_HOME",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "GH_TOKEN",
+        "GH_HOST",
+        "GH_CONFIG_DIR",
+        "GH_ENTERPRISE_TOKEN",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ] {
         if let Ok(value) = std::env::var(key)
             && !value.is_empty()
         {
@@ -209,7 +226,7 @@ fn read_lock(path: &Path) -> Result<Option<Value>> {
     }
     Ok(Some(serde_json::from_slice(&bytes)?))
 }
-/// Holds an advisory guard until the legacy-compatible PID lock is removed.
+/// Holds an advisory guard until the PID lock file is removed.
 /// The guard inode is never unlinked, avoiding races between stale-lock claimants.
 pub struct RuntimeLock {
     path: PathBuf,

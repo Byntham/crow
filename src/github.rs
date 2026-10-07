@@ -88,7 +88,18 @@ fn pull_request(v: Value) -> Result<Value> {
     object(&v["user"])?;
     object(&v["head"])?;
     object(&v["base"])?;
-    let mut result = json!({"number":integer(&v["number"])? ,"state":string(&v["state"])? ,"draft":match p.get("draft") {Some(v)=>boolean(v)?,None=>false},"user":{"login":string(&v["user"]["login"])?},"head":{"sha":string(&v["head"]["sha"])?},"base":{"sha":string(&v["base"]["sha"])? ,"ref":string(&v["base"]["ref"])?}});
+    let draft = match p.get("draft") {
+        Some(v) => boolean(v)?,
+        None => false,
+    };
+    let mut result = json!({
+        "number": integer(&v["number"])?,
+        "state": string(&v["state"])?,
+        "draft": draft,
+        "user": {"login": string(&v["user"]["login"])?},
+        "head": {"sha": string(&v["head"]["sha"])?},
+        "base": {"sha": string(&v["base"]["sha"])?, "ref": string(&v["base"]["ref"])?},
+    });
     for key in ["title", "created_at", "updated_at"] {
         if v[key].is_string() {
             result[key] = v[key].clone();
@@ -110,20 +121,25 @@ fn author(v: &Value) -> Result<Value> {
 fn comment(v: Value) -> Result<Value> {
     let obj = object(&v)?;
     let user = obj.get("user").context("Unexpected GitHub object")?;
-    Ok(
-        json!({"id":integer(&v["id"])? ,"body":match obj.get("body") {Some(b)=>string(b)?,None=>""},"user":author(user)?}),
-    )
+    let body = match obj.get("body") {
+        Some(b) => string(b)?,
+        None => "",
+    };
+    Ok(json!({"id": integer(&v["id"])?, "body": body, "user": author(user)?}))
 }
 fn review(v: Value) -> Result<Value> {
     let obj = object(&v)?;
     let body = obj.get("body").context("Unexpected GitHub string")?;
     let user = obj.get("user").context("Unexpected GitHub object")?;
-    Ok(
-        json!({"id":integer(&v["id"])? ,"body":if body.is_null() {""} else {string(body)?},"user":author(user)? ,"html_url":string(&v["html_url"])?}),
-    )
+    let body = if body.is_null() { "" } else { string(body)? };
+    Ok(json!({
+        "id": integer(&v["id"])?,
+        "body": body,
+        "user": author(user)?,
+        "html_url": string(&v["html_url"])?,
+    }))
 }
-// Delivery identifiers now exceed JavaScript's safe integer range. Keep them
-// as JSON unsigned integers throughout parsing and request-path construction.
+// Delivery identifiers exceed 2^53, so they must never pass through f64.
 fn delivery_id(value: &Value) -> Result<u64> {
     value
         .as_u64()
@@ -132,9 +148,13 @@ fn delivery_id(value: &Value) -> Result<u64> {
 }
 fn delivery(v: Value) -> Result<Value> {
     object(&v)?;
-    Ok(
-        json!({"id":delivery_id(&v["id"])? ,"guid":string(&v["guid"])? ,"status_code":integer(&v["status_code"])? ,"redelivery":boolean(&v["redelivery"])? ,"delivered_at":string(&v["delivered_at"])?}),
-    )
+    Ok(json!({
+        "id": delivery_id(&v["id"])?,
+        "guid": string(&v["guid"])?,
+        "status_code": integer(&v["status_code"])?,
+        "redelivery": boolean(&v["redelivery"])?,
+        "delivered_at": string(&v["delivered_at"])?,
+    }))
 }
 
 /// Injectable network boundary; focused mocks need only implement methods they use.

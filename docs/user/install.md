@@ -12,9 +12,9 @@ From an SSH terminal on the machine that will run Crow, use:
 curl -fsSL https://birdapp.dev/install.sh | sh
 ```
 
-Run this as your normal user, without sudo. The installer detects Linux x64 or ARM64, checks prerequisites, downloads a versioned archive from `downloads.birdapp.dev`, and verifies its checksum before extraction. It then installs the binary and offers to start setup. Ubuntu with systemd is the supported guided setup platform. Release binaries are static and do not require a particular glibc version; Ubuntu 20.04 and Debian 11 remain supported. Guided installation still targets glibc distributions because Codex and other external tools have separate platform requirements. Alpine and other musl distributions are outside this supported installation path.
+Run this as your normal user, without sudo. The installer detects Linux x64 or ARM64, checks prerequisites, downloads a versioned archive from `downloads.birdapp.dev`, and verifies its checksum before extraction. It then installs the binary and offers to start setup. Ubuntu with systemd is the supported guided setup platform. Release binaries are static and do not require a particular glibc version; Ubuntu 20.04 and Debian 11 remain supported. Guided installation still targets glibc distributions because Codex, Claude Code, and other external tools have separate platform requirements. Alpine and other musl distributions are outside this supported installation path.
 
-The bootstrap needs common Linux tools including `curl`, `tar`, and `sha256sum`. It explains missing prerequisites before installation. Crow setup offers installation of missing supported dependencies such as Git, GitHub CLI, Codex, and the chosen ingress client. GitHub login happens during setup to connect your repositories, not to download Crow.
+The bootstrap needs common Linux tools including `curl`, `tar`, and `sha256sum`. It explains missing prerequisites before installation. Crow setup offers installation of missing supported dependencies such as Git, GitHub CLI, the chosen review provider, and the chosen ingress client. GitHub login happens during setup to connect your repositories, not to download Crow.
 
 On a headless machine, open the printed browser URLs on your desktop. The installer reads setup prompts from your terminal even when invoked through the pipe above. Without a terminal, it installs only and prints the command to start setup later. Setup checks connections and configuration without running a PR review.
 
@@ -29,7 +29,7 @@ Replace `X.Y.Z` with a published version. The installer cannot downgrade or repl
 
 The default installation and state directory is `~/.local/share/crow`. `current/crow` selects the installed release and `~/.local/bin/crow` is the stable command. Set `CROW_HOME` for a custom state directory and use that same value for later commands. If `~/.local/bin` is missing from your current shell's PATH, the installer prints the command to add it and still launches setup using the full executable path. Add that directory to your shell startup file if it is not already configured for future sessions.
 
-If setup is interrupted, the permanent command remains installed. Continue with `crow setup`, or the exact command printed by the installer. Crow reuses your existing official Codex executable. If it is missing, setup can install the latest official standalone package without npm. Installing Crow does not replace a user-managed Codex installation.
+If setup is interrupted, the permanent command remains installed. Continue with `crow setup`, or the exact command printed by the installer. Crow reuses your existing Codex or Claude Code executable. If it is missing, setup can install it: Codex from its official standalone package, Claude Code with the official installer from claude.ai. Installing Crow never replaces a provider installation you manage.
 
 ## Manual binary installation
 
@@ -54,22 +54,18 @@ bash scripts/install.sh
 ~/.local/bin/crow setup
 ```
 
-Install the stable Rust toolchain, a C compiler, and Git before running the source installer. It runs `cargo build --locked --release --bin crow` and installs the resulting executable through the same installer used by downloaded binaries. SQLite is compiled into Crow; no Node or JavaScript build tools are needed.
+Install the stable Rust toolchain, a C compiler, and Git before running the source installer. It runs `cargo build --locked --release --bin crow` and installs the resulting executable through the same installer used by downloaded binaries. SQLite is compiled into Crow.
 
 The installer activates a versioned directory under `~/.local/share/crow/releases`. The `current` link selects the release, and `~/.local/bin/crow` is the stable command. It does not start services. Run `crow setup` to configure GitHub, HTTPS, subscription authentication, and persistent startup.
 
 Set `CROW_HOME` for a custom installation and data directory and `CROW_BIN_DIR` for the permanent command directory. Keep the same `CROW_HOME` for later commands. `crow update` installs published native releases for both source-built and downloaded installations. It does not modify your source checkout. To test local source changes, build and run the executable from the checkout with a separate `CROW_HOME`.
 
-## Migrating an existing installation
+## Upgrading
 
-Native Rust releases start at version 0.3.0. Its configuration, SQLite records, encrypted backups, and worker protocol retain their existing formats. Save an encrypted backup before upgrading. Existing binary installations can use `crow update` to install the latest hosted release.
-
-Legacy source installations use a Node launcher and a different release layout. Stop the old service, back up its state, and preserve the old launcher and `current` link before installing the Rust executable. The native installer refuses to overwrite an unrelated or different existing launcher. Keep `config.json`, `service.sqlite`, review directories, and the installation's `codex` directory in place. Run the new executable's `install --no-setup` with the same `CROW_HOME`, then `crow setup` to regenerate the systemd unit and validate connections. Do not delete saved provider sessions or reuse the personal Codex home.
-
-Keep the previous executable and backup until the new service passes `crow doctor --runtime`. Local tests establish data-format compatibility; validate real account access on the enrolled installation before removing the old release.
+Save an encrypted backup with `crow backup` before upgrading, then run `crow update`. Configuration, SQLite records, backups, and the worker protocol keep their formats across releases. Installations configured before Claude Code support keep using Codex.
 
 ## Local retention
 
 Crow removes expired local checkouts, review workspaces, completed report files, and per-review logs for completed, superseded, or cancelled jobs. The default retention period is seven days. Paused jobs remain available for resumption while the service keeps them active. Compact review records and GitHub comments remain.
 
-Cleanup also removes rollout files for known expired provider session IDs, including Crow's delegated reviewers, under the installation's own `codex/sessions` and `codex/archived_sessions` directories. It skips linked directories and leaves the Codex authentication file alone. It does not modify Codex's SQLite databases, whose provider-owned formats may change. A custom Codex home outside this directory needs separate retention management.
+Cleanup also removes saved provider sessions for expired reviews, including Crow's delegated reviewers: Codex rollout files under the installation's `codex/sessions` and `codex/archived_sessions`, and Claude Code transcripts under `claude/projects`. It skips linked directories and never touches provider logins. It does not modify Codex's SQLite databases, whose provider-owned formats may change. A custom `codexHome` or `claudeHome` outside the installation directory needs separate retention management.

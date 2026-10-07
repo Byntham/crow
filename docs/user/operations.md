@@ -17,6 +17,7 @@ crow policy owner/repo --everyone
 crow policy owner/repo --requesters alice,bob
 crow config
 crow models
+crow config worker.provider claude
 crow config worker.concurrency 3
 crow config worker.model provider-model-id
 crow config worker.effort high
@@ -29,9 +30,11 @@ crow repo-config owner/repo --reset
 
 Author policy determines whose PRs Crow can review. Requester policy separately determines who can trigger `/crow review`, `/crow resume`, `/crow restart`, or `/crow pause` in a PR comment; it defaults to the operator. Granting someone request permission does not authorize their own PRs or give them configuration access. `--requesters` changes only requester permission, and the target PR must still pass author and draft checks.
 
-`crow config` hides credentials. Model names and reasoning levels come from `crow models`; Crow does not maintain a model list in its source. If retrieval fails, Crow marks the last successful catalog as cached and reports the error. Saved explicit selections do not change when provider defaults change.
+`crow config` hides credentials. `worker.provider` selects Codex (`codex`, the default) or Claude Code (`claude`). Changing it clears the model and reasoning level, which are provider-specific; run `crow login` and choose new ones, and update repository model overrides with `crow repo-config`. Reviews already started keep their provider; a saved session cannot move to another provider, so use `crow restart` to rerun one with the new provider. Model names and reasoning levels come from `crow models`; Crow does not maintain a model list in its source. If retrieval fails, Crow marks the last successful catalog as cached and reports the error. Saved explicit selections do not change when provider defaults change.
 
-Model and effort settings accept plain text. Numbers, booleans, and nested settings use JSON values. Choose an available model and reasoning level from `crow models`; reviews require both selections. Use `crow config --format json` to inspect the full configuration with credentials hidden.
+Provider, model, and effort settings accept plain text. Numbers, booleans, and nested settings use JSON values. Choose an available model and reasoning level from `crow models`; reviews require both selections. Changing the model keeps the reasoning level when the new model supports it and otherwise switches to the model's default.
+
+Claude Code models are listed by alias, such as `opus` or `sonnet`, which follow Anthropic's current release. To pin a release instead, set the full model name that `crow models --format json` reports as `resolvedModel`, for example `claude-opus-5-5`. A model without adjustable reasoning uses the reasoning level `default`. Use `crow config --format json` to inspect the full configuration with credentials hidden.
 
 Workers default to three active PR reviews, with up to eight subagents each. The subagent limit is a ceiling. `inherit` uses the parent model and effort; `configured` requires `model` and `effort` in the subagent settings. There is no mode allowing a reviewer to choose its own model policy.
 
@@ -89,7 +92,7 @@ The native user systemd service starts after reboot and continues after logout. 
 
 `crow update` downloads the published stable release for the host architecture from `downloads.birdapp.dev` and verifies its SHA-256 checksum and reported version before stopping the service. It drains active work, switches the installed executable, and restarts Crow. It verifies that the new process finished initialization and restores the previous executable if startup fails. There is no source checkout or local build step. Only an explicitly published stable version is an update candidate. The hosted update endpoint is live.
 
-Updates do not modify source checkouts or replace your Codex installation. If an update fails, inspect the reported error before running `crow start`.
+Updates do not modify source checkouts or replace your Codex or Claude Code installation. If an update fails, inspect the reported error before running `crow start`.
 
 Session/diagnostic retention defaults to seven days after completion, supersession, or PR closure. Paused sessions remain while their comparison is relevant. Compact review records remain while the repository is enrolled. Cleanup does not delete GitHub comments.
 
@@ -112,6 +115,7 @@ Provider authentication and sessions are not backed up or transferred. A restore
 ## Troubleshooting
 
 - A headless Codex login uses a URL and device code on your desktop. If your account disables device login, enable it in account/workspace settings. The alternative browser flow needs SSH forwarding of the host's localhost callback; merely opening its localhost URL on another desktop will not work. See [Codex authentication](https://learn.chatgpt.com/docs/auth).
+- A headless Claude Code login prints a URL. Sign in on any device, then paste the code it shows into the terminal. Crow accepts only a Claude subscription login; API keys and cloud-provider credentials are refused. Update Claude Code with `claude update` if `crow doctor --runtime` reports a missing control.
 - If GitHub enrollment fails, verify the App is installed on the selected repository and `gh auth status` reports the Crow operator. Enrollment requires repository admin or maintain authority.
 - A worker that cannot connect needs the service URL and its own pairing token. Private Serve alone does not make GitHub webhook delivery possible.
 - Funnel setup preserves existing routes. If all supported ports are occupied, free a port or choose Cloudflare/existing HTTPS. Account-level Funnel permissions may require a tailnet administrator.

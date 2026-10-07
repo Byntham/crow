@@ -104,8 +104,8 @@ fn checksum(path: &Path) -> Result<String> {
     Ok(hex::encode(hash.finalize()))
 }
 
-/// Uses the shared PID lock and its persistent advisory guard so native
-/// installers also respect an updater that still runs the legacy executable.
+/// Uses the shared PID lock and its persistent advisory guard, so concurrent
+/// installers and updaters exclude each other.
 pub struct InstallLock {
     _lock: crate::util::RuntimeLock,
 }
@@ -430,9 +430,12 @@ async fn latest(client: &reqwest::Client) -> Result<String> {
 }
 pub async fn check_update(current: &str) -> Result<Value> {
     let result: Result<Value> = async {
-        let version = latest(&client(false, 120)?).await?;
-        Ok(json!({"available": version_parts(&version)? > version_parts(current)?, "version": version}))
-    }.await;
+        // A short timeout keeps crow status responsive when offline.
+        let version = latest(&client(false, 10)?).await?;
+        let available = version_parts(&version)? > version_parts(current)?;
+        Ok(json!({"available": available, "version": version}))
+    }
+    .await;
     Ok(result.unwrap_or_else(|e| json!({"available": false, "warning": e.to_string()})))
 }
 fn verify_sums(sums: &[u8], name: &str, digest: &str) -> Result<()> {
@@ -511,15 +514,7 @@ fn extract_archive(archive: &Path, output: &Path, codex: bool) -> Result<()> {
         let regular = if codex {
             CODEX_FILES.contains(&name.as_str()) || CODEX_OPTIONAL.contains(&name.as_str())
         } else {
-            [
-                "crow",
-                "THIRD_PARTY_NOTICES",
-                "LICENSE",
-                "LICENSE.txt",
-                "NODE-LICENSE",
-                "NODE-LICENSE.txt",
-            ]
-            .contains(&name.as_str())
+            ["crow", "THIRD_PARTY_NOTICES"].contains(&name.as_str())
         };
         let dir = codex && CODEX_DIRS.contains(&name.as_str());
         ensure!(
@@ -654,12 +649,7 @@ pub async fn prepare_update(root: &Path, current: &str) -> Result<Option<Prepare
     verify_elf(&candidate, machine)?;
     let actual = executable_version(&candidate).await?;
     ensure!(
-        [
-            version.clone(),
-            format!("crow {version}"),
-            format!("Crow {version}")
-        ]
-        .contains(&actual),
+        actual == version,
         "Downloaded Crow executable reported an unexpected version"
     );
     let executable = stage_binary(root, &candidate, &version)?;
@@ -817,6 +807,7 @@ pub async fn install_command(root: &Path, no_setup: bool) -> Result<()> {
         .arg("setup")
         .env_clear()
         .envs(crate::util::host_env())
+        .envs(std::env::var_os("CROW_BIN_DIR").map(|dir| ("CROW_BIN_DIR", dir)))
         .env("CROW_HOME", absolute(root)?)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -1106,7 +1097,7 @@ mod tests {
             &path,
             &[
                 ("./crow", b"executable", b'0'),
-                ("LICENSE", b"license", b'0'),
+                ("THIRD_PARTY_NOTICES", b"notices", b'0'),
             ],
         );
         extract_archive(&path, &tmp.path().join("valid"), false).unwrap();

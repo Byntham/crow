@@ -1,30 +1,40 @@
 # Runtime validation
 
-The Rust implementation uses native tests with temporary files, real SQLite and Git, loopback HTTP fixtures, and simulated Codex processes. Run:
+The test suite uses temporary files, real SQLite and Git, loopback HTTP fixtures, and fake Codex and Claude Code executables compiled from `tests/fixtures/`. Run:
 
 ```sh
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-The original TypeScript baseline passed 321 tests, with five skipped, before migration. The Rust tests exercise the new implementation; the historical baseline is not proof that the port preserves every behavior.
+It covers durable receipts and jobs, separate worker/admin authentication, inspection permissions, merge-base comparisons, recovery, report validation, provider policy for both providers, setup callbacks, encrypted backups, installation, and retention. Linux subprocess tests exercise cancellation and cleanup, including prompts and MCP servers that receive SIGINT or SIGTERM while stdin stays open.
 
-The ordinary suite currently passes 214 tests. It checks durable receipts and jobs, separate worker/admin authentication, inspection permissions, merge-base comparisons, recovery, report validation, provider policy, setup callbacks, encrypted backups, installation, and retention. Linux subprocess tests exercise cancellation and cleanup. Setup prompt tests keep stdin open while sending SIGINT and SIGTERM after registration listeners have been dropped; both the prompt and its runtime must exit without waiting for EOF.
+## Installed Codex probes
 
-Opt-in installed-Codex tests use temporary synthetic authentication and a loopback Responses API. They must not use an operator's live account or perform model inference:
+Opt-in tests run the installed Codex executable against temporary synthetic authentication and a loopback Responses API. They never use an operator's account or perform model inference:
 
 ```sh
 cargo test --locked --test runtime_probe -- --ignored --test-threads=1
 CROW_PROBE_FIXTURE_TOKEN=fixture cargo test --locked --test runtime_probe -- --ignored --test-threads=1
 ```
 
-The first command uses synthetic subscription authentication. The second uses a temporary proxy configuration with an environment-based credential and verifies bearer authentication for parent and delegated requests. Set `CROW_PROBE_CODEX` to select an installed Codex executable. Both modes keep their responses on localhost.
+The first command uses synthetic subscription authentication. The second uses a temporary proxy configuration with an environment-based credential and verifies bearer authentication for parent and delegated requests. Set `CROW_PROBE_CODEX` to select an executable, and `CROW_TEST_BINARY` to exercise a packaged Crow executable as the MCP server.
 
-Provider event logs stream to disk without an aggregate stdout limit. Individual messages and inspection results remain bounded. Authentication, effective tool policy, selected models, and explicit session identity must be checked for new and resumed reviews.
+## Claude Code checks
 
-Fixtures and installed-runtime probes do not establish real subscription entitlement, simultaneous production authentication refresh, review quality, or successful GitHub and ingress onboarding. Those require an enrolled installation. `crow setup` does not publish a test review. The live validation below used an existing account proxy; it does not establish direct subscription authentication or concurrent token refresh.
+Claude Code 2.1.289 was checked directly against a subscription login, with Haiku and a throwaway repository served by Crow's inspection MCP server:
 
-To repeat the executable lifecycle checks against an optimized build:
+- The `system/init` event reports `session_id`, the offered `tools`, `mcp_servers` with connection status, the resolved `model`, `permissionMode`, and `apiKeySource` before the first model request. With Crow's flags, the tools were exactly the inspection tools plus `StructuredOutput`.
+- `--json-schema` returns the report as `structured_output` on the final `result` event.
+- `--resume` keeps the same session ID.
+- Without a login, the assistant event carries `error: "authentication_failed"` and the result has `is_error: true`.
+- `claude auth status --json` reports `loggedIn`, `authMethod` (`claude.ai`, `oauth_token`, or `api_key`), and `apiProvider`.
+- The SDK `initialize` control request returns the model catalog and account without starting a conversation, including when stdin closes immediately after the request.
+- An empty `--setting-sources` and a `--settings` overlay are accepted.
+
+A full review through an enrolled installation, concurrent token refresh, and delegated child reviews with Claude Code have not been exercised live.
+
+## Release executables
 
 ```sh
 scripts/build-release.sh
@@ -32,22 +42,12 @@ CROW_TEST_BINARY="$PWD/target/x86_64-unknown-linux-musl/release/crow" \
   cargo test --locked --test native_cli --test human_cli --test inspection_mcp_port
 ```
 
+Release builds are static musl executables. Packaging rejects dynamic loaders and shared-library dependencies, and CI runs each architecture's executable in an empty chroot.
+
 ## Live installation validation
 
-On September 16, 2026, the existing Linux x64 installation was backed up and its Node service stopped. The native 0.3.0 executable completed interactive setup using the existing GitHub App, repository policies, account proxy, and Tailscale Funnel route. Only one Crow service ran during validation. Existing paused reviews were preserved.
+On September 16, 2026, an existing Linux x64 installation completed interactive setup with the 0.3.0 executable, reusing its GitHub App, repository policies, Codex account proxy, and Tailscale Funnel route.
 
-[Testbed PR #5](https://github.com/Byntham/testbed/pull/5) exercised real GitHub webhooks and model inference. Its initial commit deliberately contained an incorrect percentage discount and an off-by-one pagination offset. Crow published an advisory review with both defects anchored to the correct source lines. Local fixture tests independently reproduced both failures. After correcting the functions, both tests passed and a synchronize webhook queued the new commit. Crow published a clean review with links to the earlier findings.
+[Testbed PR #5](https://github.com/Byntham/testbed/pull/5) exercised real GitHub webhooks and model inference. Its first commit contained an incorrect percentage discount and an off-by-one pagination offset; Crow published an advisory review with both defects anchored to the correct lines. After the fix, a synchronize webhook queued the new commit and Crow published a clean review linking the earlier findings. The run also checked drain and undrain, pause and resume with and without a provider session, rejection of invalid resume settings, interruption and continuation of the same Codex session, PR-comment commands, and restart followed by resume. `crow doctor --runtime` passed against the installed binary.
 
-The flow also checked drain and undrain, queued pause/resume without a provider session, rejection of invalid resume settings without changing job state, interruption and continuation of the same saved Codex session, PR-comment pause/resume, and service restart followed by explicit resume. Both completed reviews retained their original session identities.
-
-Live testing found and fixed GitHub delivery IDs exceeding the inherited JavaScript safe-integer limit. Delivery IDs now use exact unsigned 64-bit integers. CLI start/restart now wait for the native readiness signal, and successful doctor checks summarize capabilities and job counts instead of dumping history and help output.
-
-The final optimized binary passed installation/MCP smoke checks and all three executable lifecycle tests. `crow doctor --runtime` passed against the installed binary, including public HTTPS, App permissions, pairing, proxy authentication, Codex capabilities, and enabled systemd startup. Restart followed immediately by status succeeded. The final startup logs had no delivery-audit error. The test PR was closed without merging, the original configuration was restored exactly, and the service was left active and undrained with only the two pre-existing paused reviews outstanding. A process scan found one native Crow daemon and no legacy Crow process.
-
-PR review added regressions for bounded same-origin GitHub redirects without cross-origin credential forwarding, omitted guidance metadata remaining resumable and reconcilable after publication, and delegated resume/restart/final-save failures preserving retryable state. These tests use local HTTP fixtures, SQLite, and deterministic filesystem write failures.
-
-Release builds use static musl executables to preserve compatibility with older supported glibc distributions. Packaging rejects dynamic loaders and shared-library dependencies. CI runs each architecture in an empty chroot. MCP subprocess regressions keep stdin or unread stdout open while sending SIGINT and SIGTERM, and cover large responses, request-size boundaries, and redirected files. Set `CROW_TEST_BINARY` for the installed-Codex probes to exercise the packaged MCP executable.
-
-The final x64 static executable passed all 16 CLI, MCP, and service lifecycle tests, extracted-archive installation and checksum checks, and both installed-Codex probes in each synthetic authentication mode. Version and help also ran in an empty root under PRoot; the previous GNU executable failed the same check because its loader was absent. Native CI uses chroot for this check.
-
-Cancellation and timeout now finish an accepted process-event callback while stopping the provider independently. Deterministic tests block session persistence, confirm the process has stopped before releasing the write, and verify that the paused delegated task retains its session on disk, after reopening, and when resumed. Callback errors and line ordering are also covered.
+That validation used an account proxy, so it does not establish direct subscription authentication or concurrent token refresh. Fixtures and probes do not establish subscription entitlement, review quality, or GitHub and ingress onboarding for a new account; those need an enrolled installation. `crow setup` never publishes a test review.

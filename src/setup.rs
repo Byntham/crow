@@ -75,6 +75,12 @@ async fn ask(label: &str, fallback: &str) -> Result<String> {
 }
 
 async fn choose(label: &str, fallback: &str, choices: &[(&str, &str)]) -> Result<String> {
+    // Never offer Enter for a value the loop below would reject.
+    let fallback = choices
+        .iter()
+        .find(|(value, _)| value.eq_ignore_ascii_case(fallback))
+        .or(choices.first())
+        .map_or(fallback, |(value, _)| *value);
     println!("\n{label}");
     for (index, (value, description)) in choices.iter().enumerate() {
         if description.is_empty() || description == value {
@@ -649,16 +655,58 @@ async fn registration_handler(
     }
     let result: Result<String> = async {
         let mut endpoint = state.conversion_base.clone();
-        endpoint.path_segments_mut().map_err(|_| anyhow::anyhow!("Invalid GitHub API URL"))?.pop_if_empty().push(code).push("conversions");
-        let app: Value = state.client.post(endpoint).header("Accept", "application/vnd.github+json").send().await?.error_for_status()?.json().await?;
-        if !(app["id"].as_u64().is_some_and(|id| id > 0) || app["id"].as_str().is_some_and(|id| !id.is_empty())) || ["pem", "webhook_secret", "slug"].iter().any(|key| string(&app, key).is_empty()) { bail!("GitHub returned incomplete App credentials."); }
+        endpoint
+            .path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Invalid GitHub API URL"))?
+            .pop_if_empty()
+            .push(code)
+            .push("conversions");
+        let app: Value = state
+            .client
+            .post(endpoint)
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let has_id = app["id"].as_u64().is_some_and(|id| id > 0)
+            || app["id"].as_str().is_some_and(|id| !id.is_empty());
+        if !has_id
+            || ["pem", "webhook_secret", "slug"]
+                .iter()
+                .any(|key| string(&app, key).is_empty())
+        {
+            bail!("GitHub returned incomplete App credentials.");
+        }
         let mut config = state.config.lock().await;
-        config["app"] = json!({"id":app["id"],"pem":app["pem"],"webhookSecret":app["webhook_secret"],"slug":app["slug"],"botId":null});
+        config["app"] = json!({
+            "id": app["id"],
+            "pem": app["pem"],
+            "webhookSecret": app["webhook_secret"],
+            "slug": app["slug"],
+            "botId": null,
+        });
         config::save(&state.root, &config)?;
         let mut install = url::Url::parse("https://github.com/apps/")?;
-        install.path_segments_mut().map_err(|_| anyhow::anyhow!("Invalid GitHub URL"))?.pop_if_empty().push(string(&app, "slug")).push("installations").push("new");
-        Ok(setup_page("Your GitHub App is ready", "Step 2 of 2 · Choose repositories", &format!("<p>Install your app on GitHub and choose the repositories it can access.</p><a class=\"button\" href=\"{}\">Choose repositories on GitHub</a><p>Then return to your terminal and press Enter to continue setup.</p><p class=\"note\">You will choose which repositories Crow should review in the terminal.</p>",html_escape(install.as_str()))))
-    }.await;
+        install
+            .path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Invalid GitHub URL"))?
+            .pop_if_empty()
+            .push(string(&app, "slug"))
+            .push("installations")
+            .push("new");
+        let body = format!(
+            "<p>Install your app on GitHub and choose the repositories it can access.</p><a class=\"button\" href=\"{}\">Choose repositories on GitHub</a><p>Then return to your terminal and press Enter to continue setup.</p><p class=\"note\">You will choose which repositories Crow should review in the terminal.</p>",
+            html_escape(install.as_str())
+        );
+        Ok(setup_page(
+            "Your GitHub App is ready",
+            "Step 2 of 2 · Choose repositories",
+            &body,
+        ))
+    }
+    .await;
     let (response, outcome) = match result {
         Ok(body) => (setup_response(StatusCode::OK, body, "text/html"), Ok(())),
         Err(error) => (
@@ -957,10 +1005,21 @@ struct ServiceRestart<'a> {
 #[async_trait::async_trait]
 impl RestartBackend for ServiceRestart<'_> {
     async fn current_draining(&self) -> Result<Option<bool>> {
-        Ok(operations::admin(self.config, "status", &Value::Null)
+        let error = match operations::admin(self.config, "status", &Value::Null).await {
+            Ok(status) => return Ok(Some(status["draining"] == true)),
+            Err(error) => error,
+        };
+        // Skipping the stop would leave a running service on its old settings.
+        let unit = operations::unit_name(self.root);
+        let active = operations::run("systemctl", &["--user", "is-active", &unit], false)
             .await
-            .ok()
-            .map(|status| status["draining"] == true))
+            .is_ok_and(|state| state.trim() == "active");
+        if active {
+            return Err(error.context(
+                "Crow is running but did not answer its status check. Check crow logs, then rerun crow setup.",
+            ));
+        }
+        Ok(None)
     }
     async fn drain(&self) -> Result<()> {
         println!("Waiting for active reviews before applying setup changes.");
@@ -1125,28 +1184,9 @@ pub async fn validate_models(config: &Value, root: &Path, worker: &Value) -> Res
     let models = catalog["models"]
         .as_array()
         .context("The provider returned no model catalog")?;
-    validate_model_selection(models, worker, "Review")?;
+    crate::provider::validate_selection(models, worker, "Review")?;
     if worker["subagents"]["mode"] == "configured" {
-        validate_model_selection(models, &worker["subagents"], "Subagent")?;
-    }
-    Ok(())
-}
-
-fn validate_model_selection(models: &[Value], selected: &Value, label: &str) -> Result<()> {
-    let model_name = string(selected, "model");
-    let model = models
-        .iter()
-        .find(|m| !model_name.is_empty() && m["model"] == model_name)
-        .with_context(|| {
-            format!("{label} model is not available from the provider: {model_name}")
-        })?;
-    let effort = string(selected, "effort");
-    if effort.is_empty()
-        || !model["supportedReasoningEfforts"]
-            .as_array()
-            .is_some_and(|efforts| efforts.iter().any(|e| e["reasoningEffort"] == effort))
-    {
-        bail!("{label} reasoning level {effort} is unsupported for {model_name}");
+        crate::provider::validate_selection(models, &worker["subagents"], "Subagent")?;
     }
     Ok(())
 }
@@ -1212,6 +1252,9 @@ pub async fn setup(root: &Path, options: &Value) -> Result<()> {
             "\nConnect this worker\nRun crow pair on your service machine, then enter its connection details."
         );
         let previous = string(&config, "serviceUrl");
+        // Only offer the saved ID once this worker has been paired before;
+        // a fresh installation's random ID was never issued by a service.
+        let paired = previous.starts_with("https:");
         config["serviceUrl"] = json!(util::https_url(
             &ask(
                 "Connection-service HTTPS URL",
@@ -1223,8 +1266,19 @@ pub async fn setup(root: &Path, options: &Value) -> Result<()> {
             )
             .await?
         )?);
-        config["worker"]["id"] =
-            json!(ask("Worker ID from crow pair", string(&config["worker"], "id")).await?);
+        let worker_id = ask(
+            "Worker ID from crow pair",
+            if paired {
+                string(&config["worker"], "id")
+            } else {
+                ""
+            },
+        )
+        .await?;
+        if worker_id.is_empty() {
+            bail!("Worker ID required. Run crow pair on your service machine to get one.");
+        }
+        config["worker"]["id"] = json!(worker_id);
         let token = ask("Worker token from crow pair", "").await?;
         if token.is_empty() {
             bail!("Worker pairing token required");
@@ -1367,7 +1421,15 @@ pub async fn setup(root: &Path, options: &Value) -> Result<()> {
             if !enrolled.insert(name.to_ascii_lowercase()) {
                 continue;
             }
-            let result = operations::admin(&config,"enroll",&json!({"repo":name,"githubToken":identity["token"],"worker":config["worker"]["id"],"policy":"selected","authors":[config["operator"]],"includeBacklog":false})).await?;
+            let enrollment = json!({
+                "repo": name,
+                "githubToken": identity["token"],
+                "worker": config["worker"]["id"],
+                "policy": "selected",
+                "authors": [config["operator"]],
+                "includeBacklog": false,
+            });
+            let result = operations::admin(&config, "enroll", &enrollment).await?;
             println!("{}", crate::output::render("enroll", &result));
         }
     }
@@ -1390,92 +1452,178 @@ pub async fn setup(root: &Path, options: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Choose the review provider, sign in, and select its model. The selection is
+/// saved only once complete, so an interrupted switch keeps the previous provider.
 async fn setup_provider(config: &mut Value, root: &Path) -> Result<()> {
     println!("\nChoose how Crow reviews code");
     ensure_command("git").await?;
-    if operations::run(string(&config["worker"], "codex"), &["--version"], false)
-        .await
-        .is_err()
-    {
-        if !confirm(
-            "Codex is missing. Install the latest official standalone Codex package?",
-            true,
-        )
-        .await?
-        {
-            bail!("Install Codex and rerun setup.");
+    let previous = config["worker"]["provider"]
+        .as_str()
+        .unwrap_or("codex")
+        .to_owned();
+    let provider = choose(
+        "Review provider",
+        &previous,
+        &[
+            ("codex", "OpenAI Codex with a ChatGPT subscription."),
+            ("claude", "Claude Code with a Claude subscription."),
+        ],
+    )
+    .await?;
+    // Installing the executable saves only its path, never the provider switch.
+    if provider == "claude" {
+        ensure_claude(config, root).await?;
+    } else {
+        ensure_codex(config, root).await?;
+    }
+    let mut worker = config["worker"].clone();
+    if provider != previous {
+        // Model names are provider-specific.
+        worker["model"] = Value::Null;
+        worker["effort"] = Value::Null;
+        if worker["subagents"]["mode"] == "configured" {
+            let max = worker["subagents"]["max"].clone();
+            worker["subagents"] = json!({"mode": "inherit", "max": max});
         }
-        config["worker"]["codex"] = json!(crate::install::install_codex(root).await?);
-        config::save(root, config)?;
     }
-    if crate::provider::auth_status(&config["worker"], root).await?["authenticated"] != true {
-        println!("Authenticate on your desktop using the URL and code printed below.");
-        crate::provider::login(&config["worker"], root).await?;
+    worker["provider"] = json!(provider);
+    if crate::provider::auth_status(&worker, root).await?["authenticated"] != true {
+        println!(
+            "{}",
+            if provider == "claude" {
+                "Sign in to your Claude subscription. Open the URL printed below on any device, then paste the code it shows here."
+            } else {
+                "Authenticate on your desktop using the URL and code printed below."
+            }
+        );
+        crate::provider::login(&worker, root).await?;
     }
-    let catalog = crate::provider::discover(&config["worker"], root).await?;
+    let catalog = crate::provider::discover(&worker, root).await?;
     if let Some(warning) = catalog["warning"].as_str() {
         println!("{warning}");
     }
     let models = catalog["models"]
         .as_array()
         .context("The provider returned no model catalog")?;
-    let initial = models.iter().find(|model| model["isDefault"] == true).or_else(|| models.iter().find(|model| !string(&config["worker"],"model").is_empty() && model["model"] == config["worker"]["model"])).context("The provider did not report a default model. Retry model discovery before completing initial setup.")?;
-    let previous = string(&config["worker"], "model");
-    let model_choices: Vec<_> = models
+    let saved = string(&worker, "model");
+    let current = crate::provider::find_model(models, saved)
+        .or_else(|| models.iter().find(|model| model["isDefault"] == true))
+        .context("The provider did not report a default model. Retry model discovery before completing initial setup.")?;
+    let mut model_choices: Vec<_> = models
         .iter()
-        .map(|model| {
-            (
-                model["model"].as_str().unwrap_or(string(model, "id")),
-                model["displayName"]
-                    .as_str()
-                    .unwrap_or(string(model, "model")),
-            )
-        })
+        .map(|model| (string(model, "model"), string(model, "displayName")))
         .collect();
-    let selected = choose(
-        "Review model",
-        if previous.is_empty() {
-            initial["model"].as_str().unwrap_or(string(initial, "id"))
-        } else {
-            previous
-        },
-        &model_choices,
-    )
-    .await?;
-    let model = models
-        .iter()
-        .find(|model| model["model"] == selected)
+    // Keep a pinned model (one an alias resolves to) as the default choice.
+    let pinned = format!("{} (pinned)", string(current, "displayName"));
+    let default = if !saved.is_empty() && current["model"] != saved {
+        model_choices.push((saved, &pinned));
+        saved
+    } else {
+        string(current, "model")
+    };
+    let selected = choose("Review model", default, &model_choices).await?;
+    let model = crate::provider::find_model(models, &selected)
         .context("Select a model from the provider list.")?;
-    config["worker"]["model"] = json!(selected);
     let efforts = model["supportedReasoningEfforts"]
         .as_array()
         .context("The selected model did not report reasoning levels")?;
-    let previous = string(&config["worker"], "effort");
+    let previous = string(&worker, "effort");
+    let fallback = if crate::provider::supports_effort(model, previous) {
+        previous
+    } else {
+        string(model, "defaultReasoningEffort")
+    };
     println!("\nHigher reasoning levels give the model more time to work on each review.");
     let effort_choices: Vec<_> = efforts
         .iter()
-        .filter_map(|effort| {
-            effort["reasoningEffort"]
-                .as_str()
-                .map(|name| (name, string(effort, "description")))
+        .map(|effort| {
+            (
+                string(effort, "reasoningEffort"),
+                string(effort, "description"),
+            )
         })
         .collect();
-    let effort = choose(
-        "Reasoning level",
-        if previous.is_empty() {
-            string(model, "defaultReasoningEffort")
-        } else {
-            previous
-        },
-        &effort_choices,
-    )
-    .await?;
-    if !efforts.iter().any(|e| e["reasoningEffort"] == effort) {
-        bail!("Unsupported reasoning level for this model.");
+    let effort = choose("Reasoning level", fallback, &effort_choices).await?;
+    worker["model"] = json!(selected);
+    worker["effort"] = json!(effort);
+    config["worker"] = worker;
+    config::save(root, config)
+}
+async fn ensure_codex(config: &mut Value, root: &Path) -> Result<()> {
+    if operations::run(string(&config["worker"], "codex"), &["--version"], false)
+        .await
+        .is_ok()
+    {
+        return Ok(());
     }
-    config["worker"]["effort"] = json!(effort);
-    config::save(root, config)?;
-    Ok(())
+    if !confirm(
+        "Codex is missing. Install the latest official standalone Codex package?",
+        true,
+    )
+    .await?
+    {
+        bail!("Install Codex and rerun setup.");
+    }
+    config["worker"]["codex"] = json!(crate::install::install_codex(root).await?);
+    config::save(root, config)
+}
+/// Use the installed Claude Code CLI, or offer its official installer. The
+/// absolute path is saved so the background service finds the same executable;
+/// the installer's launcher link keeps working across Claude Code updates.
+async fn ensure_claude(config: &mut Value, root: &Path) -> Result<()> {
+    let configured = config["worker"]["claude"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("claude")
+        .to_owned();
+    let mut found = find_executable(&configured);
+    if found.is_none() {
+        if !confirm(
+            "Claude Code is missing. Install it with the official installer from claude.ai?",
+            true,
+        )
+        .await?
+        {
+            bail!(
+                "Install Claude Code with\n  curl -fsSL https://claude.ai/install.sh | bash\nthen rerun crow setup."
+            );
+        }
+        let directory = tempfile::tempdir()?;
+        let script = directory.path().join("install.sh");
+        let response = reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()?
+            .get("https://claude.ai/install.sh")
+            .send()
+            .await?
+            .error_for_status()?;
+        util::atomic_bytes(&script, &response.bytes().await?)?;
+        operations::run("bash", &[&script.to_string_lossy()], true).await?;
+        found = find_executable(&configured)
+            .or_else(|| user_home().ok().map(|home| home.join(".local/bin/claude")));
+    }
+    let path = found.context("Claude Code was not found after installation.")?;
+    let version = operations::run(&path.to_string_lossy(), &["--version"], false).await?;
+    if !version.contains("Claude Code") {
+        bail!("{} is not the official Claude Code CLI.", path.display());
+    }
+    config["worker"]["claude"] = json!(path);
+    config::save(root, config)
+}
+/// Resolve a command name the way a shell would, without following links.
+fn find_executable(command: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let executable = |path: &Path| {
+        std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    };
+    if command.contains('/') {
+        let path = PathBuf::from(command);
+        return executable(&path).then_some(path);
+    }
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(command))
+        .find(|path| executable(path))
 }
 
 #[cfg(test)]
@@ -2034,47 +2182,6 @@ mod tests {
         assert_eq!(
             systemd_quote("/home/$user/crow").unwrap(),
             "\"/home/$$user/crow\""
-        );
-    }
-
-    #[test]
-    fn model_selection_checks_both_model_and_reasoning_capability() {
-        let models = vec![
-            json!({"id":"model-id","model":"review-model","supportedReasoningEfforts":[{"reasoningEffort":"medium"},{"reasoningEffort":"high"}]}),
-        ];
-        assert!(
-            validate_model_selection(
-                &models,
-                &json!({"model":"model-id","effort":"high"}),
-                "Review",
-            )
-            .is_err()
-        );
-        validate_model_selection(
-            &models,
-            &json!({"model":"review-model","effort":"medium"}),
-            "Subagent",
-        )
-        .unwrap();
-        assert!(
-            validate_model_selection(
-                &models,
-                &json!({"model":"unknown","effort":"medium"}),
-                "Review"
-            )
-            .is_err()
-        );
-        assert!(
-            validate_model_selection(
-                &models,
-                &json!({"model":"review-model","effort":"max"}),
-                "Review"
-            )
-            .is_err()
-        );
-        assert!(
-            validate_model_selection(&models, &json!({"model":null,"effort":null}), "Review")
-                .is_err()
         );
     }
 

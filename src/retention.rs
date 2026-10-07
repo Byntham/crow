@@ -94,6 +94,37 @@ fn walk(path: &Path, sessions: &HashSet<String>) -> Result<()> {
     }
     Ok(())
 }
+/// Claude Code keeps each session as `projects/<project>/<id>.jsonl`, with an
+/// optional `<id>/` directory for tool output. Crow gives every review its own
+/// working directory, so a project holds only that review's sessions.
+fn walk_claude(projects: &Path, sessions: &HashSet<String>) -> Result<()> {
+    if !directory(projects)? {
+        return Ok(());
+    }
+    for project in fs::read_dir(projects)? {
+        let project = project?;
+        if !project.file_type()?.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(project.path())? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let id = name.strip_suffix(".jsonl").unwrap_or(&name);
+            if !sessions.contains(id) {
+                continue;
+            }
+            if kind.is_file() && name.ends_with(".jsonl") {
+                fs::remove_file(entry.path())?;
+            } else if kind.is_dir() && id == name {
+                fs::remove_dir_all(entry.path())?;
+            }
+        }
+        // Only an emptied project directory is removed; remove_dir refuses otherwise.
+        let _ = fs::remove_dir(project.path());
+    }
+    Ok(())
+}
 /// Configuration accepts `retentionDays`, with the same seven-day default as the service.
 pub fn cleanup(root: &Path, config: &Value, jobs: &[Value]) -> Result<Value> {
     let days = match config.get("retentionDays") {
@@ -194,6 +225,10 @@ pub fn cleanup_at(root: &Path, jobs: &[Value], days: f64, now: f64) -> Result<Va
                 walk(&codex.join("sessions"), &sessions)?;
                 walk(&codex.join("archived_sessions"), &sessions)?;
             }
+            let claude = root.join("claude");
+            if directory(&claude)? {
+                walk_claude(&claude.join("projects"), &sessions)?;
+            }
             Ok(())
         };
         if let Err(e) = action() {
@@ -238,6 +273,40 @@ mod tests {
             assert!(root.join(format!("reviews/{id}/file")).exists());
         }
         assert!(cleanup_at(root, &[], -1.0, 1.0).is_err());
+    }
+    #[test]
+    fn expired_claude_sessions_and_their_tool_output_are_removed() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        let live = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        file(
+            root,
+            &format!("claude/projects/-review-done/{SESSION}.jsonl"),
+            "owned",
+        );
+        file(
+            root,
+            &format!("claude/projects/-review-done/{SESSION}/tool.txt"),
+            "owned",
+        );
+        file(
+            root,
+            &format!("claude/projects/-review-paused/{live}.jsonl"),
+            "keep",
+        );
+        file(root, "claude/.credentials.json", "keep");
+        let jobs = vec![
+            json!({"id":"done","state":"completed","updatedAt":0,"session":SESSION}),
+            json!({"id":"paused","state":"paused","updatedAt":0,"session":live}),
+        ];
+        let r = cleanup_at(root, &jobs, 7.0, 1e10).unwrap();
+        assert_eq!(r["warnings"], json!([]));
+        assert!(!root.join("claude/projects/-review-done").exists());
+        assert!(
+            root.join(format!("claude/projects/-review-paused/{live}.jsonl"))
+                .exists()
+        );
+        assert!(root.join("claude/.credentials.json").exists());
     }
     #[test]
     fn delegated_sessions_respect_live_references() {

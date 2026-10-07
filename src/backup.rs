@@ -246,7 +246,12 @@ pub fn restore_backup(root: &Path, file: &Path, secret: &str) -> Result<Value> {
         .1;
     let mut config = SecretValue(serde_json::from_slice(config_bytes)?);
     crate::config::validate_config(&config)?;
+    // Backups exclude provider logins and sessions, so the restored worker
+    // starts with fresh provider state under the destination folder.
     config["worker"]["codexHome"] = json!(root.join("codex"));
+    if config["worker"].get("claudeHome").is_some() {
+        config["worker"]["claudeHome"] = json!(root.join("claude"));
+    }
     *config_bytes = Zeroizing::new(serde_json::to_vec_pretty(&config.0)?);
     config_bytes.push(b'\n');
     private_dir(&root)?;

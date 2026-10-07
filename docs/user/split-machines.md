@@ -1,6 +1,6 @@
 # Run the service and worker separately
 
-The default combined installation is simpler. Separate roles are useful when the public connection service belongs on one host and Codex should run on another. Both hosts still belong to the same Crow operator.
+The default combined installation is simpler. Separate roles are useful when the public connection service belongs on one host and reviews should run on another. Both hosts still belong to the same Crow operator.
 
 These instructions apply to a new installation. An existing combined installation cannot switch to `service` while any repository or unfinished review is assigned to its local worker. Setup refuses the change before saving the new role, so the existing worker keeps running. `crow pair` creates another worker; it does not move existing repositories or saved sessions. Keep the existing installation in `both` mode until an explicit migration feature is available. You can pair remote workers with a combined installation and assign newly enrolled repositories to them. A service-hosting installation also cannot switch to `worker` while it holds repositories or unfinished reviews, because that would remove their connection service. Create the worker installation on the other machine instead.
 
@@ -11,7 +11,7 @@ crow setup --role service
 crow pair
 ```
 
-Service setup handles public HTTPS, your GitHub App, persistent startup, and storage. It does not require a Codex login. `crow pair` prints a service URL, worker ID, and secret token. Transfer these privately to the worker operator.
+Service setup handles public HTTPS, your GitHub App, persistent startup, and storage. It does not require a provider login. `crow pair` prints a service URL, worker ID, and secret token. Transfer these privately to the worker operator.
 
 On the worker host:
 
@@ -19,7 +19,7 @@ On the worker host:
 crow setup --role worker
 ```
 
-Enter the HTTPS service URL and pairing credentials. Complete Codex's device-code login on your desktop, confirm provider settings, and let setup enable persistent startup. This machine needs outbound HTTPS, but no Funnel, public listener, or GitHub App private key.
+Enter the HTTPS service URL and pairing credentials. Choose Codex or Claude Code, sign in on your desktop, confirm the model, and let setup enable persistent startup. Workers paired with one service can use different providers. This machine needs outbound HTTPS, but no Funnel, public listener, or GitHub App private key.
 
 Back on the service host:
 
