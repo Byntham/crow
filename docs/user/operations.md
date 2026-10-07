@@ -15,6 +15,7 @@ crow enroll owner/repo
 crow policy owner/repo --authors alice,bob
 crow policy owner/repo --everyone
 crow policy owner/repo --requesters alice,bob
+crow policy owner/repo --pushers anyone
 crow config
 crow models
 crow config worker.provider claude
@@ -30,6 +31,8 @@ crow repo-config owner/repo --reset
 ```
 
 Author policy determines whose PRs Crow can review. Requester policy separately determines who can trigger `/crow review`, `/crow resume`, `/crow restart`, or `/crow pause` in a PR comment; it defaults to the operator. Granting someone request permission does not authorize their own PRs or give them configuration access. `--requesters` changes only requester permission, and the target PR must still pass author and draft checks.
+
+Crow also checks who pushed each new version, using GitHub's record of the authenticated user behind each push. With an author list, it reviews a version automatically only when a listed author pushed it, so collaborators and bots pushing to your PRs don't use your subscription. Such a version is skipped, and the status comment names who pushed it; a requester can still ask for it with `/crow review`. To review pushes from anyone with write access, set `--pushers anyone`. See ADR 0011.
 
 `crow config` hides credentials. `worker.provider` selects Codex (`codex`, the default) or Claude Code (`claude`). Changing it clears the model and reasoning level, which are provider-specific; run `crow login` and choose new ones, and update repository model overrides with `crow repo-config`. Reviews already started keep their provider; a saved session cannot move to another provider, so use `crow restart` to rerun one with the new provider. Model names and reasoning levels come from `crow models`; Crow does not maintain a model list in its source. If retrieval fails, Crow marks the last successful catalog as cached and reports the error. Saved explicit selections do not change when provider defaults change.
 

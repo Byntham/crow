@@ -123,6 +123,10 @@ Use crow policy to change who receives or requests reviews.")]
         /// Allow these comma-separated GitHub usernames to request reviews.
         #[arg(long, value_name = "USER,USER")]
         requesters: Option<String>,
+        /// Review new versions pushed by the listed authors only (authors, the
+        /// default) or by anyone with write access (anyone).
+        #[arg(long, value_parser = ["authors", "anyone"])]
+        pushers: Option<String>,
     },
     /// Set review options for one repository.
     #[command(group(clap::ArgGroup::new("settings").args(["json", "model", "effort", "timeout_seconds", "reset"]).required(true).multiple(true)), after_help = "Examples:
@@ -727,10 +731,11 @@ async fn configured_command(format: OutputFormat, command: Command, root: &Path)
             authors,
             everyone,
             requesters,
+            pushers,
         } => {
             ensure!(
-                authors.is_some() || everyone || requesters.is_some(),
-                "Specify --authors, --everyone, or --requesters"
+                authors.is_some() || everyone || requesters.is_some() || pushers.is_some(),
+                "Specify --authors, --everyone, --requesters, or --pushers"
             );
             let mut args = json!({"repo":util::repo_name(&repo)?});
             if everyone {
@@ -742,6 +747,9 @@ async fn configured_command(format: OutputFormat, command: Command, root: &Path)
             }
             if let Some(requesters) = requesters {
                 args["requesters"] = json!(logins(&requesters)?);
+            }
+            if let Some(pushers) = pushers {
+                args["pushers"] = json!(pushers);
             }
             print(
                 format,

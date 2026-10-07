@@ -181,6 +181,12 @@ impl Store {
             if let Some(encoded) = encoded {
                 let mut active: Value = serde_json::from_str(&encoded)?;
                 if active["head"] == head && active["target"] == target && !restart {
+                    // An explicit request makes the review requested, whatever
+                    // queued it, so checks for automatic reviews no longer apply.
+                    if manual && active["manual"] != true {
+                        active["manual"] = json!(true);
+                        store.put("jobs", field(&active, "id")?, &active)?;
+                    }
                     if manual && matches!(active["state"].as_str(), Some("paused" | "held")) {
                         let epoch = active["resumeEpoch"].as_u64().unwrap_or(0);
                         active["resumeEpoch"] = json!(epoch.saturating_add(1));

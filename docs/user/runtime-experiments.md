@@ -9,10 +9,11 @@ A review can run code only when all of these hold:
 - The repository is listed in this worker's `worker.execution` setting.
 - The repository's author policy lists its authors (`crow policy owner/repo --authors ...`), not `--everyone`.
 - The PR comes from a branch of the repository itself, not a fork.
+- Listed authors made every push to that branch since it was created.
 
 Anything else is reviewed by inspection only, as before. A PR, its review guidance and the connection service cannot turn execution on. Delegated subagents never run code.
 
-Crow checks who opened the PR, not who pushed each commit. Anyone with write access to the repository can add commits to a PR's branch. Only turn this on for repositories where you would let everyone with write access, including bots, run code on this machine.
+Crow checks pushes with GitHub's record of who made them, not commit authors, which anyone can set. If you set `crow policy owner/repo --pushers anyone`, the last condition no longer applies, and anyone with write access to the repository, including bots, can get code run on this machine.
 
 ## Turn it on
 

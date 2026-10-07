@@ -98,7 +98,11 @@ fn pull_request(v: Value) -> Result<Value> {
         "draft": draft,
         "user": {"login": string(&v["user"]["login"])?},
         // A deleted fork leaves no head repository; treat it as a fork.
-        "head": {"sha": string(&v["head"]["sha"])?, "repo": v["head"]["repo"]["full_name"].as_str()},
+        "head": {
+            "sha": string(&v["head"]["sha"])?,
+            "ref": v["head"]["ref"].as_str(),
+            "repo": v["head"]["repo"]["full_name"].as_str(),
+        },
         "base": {"sha": string(&v["base"]["sha"])?, "ref": string(&v["base"]["ref"])?},
     });
     for key in ["title", "created_at", "updated_at"] {
@@ -182,6 +186,11 @@ pub trait GitHubApi: Send + Sync {
     }
     async fn prs(&self, repo: &Value, token: &str) -> Result<Vec<Value>> {
         bail!("GitHub prs is not implemented")
+    }
+    /// Pushes to a PR's head branch, newest first, back to the branch's creation
+    /// when GitHub still has it. Each has `type`, `actor` and `after`.
+    async fn pushes(&self, repo: &Value, pr: &Value, token: &str) -> Result<Vec<Value>> {
+        bail!("GitHub pushes is not implemented")
     }
     async fn comments(&self, repo: &Value, n: i64, token: &str) -> Result<Vec<Value>> {
         bail!("GitHub comments is not implemented")
@@ -322,12 +331,22 @@ impl GitHub {
         let status = response.status();
         let headers = response.headers().clone();
         if !status.is_success() {
-            let retry_after = headers
-                .get("retry-after")
-                .and_then(|h| h.to_str().ok())
+            let header = |name: &str| headers.get(name).and_then(|h| h.to_str().ok());
+            // A spent primary rate limit gives its reset time instead of Retry-After.
+            let reset = (header("x-ratelimit-remaining") == Some("0"))
+                .then(|| header("x-ratelimit-reset")?.parse::<i64>().ok())
+                .flatten()
+                .map(|reset| {
+                    (reset * 1000 - chrono::Utc::now().timestamp_millis()).max(1000) as u64
+                });
+            // A secondary rate limit may name no delay; GitHub asks for at least a minute.
+            let unnamed = matches!(status.as_u16(), 403 | 429).then_some(60_000);
+            let retry_after = header("retry-after")
                 .and_then(|h| h.parse::<f64>().ok())
                 .filter(|v| v.is_finite() && *v > 0.0)
                 .map(|v| (v * 1000.0) as u64)
+                .or(reset)
+                .or(unnamed)
                 .unwrap_or(0);
             return Err(GitHubError {
                 message: format!(
@@ -377,11 +396,49 @@ impl GitHub {
         }
         bail!("GitHub pagination limit reached")
     }
+    /// The next page from a `Link` header. It must stay on GitHub's API origin
+    /// and on a path `allowed` accepts, so the token goes nowhere else.
+    fn next_page(
+        &self,
+        headers: &HeaderMap,
+        allowed: impl Fn(&str) -> bool,
+    ) -> Result<Option<String>> {
+        let link = headers
+            .get("link")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("");
+        static NEXT: std::sync::LazyLock<regex::Regex> =
+            std::sync::LazyLock::new(|| regex::Regex::new(r#";\s*rel="next""#).unwrap());
+        let Some(next) = link.split(',').find(|part| NEXT.is_match(part)) else {
+            return Ok(None);
+        };
+        let target = next
+            .split_once('<')
+            .and_then(|(_, s)| s.split_once('>'))
+            .map(|(u, _)| u)
+            .context("Invalid GitHub pagination link")?;
+        let origin = url::Url::parse(&self.origin)?;
+        let next = origin
+            .join(target)
+            .context("Invalid GitHub pagination link")?;
+        if next.origin() != origin.origin()
+            || !allowed(next.path())
+            || !next.username().is_empty()
+            || next.password().is_some()
+        {
+            bail!("Invalid GitHub pagination origin");
+        }
+        let mut path = next.path().to_owned();
+        if let Some(q) = next.query() {
+            path.push('?');
+            path.push_str(q);
+        }
+        Ok(Some(path))
+    }
     pub async fn deliveries(&self, token: &str) -> Result<Vec<Value>> {
         let mut result = Vec::new();
         let mut seen = HashSet::new();
         let mut path = "/app/hook/deliveries?per_page=100".to_owned();
-        let origin = url::Url::parse(&self.origin)?;
         loop {
             if seen.len() >= 1000 || !seen.insert(path.clone()) {
                 bail!("GitHub delivery pagination did not terminate");
@@ -395,34 +452,9 @@ impl GitHub {
             {
                 result.push(delivery(v.clone())?);
             }
-            let link = headers
-                .get("link")
-                .and_then(|h| h.to_str().ok())
-                .unwrap_or("");
-            static NEXT: std::sync::LazyLock<regex::Regex> =
-                std::sync::LazyLock::new(|| regex::Regex::new(r#";\s*rel="next""#).unwrap());
-            let Some(next) = link.split(',').find(|part| NEXT.is_match(part)) else {
-                return Ok(result);
-            };
-            let target = next
-                .split_once('<')
-                .and_then(|(_, s)| s.split_once('>'))
-                .map(|(u, _)| u)
-                .context("Invalid GitHub delivery pagination link")?;
-            let next = origin
-                .join(target)
-                .context("Invalid GitHub delivery pagination link")?;
-            if next.origin() != origin.origin()
-                || next.path() != "/app/hook/deliveries"
-                || !next.username().is_empty()
-                || next.password().is_some()
-            {
-                bail!("Invalid GitHub delivery pagination origin");
-            }
-            path = next.path().to_owned();
-            if let Some(q) = next.query() {
-                path.push('?');
-                path.push_str(q);
+            match self.next_page(&headers, |p| p == "/app/hook/deliveries")? {
+                Some(next) => path = next,
+                None => return Ok(result),
             }
         }
     }
@@ -470,6 +502,49 @@ impl GitHubApi for GitHub {
         .into_iter()
         .map(pull_request)
         .collect()
+    }
+    async fn pushes(&self, _: &Value, pr: &Value, token: &str) -> Result<Vec<Value>> {
+        // GitHub records the authenticated user behind each push, unlike Git's
+        // author fields, which anyone can set. A deleted fork has no pushes to read.
+        let (Some(head), Some(branch)) = (pr["head"]["repo"].as_str(), pr["head"]["ref"].as_str())
+        else {
+            return Ok(Vec::new());
+        };
+        let reference: String =
+            url::form_urlencoded::byte_serialize(format!("refs/heads/{branch}").as_bytes())
+                .collect();
+        let start = format!("{}/activity", self.path(&json!(head))?);
+        let mut path = format!("{start}?ref={reference}&per_page=100");
+        let allowed = |p: &str| {
+            p.eq_ignore_ascii_case(&start)
+                || p.strip_prefix("/repositories/")
+                    .and_then(|rest| rest.strip_suffix("/activity"))
+                    .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+        };
+        let mut pushes = Vec::new();
+        for _ in 0..10 {
+            let (data, headers) = self
+                .request_headers(&path, Some(token), "GET", None)
+                .await?;
+            for entry in data.as_array().context("Unexpected GitHub activity")? {
+                // Keep entries of unknown shape: their actor still has to qualify.
+                let kind = entry["activity_type"].as_str();
+                pushes.push(json!({
+                    "type": kind,
+                    "actor": entry["actor"]["login"].as_str(),
+                    "after": entry["after"].as_str(),
+                }));
+                // Older activity belongs to an earlier branch with this name.
+                if kind == Some("branch_creation") {
+                    return Ok(pushes);
+                }
+            }
+            match self.next_page(&headers, allowed)? {
+                Some(next) => path = next,
+                None => break,
+            }
+        }
+        Ok(pushes)
     }
     async fn comments(&self, repo: &Value, n: i64, token: &str) -> Result<Vec<Value>> {
         self.list(
@@ -715,7 +790,7 @@ mod tests {
         json!({"name":"owner/project","installation":1})
     }
     fn valid_pr() -> Value {
-        json!({"number":3,"state":"open","user":{"login":"operator"},"head":{"sha":"a".repeat(40)},"base":{"sha":"b".repeat(40),"ref":"main"},"body":null,"title":"Change"})
+        json!({"number":3,"state":"open","user":{"login":"operator"},"head":{"sha":"a".repeat(40),"ref":"feature"},"base":{"sha":"b".repeat(40),"ref":"main"},"body":null,"title":"Change"})
     }
     #[test]
     fn exact_bytes_hmac_and_rsa_jwt() {
@@ -1040,6 +1115,33 @@ mod tests {
         assert_eq!(error.status, 429);
         assert_eq!(error.retry_after, 3000);
         assert!(!error.message.contains("secret"));
+        // A spent primary rate limit answers 403 with its reset time instead.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
+        let reset = chrono::Utc::now().timestamp() + 60;
+        headers.insert("x-ratelimit-reset", reset.to_string().parse().unwrap());
+        m.push(403, headers, json!({}));
+        let error = gh
+            .request("/rate", Some("token"), "GET", None)
+            .await
+            .unwrap_err();
+        let error = error.downcast_ref::<GitHubError>().unwrap();
+        assert_eq!(error.status, 403);
+        assert!(
+            (50_000..=61_000).contains(&error.retry_after),
+            "{}",
+            error.retry_after
+        );
+        // A secondary rate limit may name no delay at all: wait the minute GitHub asks for.
+        m.push(403, HeaderMap::new(), json!({}));
+        let error = gh
+            .request("/rate", Some("token"), "GET", None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<GitHubError>().unwrap().retry_after,
+            60_000
+        );
         assert!(
             m.calls.lock().unwrap()[1]
                 .path
@@ -1060,6 +1162,68 @@ mod tests {
             m.push(200, headers, json!([]));
             let error = gh.deliveries("app-token").await.unwrap_err();
             assert!(error.to_string().contains("pagination"));
+            assert_eq!(m.calls.lock().unwrap().len(), 1);
+            h.abort();
+        }
+    }
+    #[tokio::test]
+    async fn pushes_follow_the_activity_cursor_and_stop_at_branch_creation() {
+        let pr = json!({"head":{"sha":"a".repeat(40),"ref":"feature/x#1","repo":"owner/project"}});
+        let entry = |kind: &str, actor: &str, after: &str| json!({"activity_type":kind,"actor":{"login":actor},"after":after});
+        let (gh, m, h) = mock(None).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "link",
+            "</repositories/42/activity?ref=x&after=cursor>; rel=\"next\""
+                .parse()
+                .unwrap(),
+        );
+        // An entry without a type is kept, so its actor still has to qualify.
+        m.push(
+            200,
+            headers,
+            json!([entry("push", "alice", "a1"), {"actor":{"login":"carol"},"after":"d1"}]),
+        );
+        // Activity before the branch's creation belongs to an earlier branch.
+        m.json(json!([
+            entry("force_push", "bob", "b1"),
+            entry("branch_creation", "alice", "c1"),
+            entry("push", "mallory", "old")
+        ]));
+        let pushes = gh.pushes(&repo(), &pr, "token").await.unwrap();
+        assert_eq!(
+            pushes,
+            vec![
+                json!({"type":"push","actor":"alice","after":"a1"}),
+                json!({"type":null,"actor":"carol","after":"d1"}),
+                json!({"type":"force_push","actor":"bob","after":"b1"}),
+                json!({"type":"branch_creation","actor":"alice","after":"c1"}),
+            ]
+        );
+        {
+            let calls = m.calls.lock().unwrap();
+            assert_eq!(
+                calls[0].path,
+                "/repos/owner/project/activity?ref=refs%2Fheads%2Ffeature%2Fx%231&per_page=100"
+            );
+            assert_eq!(
+                calls[1].path,
+                "/repositories/42/activity?ref=x&after=cursor"
+            );
+        }
+        h.abort();
+        // A next page anywhere else is refused before the token goes there.
+        for link in [
+            "https://attacker.example/repositories/42/activity",
+            "/repositories/42/hooks",
+            "/repos/other/project/activity",
+        ] {
+            let (gh, m, h) = mock(None).await;
+            let mut headers = HeaderMap::new();
+            headers.insert("link", format!("<{link}>; rel=\"next\"").parse().unwrap());
+            m.push(200, headers, json!([entry("push", "alice", "a1")]));
+            let error = gh.pushes(&repo(), &pr, "token").await.unwrap_err();
+            assert!(error.to_string().contains("pagination"), "{link}: {error}");
             assert_eq!(m.calls.lock().unwrap().len(), 1);
             h.abort();
         }
