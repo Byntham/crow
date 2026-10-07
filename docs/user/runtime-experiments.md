@@ -51,6 +51,6 @@ The published review ends with a short list of what ran and how it went. Failed 
 
 ## What the sandbox protects
 
-Each container runs as a non-root user that rootless Podman maps to a subordinate UID, so it cannot read files owned by your account. It has no capabilities, cannot gain privileges or create namespaces, has a read-only root filesystem and bounded scratch space, and its memory, CPU and process limits are checked before any repository file is unpacked. Tests have no network. Containers are removed after each command, and Podman stops them on its own if Crow exits.
+Each container runs as a non-root user in a user namespace where your own UID is not mapped, so it cannot act as your account or read your files. Crow refuses to run experiments with rootful Podman. It has no capabilities, cannot gain privileges or create namespaces, has a read-only root filesystem and bounded scratch space, and its memory, CPU and process limits are checked before any repository file is unpacked. Tests have no network. Containers are removed after each command, and Podman stops them on its own if Crow exits.
 
 It does not make hostile code safe. Containers share the host's kernel, so a kernel vulnerability could let code escape. Setup commands can send data to the registries they reach; that includes any bucket on `storage.googleapis.com`, which the Go module proxy uses. Only enable execution for repositories whose authors you would let run code on this machine.

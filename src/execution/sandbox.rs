@@ -1,7 +1,7 @@
-//! One experiment container: rootless Podman, a non-root user that maps to a
-//! subordinate host UID, no capabilities, no new namespaces, a read-only root
-//! filesystem, verified cgroup limits, and no network unless it is a setup
-//! container using the gateway.
+//! One experiment container: rootless Podman with the operator's UID left out
+//! of the user namespace, a non-root user, no capabilities, no new namespaces,
+//! a read-only root filesystem, verified cgroup limits, and no network unless
+//! it is a setup container using the gateway.
 use super::{Limits, gateway::Gateway, seccomp};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -18,8 +18,8 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-/// Container user. Rootless Podman maps it to a subordinate UID, so code in the
-/// container never runs as the operator's own account.
+/// Container user. With `--userns=nomap` every container ID maps to a
+/// subordinate host ID, so code never runs as the operator's own account.
 const USER: &str = "1000:1000";
 const OUTPUT_LIMIT: usize = 32 * 1024;
 /// Time allowed for starting the container, restoring files and exporting a snapshot.
@@ -90,11 +90,11 @@ impl Sandbox<'_> {
     /// than an `Err`, so the receipt records them.
     pub async fn run(&self, run: Run<'_>, cancel: &CancellationToken) -> Outcome {
         let profile = run.scratch.join("seccomp.profile");
-        let written = seccomp::profile(self.podman, self.env)
+        let written = host_profile(self.podman, self.env)
             .await
             .and_then(|p| crate::util::atomic(&profile, &p));
         if let Err(e) = written {
-            return Outcome::sandbox_error(format!("Seccomp profile: {e:#}"));
+            return Outcome::sandbox_error(format!("{e:#}"));
         }
         let gateway = if run.snapshot.is_some() {
             match Gateway::start_in(run.scratch, self.limits) {
@@ -304,6 +304,17 @@ impl Sandbox<'_> {
     }
 }
 
+/// Check that Podman is rootless, then derive Crow's seccomp profile from its default.
+async fn host_profile(podman: &str, env: &BTreeMap<String, String>) -> Result<Value> {
+    let info = super::podman(podman, env, &["info", "--format=json"], true).await?;
+    let info: Value = serde_json::from_str(&info.stdout).context("Unreadable podman info")?;
+    ensure!(
+        info["host"]["security"]["rootless"] == true,
+        "Crow runs experiments only with rootless Podman"
+    );
+    seccomp::derive(&info["host"]).context("Seccomp profile")
+}
+
 /// Arguments for `podman run`. Kept pure so tests can check every isolation flag.
 pub(super) fn container_args(
     limits: &Limits,
@@ -329,7 +340,12 @@ pub(super) fn container_args(
         "--cap-drop=ALL".into(),
         "--security-opt=no-new-privileges".into(),
         format!("--security-opt=seccomp={}", seccomp.display()),
+        // The operator's UID is not mapped at all. Podman rejects this when rootful.
+        "--userns=nomap".into(),
         format!("--user={USER}"),
+        // Reaps processes that commands leave behind, which would otherwise
+        // stay as zombies and count against the process limit.
+        "--init".into(),
         "--pid=private".into(),
         "--ipc=private".into(),
         "--log-driver=none".into(),
@@ -402,15 +418,17 @@ impl Drop for Container {
         if !self.armed {
             return;
         }
-        // A dropped run (for example a cancelled tool call) still removes its container.
-        let _ = std::process::Command::new(&self.podman)
+        // A dropped run (for example a cancelled tool call) still removes its
+        // container. The thread waits for `podman rm`, so it leaves no zombie.
+        let mut remove = std::process::Command::new(&self.podman);
+        remove
             .args(["rm", "--force", "--time=0", "--ignore", &self.name])
             .env_clear()
             .envs(&self.env)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+            .stderr(Stdio::null());
+        std::thread::spawn(move || remove.status());
     }
 }
 
@@ -581,6 +599,8 @@ mod tests {
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
             "--security-opt=seccomp=/s/seccomp.profile",
+            "--userns=nomap",
+            "--init",
             "--user=1000:1000",
             "--pull=never",
             "--image-volume=ignore",
@@ -611,6 +631,23 @@ mod tests {
         assert!(check.contains("id -u"));
         assert!(check.contains(&format!("= {} ]", Limits::default().pids)));
         assert!(check.contains("exit 125"));
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rootful_podman_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let podman = dir.path().join("podman");
+        let info = r#"{"host":{"security":{"rootless":false,"seccompProfilePath":"/x"}}}"#;
+        std::fs::write(&podman, format!("#!/bin/sh\necho '{info}'\n")).unwrap();
+        std::fs::set_permissions(&podman, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = host_profile(podman.to_str().unwrap(), &BTreeMap::new())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("only with rootless Podman"),
+            "{error}"
+        );
     }
     #[tokio::test]
     async fn oversized_export_stops_without_waiting_for_the_container() {

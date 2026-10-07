@@ -133,9 +133,11 @@ pub fn resolve(worker: &Value, repo: &str, allowed_by_service: bool) -> Result<O
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case(repo))
         .map(|(_, limits)| limits);
+    // The MCP helper that runs experiments inherits the provider's isolated
+    // environment, so the policy carries the worker's Podman environment.
     Ok(match limits {
         Some(limits) if allowed_by_service => {
-            Some(json!({"podman": config.podman, "limits": limits}))
+            Some(json!({"podman": config.podman, "limits": limits, "env": podman_env()}))
         }
         _ => None,
     })
@@ -233,9 +235,16 @@ impl Execution {
             .context("Invalid review ID")?
             .to_owned();
         let root = PathBuf::from(context["root"].as_str().context("Missing review root")?);
+        // Without the worker's environment, for example in tests, use this process's.
+        let env = match policy.get("env") {
+            Some(env) => {
+                serde_json::from_value(env.clone()).context("Invalid Podman environment")?
+            }
+            None => podman_env(),
+        };
         Ok(Some(Self {
             podman: policy["podman"].as_str().unwrap_or("podman").to_owned(),
-            env: podman_env(),
+            env,
             limits,
             dir: root.join("reviews").join(&review).join("experiments"),
             review,
@@ -465,9 +474,30 @@ fn bounded_text(value: &Value, name: &str, max: usize) -> Result<String> {
 }
 
 /// Environment for Podman: the operator's own session, so rootless storage and
-/// the user's systemd cgroup manager are found.
+/// the user's systemd cgroup manager are found. Connection settings such as
+/// CONTAINER_HOST are left out, so Podman is always the local one.
 pub fn podman_env() -> BTreeMap<String, String> {
-    crate::util::host_env().into_iter().collect()
+    let mut env: BTreeMap<_, _> = crate::util::clean_env().into_iter().collect();
+    for key in [
+        "XDG_RUNTIME_DIR",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "CONTAINERS_CONF",
+        "CONTAINERS_STORAGE_CONF",
+        // For pulling the base image.
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ] {
+        if let Some(value) = std::env::var(key).ok().filter(|v| !v.is_empty()) {
+            env.insert(key.to_owned(), value);
+        }
+    }
+    env
 }
 pub(crate) struct PodmanOutput {
     pub success: bool,
@@ -507,6 +537,12 @@ pub fn summary(review_dir: &Path) -> Option<String> {
         return None;
     }
     receipts.sort_by_key(|r| r["id"].as_str().and_then(|id| id.parse::<u64>().ok()));
+    // The review has finished, so an attempt still marked running was cut short.
+    for receipt in &mut receipts {
+        if receipt["status"] == "running" {
+            receipt["status"] = json!("interrupted");
+        }
+    }
     let count = |kind: &str| {
         let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
         for receipt in receipts.iter().filter(|r| r["kind"] == kind) {
@@ -609,7 +645,7 @@ pub async fn diagnostics(worker: &Value) -> Result<Option<Value>> {
             format!("Needs cgroup v2 with cpu, memory and pids delegated to this user; missing: {}", missing.join(", "))
         },
     }));
-    let seccomp = seccomp::profile(&config.podman, &env).await;
+    let seccomp = seccomp::derive(&host);
     checks.push(json!({
         "name": "Namespace blocking",
         "ok": seccomp.is_ok(),
@@ -670,6 +706,14 @@ mod tests {
             TOOL_NAMES.iter().map(|n| json!(n)).collect::<Vec<_>>()
         );
     }
+    #[test]
+    fn the_policy_carries_the_workers_podman_environment() {
+        let worker = json!({"execution":{"repositories":{"owner/repo":{}}}});
+        let policy = resolve(&worker, "owner/repo", true).unwrap().unwrap();
+        assert_eq!(policy["env"], json!(podman_env()));
+        assert!(policy["env"].get("GH_TOKEN").is_none());
+        assert!(policy["env"].get("CONTAINER_HOST").is_none());
+    }
     #[cfg(unix)]
     #[tokio::test]
     async fn shutdown_stops_a_runtime_image_build() {
@@ -720,6 +764,7 @@ mod tests {
                 "Run cart tests\nwith a newline",
             ),
             ("3", "test", "base", "passed", "Run cart tests"),
+            ("4", "test", "head", "running", "Cut short"),
         ] {
             crate::util::atomic(
                 &experiments.join(format!("{id}.json")),
@@ -728,7 +773,11 @@ mod tests {
             .unwrap();
         }
         let text = summary(dir.path()).unwrap();
-        assert!(text.contains("Tests: 1 failed, 1 passed."), "{text}");
+        assert!(
+            text.contains("Tests: 1 failed, 1 interrupted, 1 passed."),
+            "{text}"
+        );
+        assert!(text.contains("- interrupted, PR version: Cut short"));
         assert!(text.contains("Setup: 1 passed."));
         assert!(text.contains("- failed, PR version: Run cart tests"));
         assert!(text.contains("- passed, before the PR: Run cart tests"));

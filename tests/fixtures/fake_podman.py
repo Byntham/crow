@@ -11,6 +11,8 @@ state = os.environ["FAKE_PODMAN_STATE"]
 args = sys.argv[1:]
 with open(os.path.join(state, "calls.jsonl"), "a") as log:
     log.write(json.dumps(args) + "\n")
+with open(os.path.join(state, "homes"), "a") as log:
+    log.write(os.environ.get("HOME", "") + "\n")
 
 
 def workspace(name):
@@ -33,7 +35,7 @@ if command == "info":  # the default seccomp profile Crow derives its own from
     with open(profile, "w") as out:
         json.dump({"defaultAction": "SCMP_ACT_ERRNO", "syscalls": [
             {"names": ["read", "clone", "clone3", "unshare"], "action": "SCMP_ACT_ALLOW"}]}, out)
-    print(profile)
+    print(json.dumps({"host": {"security": {"rootless": True, "seccompProfilePath": profile}}}))
     sys.exit(0)
 if command == "image" and args[1] == "exists":
     sys.exit(0 if os.path.exists(os.path.join(state, "image")) else 1)

@@ -361,7 +361,16 @@ impl Gateway {
                     _ = cancelled.cancelled() => break,
                     Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
                     incoming = listener.accept() => {
-                        let Ok((mut stream,_)) = incoming else {break};
+                        // Errors such as running out of file descriptors pass;
+                        // only closing the gateway stops it.
+                        let mut stream = match incoming {
+                            Ok((stream, _)) => stream,
+                            Err(error) => {
+                                remember_error(&task_errors, &format!("Package gateway could not accept a connection: {error}"));
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                continue;
+                            }
+                        };
                         // At most one accepted stream waits for capacity. The
                         // remaining requests stay in the bounded socket backlog.
                         // Only real waiting demand enables idle reclamation.

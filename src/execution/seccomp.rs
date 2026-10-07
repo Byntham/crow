@@ -5,23 +5,19 @@
 //! libc falls back to `clone`, and `clone` is allowed only without namespace flags.
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, path::Path};
+use std::path::Path;
 
 const NAMESPACE_SYSCALLS: &[&str] = &["clone", "clone3", "unshare", "setns"];
 /// CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET
 const NAMESPACE_FLAGS: u64 = 0x7E02_0000;
 const ENOSYS: u64 = 38;
 
-/// Crow's profile, derived from the one Podman applies by default.
-pub(super) async fn profile(podman: &str, env: &BTreeMap<String, String>) -> Result<Value> {
-    let info = super::podman(
-        podman,
-        env,
-        &["info", "--format={{.Host.Security.SECCOMPProfilePath}}"],
-        true,
-    )
-    .await?;
-    let path = info.stdout.trim();
+/// Crow's profile, derived from the one Podman applies by default, which
+/// `podman info` reports as `host.security.seccompProfilePath`.
+pub(super) fn derive(host: &Value) -> Result<Value> {
+    let path = host["security"]["seccompProfilePath"]
+        .as_str()
+        .unwrap_or("");
     ensure!(
         !path.is_empty(),
         "Podman reports no seccomp profile file to derive Crow's profile from"

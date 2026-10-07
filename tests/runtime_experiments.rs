@@ -231,7 +231,7 @@ async fn experiments_prepare_reuse_and_account_for_every_attempt() {
 }
 
 #[tokio::test]
-async fn mcp_answers_during_an_experiment_and_refuses_a_second_one() {
+async fn mcp_helper_uses_the_workers_podman_and_refuses_a_second_experiment() {
     use std::{process::Stdio, time::Duration};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let dir = tempfile::tempdir().unwrap();
@@ -239,21 +239,32 @@ async fn mcp_answers_during_an_experiment_and_refuses_a_second_one() {
     let source = source(root);
     let podman = fake_podman(root);
     std::fs::write(root.join("podman/image"), "").unwrap();
+    // The worker resolves the policy in its own environment.
+    let worker = json!({"execution": {
+        "podman": podman,
+        "repositories": {"owner/repo": {"timeoutSeconds": 30, "maxRuns": 5}},
+    }});
+    let policy = crow::execution::resolve(&worker, "owner/repo", true)
+        .unwrap()
+        .unwrap();
     let context = json!({
         "root": root,
-        "job": {"id": "review1", "settings": {"execution": {
-            "podman": podman,
-            "limits": {"timeoutSeconds": 30, "maxRuns": 5},
-        }}},
+        "job": {"id": "review1", "settings": {"execution": policy}},
         "source": source,
     });
     let (source_file, context_file) = (root.join("source.json"), root.join("context.json"));
     std::fs::write(&source_file, source.to_string()).unwrap();
     std::fs::write(&context_file, context.to_string()).unwrap();
+    // Providers start the helper with Crow's isolated environment, as here.
+    let isolated = root.join("provider-home");
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_crow"))
         .arg("_inspection-mcp")
         .arg(&source_file)
         .arg(&context_file)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &isolated)
+        .env("XDG_DATA_HOME", isolated.join(".local/share"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -314,6 +325,10 @@ async fn mcp_answers_during_an_experiment_and_refuses_a_second_one() {
         let info: Value =
             serde_json::from_str(info["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(info["attempts"]["used"], 1);
+        // Podman ran in the worker's environment, not the helper's.
+        let homes = std::fs::read_to_string(root.join("podman/homes")).unwrap();
+        let worker_home = std::env::var("HOME").unwrap();
+        assert!(homes.lines().all(|home| home == worker_home), "{homes}");
     };
     tokio::time::timeout(Duration::from_secs(30), test)
         .await

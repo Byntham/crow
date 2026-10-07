@@ -88,9 +88,7 @@ async fn run(execution: &Execution, tool: &str, revision: &str, command: &str) -
     execution.call(tool, &args).await.unwrap()
 }
 
-#[tokio::test]
-#[ignore = "requires rootless Podman and network access to build the runtime image"]
-async fn real_podman_isolates_experiments() {
+async fn ensure_image() {
     let env = crow::execution::podman_env();
     if !crow::execution::image::exists("podman", &env)
         .await
@@ -101,6 +99,12 @@ async fn real_podman_isolates_experiments() {
             .await
             .unwrap();
     }
+}
+
+#[tokio::test]
+#[ignore = "requires rootless Podman and network access to build the runtime image"]
+async fn real_podman_isolates_experiments() {
+    ensure_image().await;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let context = json!({
@@ -183,4 +187,67 @@ async fn real_podman_isolates_experiments() {
         .output()
         .unwrap();
     assert!(String::from_utf8_lossy(&listed.stdout).trim().is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires rootless Podman and network access to build the runtime image"]
+async fn real_podman_runs_through_the_helper_a_provider_starts() {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    ensure_image().await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let source = source(root);
+    let worker = json!({"execution": {"repositories": {"owner/repo": {"timeoutSeconds": 120}}}});
+    let policy = crow::execution::resolve(&worker, "owner/repo", true)
+        .unwrap()
+        .unwrap();
+    let context = json!({
+        "root": root,
+        "job": {"id": "podmanhelper", "settings": {"execution": policy}},
+        "source": source,
+    });
+    let (source_file, context_file) = (root.join("source.json"), root.join("context.json"));
+    std::fs::write(&source_file, source.to_string()).unwrap();
+    std::fs::write(&context_file, context.to_string()).unwrap();
+    // The same isolated environment Crow gives Claude Code and Codex, which
+    // pass it on to the helper: another HOME, no runtime directory or D-Bus.
+    let home = root.join("provider-home");
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_crow"))
+        .arg("_inspection-mcp")
+        .arg(&source_file)
+        .arg(&context_file)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap())
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut call = async |name: &str, arguments: Value| -> Value {
+        let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":arguments}});
+        input
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+        let response: Value =
+            serde_json::from_str(&output.next_line().await.unwrap().unwrap()).unwrap();
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        serde_json::from_str(text).unwrap_or_else(|_| panic!("{text}"))
+    };
+    let info = call("runtime_info", json!({})).await;
+    assert_eq!(info["imageReady"], true, "{info}");
+    let ran = call(
+        "run_experiment",
+        json!({"revision": "head", "command": "test -f check.js", "purpose": "helper"}),
+    )
+    .await;
+    assert_eq!(ran["status"], "passed", "{ran}");
 }

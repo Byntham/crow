@@ -17,7 +17,7 @@ It covers durable receipts and jobs, separate worker/admin authentication, inspe
 cargo test --locked --test runtime_podman -- --ignored --test-threads=1
 ```
 
-That test checks the non-root user, empty capabilities, `no_new_privs`, that `unshare`, `clone` and `clone3` cannot create a user namespace while threads still work, the read-only root, the lack of network in tests, the gateway's allowlist, offline use of a prepared dependency, and container removal.
+`real_podman_isolates_experiments` checks the non-root user, empty capabilities, `no_new_privs`, that `unshare`, `clone` and `clone3` cannot create a user namespace while threads still work, the read-only root, the lack of network in tests, the gateway's allowlist, offline use of a prepared dependency, and container removal. `real_podman_runs_through_the_helper_a_provider_starts` runs experiments through the MCP helper with the isolated environment providers give it, which only works because the worker passes Podman's environment with the policy.
 
 ## Installed Codex probes
 
