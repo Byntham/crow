@@ -855,7 +855,12 @@ impl Review {
             if key == "tool_timeout_sec" && expected.is_null() {
                 continue;
             }
-            if &inspection[key] != expected {
+            // Codex reports timeouts as floating-point seconds, such as 420.0.
+            let applied = match expected.as_f64() {
+                Some(seconds) => inspection[key].as_f64() == Some(seconds),
+                None => &inspection[key] == expected,
+            };
+            if !applied {
                 return Err(failure(
                     "config",
                     "Codex did not apply the controlled Crow inspection helper.",
@@ -1178,6 +1183,13 @@ mod tests {
             .unwrap();
         assert!(tools.contains("\"run_experiment\""), "{tools}");
         assert!(text(&invocation, "prompt").contains("Runtime tools are available"));
+        // Codex reports 600.0 for 600; a timeout it did not apply is refused.
+        let mut short = Fixture::new(json!({"shortToolTimeout": true}));
+        short.job["settings"]["execution"] = f.job["settings"]["execution"].clone();
+        assert_eq!(
+            classify_error(&short.run().await.unwrap_err()).kind,
+            "config"
+        );
     }
     #[tokio::test]
     async fn provider_failure_keeps_classification_and_retry_delay() {

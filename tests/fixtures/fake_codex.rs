@@ -78,6 +78,16 @@ fn main() {
                         }
                         target[parts[parts.len() - 1]] = value;
                     }
+                    // Like Codex 0.160, report MCP timeouts as floating-point seconds.
+                    if let Some(servers) = config["mcp_servers"].as_object_mut() {
+                        for server in servers.values_mut() {
+                            for key in ["startup_timeout_sec", "tool_timeout_sec"] {
+                                if let Some(seconds) = server.get(key).and_then(Value::as_f64) {
+                                    server[key] = json!(seconds);
+                                }
+                            }
+                        }
+                    }
                     if behavior["unsafe"] == true {
                         config["mcp_servers"]["unexpected"] = json!({"command":"bad"});
                     }
@@ -86,6 +96,9 @@ fn main() {
                     }
                     if behavior["wrongModel"] == true {
                         config["model"] = json!("other");
+                    }
+                    if behavior["shortToolTimeout"] == true {
+                        config["mcp_servers"]["crow_inspection"]["tool_timeout_sec"] = json!(60.0);
                     }
                     send(json!({"id":id,"result":{"config":config}}));
                 }

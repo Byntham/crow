@@ -12,6 +12,8 @@ A review can run code only when all of these hold:
 
 Anything else is reviewed by inspection only, as before. A PR, its review guidance and the connection service cannot turn execution on. Delegated subagents never run code.
 
+Crow checks who opened the PR, not who pushed each commit. Anyone with write access to the repository can add commits to a PR's branch. Only turn this on for repositories where you would let everyone with write access, including bots, run code on this machine.
+
 ## Turn it on
 
 The worker needs rootless Podman, with cgroup v2 and the cpu, memory and pids controllers delegated to your user. On Ubuntu or Debian:
