@@ -743,6 +743,10 @@ impl Service {
         bot_id: i64,
     ) -> Result<Value> {
         let body = comment_body(j, &saved);
+        // An unchanged comment needs no edit, which would only add a revision.
+        if saved["id"].is_i64() && s(&saved, "body") == body {
+            return Ok(saved);
+        }
         let result = self
             .github
             .status(
@@ -771,8 +775,8 @@ impl Service {
         Ok(record)
     }
     /// Write `j`'s report into the PR's comment. `records` are the PR's
-    /// findings after it, and `review` holds its new findings inline. Hold the
-    /// comment's lock.
+    /// findings after it, and `review` holds its new findings inline. `done`
+    /// says that nothing is left to post. Hold the comment's lock.
     async fn write_report(
         &self,
         repo: &Value,
@@ -780,13 +784,13 @@ impl Service {
         j: &Value,
         records: &[Value],
         review: Option<&str>,
-        bot: Option<i64>,
+        done: bool,
     ) -> Result<Value> {
         let key = s(j, "key");
         let saved = self.get("status", key)?.unwrap_or_else(|| json!({}));
         let mut shown = self.latest(key)?.unwrap_or_else(|| j.clone());
         // This publication completes the job.
-        if shown["id"] == j["id"] && s(&shown, "state") == "publishing" {
+        if done && shown["id"] == j["id"] && s(&shown, "state") == "publishing" {
             shown["state"] = json!("completed");
         }
         let published = report::add_published(&saved["published"], j, review);
@@ -800,8 +804,8 @@ impl Service {
                 "published": published,
             }),
         );
-        self.write_comment(repo, token, &shown, saved, bot.unwrap_or(0))
-            .await
+        let bot = self.config["app"]["botId"].as_i64().unwrap_or(0);
+        self.write_comment(repo, token, &shown, saved, bot).await
     }
     async fn status(&self, j: &Value) -> Result<()> {
         let Some(bot_id) = self.config["app"]["botId"].as_i64().filter(|x| *x > 0) else {
@@ -892,10 +896,10 @@ impl Service {
         // comments follow and point to it, and then the comment links them.
         let mut records =
             report::record_findings(&j["report"], history.clone(), &anchored, review.as_deref());
-        let comment = self
-            .write_report(&repo, &token, j, &records, review.as_deref(), bot)
-            .await?;
         let inline = review.is_none() && !anchored.is_empty();
+        let comment = self
+            .write_report(&repo, &token, j, &records, review.as_deref(), !inline)
+            .await?;
         if inline {
             let posted = self
                 .github
@@ -925,7 +929,7 @@ impl Service {
             })
         })?;
         if inline {
-            self.write_report(&repo, &token, j, &records, review.as_deref(), bot)
+            self.write_report(&repo, &token, j, &records, review.as_deref(), true)
                 .await?;
         }
         let current = self
@@ -1652,7 +1656,7 @@ impl Service {
                 let patch = s(a, "patch").chars().take(1000000).collect::<String>();
                 self.update(
                     id,
-                    json!({"report":report,"patch":patch,"state":"publishing","reason":null}),
+                    json!({"report":report,"patch":patch,"state":"publishing","reason":null,"reportedAt":now()}),
                     Some(lease),
                 )?;
                 Ok(json!({"ok":true}))
@@ -2414,6 +2418,8 @@ mod tests {
         fail_publish: AtomicBool,
         /// Fails the nth publication call from now, counting from one.
         fail_nth: AtomicUsize,
+        /// Fails every inline review.
+        fail_reviews: AtomicBool,
         fail_pr: AtomicBool,
         pr_calls: AtomicUsize,
         threads: Mutex<HashSet<std::thread::ThreadId>>,
@@ -2527,6 +2533,9 @@ mod tests {
             comments: &[Value],
         ) -> Result<Value> {
             self.publication().await?;
+            if self.fail_reviews.load(Ordering::Relaxed) {
+                bail!("Unprocessable review comment");
+            }
             let mut published = self.published.lock().unwrap();
             published.push(json!({"number":number,"body":body,"head":head,"comments":comments}));
             let url = format!(
@@ -4167,6 +4176,48 @@ mod tests {
             f.github
                 .comment()
                 .contains(&format!("#L2) · [Thread]({review})"))
+        );
+        f.close().await;
+    }
+    #[tokio::test]
+    async fn a_failing_inline_review_leaves_the_comment_settled() {
+        let f = Fixture::new().await;
+        let j = f.prepared().await;
+        f.report_finding(&j).await;
+        f.github.fail_reviews.store(true, Ordering::Relaxed);
+        let mut writes = Vec::new();
+        for _ in 0..4 {
+            f.handle
+                .service
+                .update(s(&j, "id"), json!({"publishAt":0}), None)
+                .unwrap();
+            f.publish_tick().await;
+            let job = f.job(s(&j, "id"));
+            let service = f.handle.service.clone();
+            f.handle
+                .execute(async move { service.status(&job).await })
+                .await
+                .unwrap();
+            writes.push(f.github.written.lock().unwrap().len());
+        }
+        // The report, then once the failure's reason; later retries change nothing.
+        assert_eq!(writes, [1, 2, 2, 2]);
+        let comment = f.github.comment();
+        assert!(comment.contains("### 🔄 Publishing the review of"));
+        assert!(comment.contains("GitHub publication failed"));
+        assert!(comment.contains("<summary>Previous report: 🟠 1 finding on"));
+        f.github.fail_reviews.store(false, Ordering::Relaxed);
+        f.handle
+            .service
+            .update(s(&j, "id"), json!({"publishAt":0}), None)
+            .unwrap();
+        f.publish_tick().await;
+        assert_eq!(f.job(s(&j, "id"))["state"], "completed");
+        let comment = f.github.comment();
+        assert!(comment.contains("### 🟠 1 finding on"));
+        assert!(
+            comment
+                .contains("[Thread](https://github.com/owner/project/pull/1#pullrequestreview-1)")
         );
         f.close().await;
     }

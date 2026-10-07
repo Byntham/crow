@@ -413,8 +413,9 @@ fn render(job: &Value, records: &[Value], published: &Value, links: bool) -> Str
     if let Some(trigger) = job["trigger"].as_str().filter(|t| !t.is_empty()) {
         about.push(trigger.to_owned());
     }
-    // When the review finished.
-    about.extend(when(job["updatedAt"].as_i64().unwrap_or(0)));
+    // When the review finished, which stays the same while publication retries.
+    let finished = job.get("reportedAt").unwrap_or(&job["updatedAt"]);
+    about.extend(when(finished.as_i64().unwrap_or(0)));
     blocks.push(format!("<sub>{}</sub>", about.join(" · ")));
     format!("{}\n{}", marker(&meta(job)), blocks.join("\n\n"))
 }
