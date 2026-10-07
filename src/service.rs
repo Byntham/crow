@@ -743,8 +743,10 @@ impl Service {
         bot_id: i64,
     ) -> Result<Value> {
         let body = comment_body(j, &saved);
-        // An unchanged comment needs no edit, which would only add a revision.
+        // An unchanged comment needs no edit, which would only add a revision,
+        // but what it shows next time may still have changed.
         if saved["id"].is_i64() && s(&saved, "body") == body {
+            self.db(|db| db.put("status", s(j, "key"), &saved))?;
             return Ok(saved);
         }
         let result = self
@@ -4219,6 +4221,28 @@ mod tests {
             comment
                 .contains("[Thread](https://github.com/owner/project/pull/1#pullrequestreview-1)")
         );
+        f.close().await;
+    }
+    #[tokio::test]
+    async fn an_unchanged_comment_still_saves_its_record() {
+        let f = Fixture::new().await;
+        f.queue().await;
+        let j = f.claim().await;
+        let mut saved = json!({"id":1,"url":COMMENT,"layout":2});
+        saved["body"] = json!(comment_body(&j, &saved));
+        // Recorded for the history row, which this comment doesn't show.
+        let next = patch(saved, &json!({"published":{"count":1}}));
+        let repo = f.handle.service.repo("owner/project").unwrap();
+        let service = f.handle.service.clone();
+        let job = j.clone();
+        let written = f
+            .handle
+            .execute(async move { service.write_comment(&repo, "token", &job, next, 42).await })
+            .await
+            .unwrap();
+        assert_eq!(written["published"]["count"], 1);
+        let record = f.handle.service.get("status", s(&j, "key")).unwrap();
+        assert_eq!(record.unwrap()["published"]["count"], 1);
         f.close().await;
     }
     #[tokio::test]
