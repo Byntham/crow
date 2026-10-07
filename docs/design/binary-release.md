@@ -16,7 +16,7 @@ Cargo embeds the version from `Cargo.toml`. The private `_inspection-mcp` comman
 
 `dist-release` receives `crow-vVERSION-linux-x64.tar.gz` or `crow-vVERSION-linux-arm64.tar.gz`, plus `SHA256SUMS` and build metadata. Archives contain `crow` and `THIRD_PARTY_NOTICES`. Each architecture builds and tests natively in GitHub Actions. Version tags must match `Cargo.toml`.
 
-Builds produce private workflow artifacts. A separate manual publication workflow verifies the selected build's source and version, uploads immutable objects, verifies public downloads, and updates `latest.txt` last. Website deployment is also manual. See [hosted distribution](../maintainer/hosted-distribution.md).
+Builds only produce workflow artifacts. A separate manual publication workflow verifies the selected build's source and version, uploads immutable objects, verifies public downloads, and updates `latest.txt` last. Website deployment is also manual. See [hosted distribution](../maintainer/hosted-distribution.md).
 
 ## Runtime verification
 

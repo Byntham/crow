@@ -12,7 +12,7 @@ The hosted installer is live at `birdapp.dev`. Install with:
 curl -fsSL https://birdapp.dev/install.sh | sh
 ```
 
-The installer downloads and verifies the Linux binary, installs a permanent command, and offers to start setup. Downloads are public; access to Crow's private source repository is not required. The executable is compiled from Rust, so users do not need a language runtime or a checkout. See [installation](docs/user/install.md) for install-only mode and the source installation alternative.
+The installer downloads and verifies the Linux binary, installs a permanent command, and offers to start setup. The executable is compiled from Rust, so users do not need a language runtime or a checkout. See [installation](docs/user/install.md) for install-only mode and the source installation alternative.
 
 Setup installs the executable and defaults to running both the connection service and worker on this machine. It guides Tailscale Funnel, creation or connection of your own GitHub App, repository selection, the choice of review provider and a separate subscription login for it, and persistent systemd startup. Missing supported Linux dependencies can be installed with your confirmation. Browser steps print URLs you can open on a separate desktop. No browser is required on the host.
 

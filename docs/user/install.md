@@ -1,6 +1,6 @@
 # Install Crow on Linux
 
-Crow's hosted installer downloads a native Linux executable compiled from Rust. Users do not need the source repository or a language runtime. The installer and binaries are public even while the source repository is private.
+Crow's hosted installer downloads a native Linux executable compiled from Rust. Users do not need the source repository or a language runtime.
 
 The hosted installer is live at `https://birdapp.dev/install.sh`, with releases at `https://downloads.birdapp.dev`.
 
