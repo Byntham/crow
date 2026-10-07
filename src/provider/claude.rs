@@ -93,11 +93,19 @@ pub(super) fn environment(settings: &Value, root: &Path) -> Result<Environment> 
     for (key, value) in ENVIRONMENT {
         env.insert((*key).into(), (*value).into());
     }
-    if let Some(certificates) = std::env::var_os("NODE_EXTRA_CA_CERTS") {
-        env.insert(
-            "NODE_EXTRA_CA_CERTS".into(),
-            certificates.to_string_lossy().into_owned(),
-        );
+    // Network settings Claude Code needs to reach Anthropic from this host.
+    for key in [
+        "NODE_EXTRA_CA_CERTS",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ] {
+        if let Some(value) = std::env::var_os(key).filter(|v| !v.is_empty()) {
+            env.insert(key.into(), value.to_string_lossy().into_owned());
+        }
     }
     Ok(Environment {
         env,
