@@ -50,7 +50,7 @@ For example, `{"repositories":{"owner/repo":{"timeoutSeconds":600,"maxRuns":20}}
 
 The reviewer decides whether running code would help. It prepares an environment for the PR version or the merge base with a setup command, such as `npm ci` or `pip install -e .`. Setup can download from public package registries (npm, PyPI, crates.io, the Go module proxy, Maven Central and RubyGems) through Crow's gateway; nothing else is reachable. Each gateway connection lasts at most `timeoutSeconds`, can download at most `workspaceMiB` and upload at most 16 MiB. A successful setup is saved, and later commands for that version start from it. Each command runs in a fresh container with no network, and files it creates are discarded afterwards.
 
-The published review ends with a short list of what ran and how it went. Failed commands include the reviewer's own investigation attempts and checks that also fail before the PR, so a failure there is not by itself a finding. Command output stays on the worker in `reviews/<job>/experiments/`, which follows the normal retention period. Prepared environments are deleted when the review finishes.
+The published report ends with a short list of what ran and how it went. Failed commands include the reviewer's own investigation attempts and checks that also fail before the PR, so a failure there is not by itself a finding. Command output stays on the worker in `reviews/<job>/experiments/`, which follows the normal retention period. Prepared environments are deleted when the review finishes.
 
 ## What the sandbox protects
 

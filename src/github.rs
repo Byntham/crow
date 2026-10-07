@@ -130,7 +130,15 @@ fn comment(v: Value) -> Result<Value> {
         Some(b) => string(b)?,
         None => "",
     };
-    Ok(json!({"id": integer(&v["id"])?, "body": body, "user": author(user)?}))
+    Ok(json!({
+        "id": integer(&v["id"])?,
+        "body": body,
+        "user": author(user)?,
+        "html_url": v["html_url"].as_str(),
+    }))
+}
+fn comment_url(v: &Value) -> Result<Value> {
+    Ok(json!({"id":integer(&v["id"])?,"html_url":string(&v["html_url"])?}))
 }
 fn review(v: Value) -> Result<Value> {
     let obj = object(&v)?;
@@ -631,7 +639,7 @@ impl GitHubApi for GitHub {
                 )
                 .await
             {
-                Ok(result) => return Ok(json!({"id":integer(&result["id"])?})),
+                Ok(result) => return comment_url(&result),
                 Err(e)
                     if e.downcast_ref::<GitHubError>()
                         .is_some_and(|e| e.status == 404) => {}
@@ -646,7 +654,7 @@ impl GitHubApi for GitHub {
                 Some(&body),
             )
             .await?;
-        Ok(json!({"id":integer(&result["id"])?}))
+        comment_url(&result)
     }
     async fn publish(
         &self,
@@ -852,7 +860,7 @@ mod tests {
         m.json(json!([{"id":1,"user":null}]));
         assert_eq!(
             gh.comments(&repo(), 3, "token").await.unwrap(),
-            vec![json!({"id":1,"user":null,"body":""})]
+            vec![json!({"id":1,"user":null,"body":"","html_url":null})]
         );
         m.json(json!([{"id":1,"user":null,"body":null,"html_url":"https://example.com/review"}]));
         assert_eq!(
@@ -1079,12 +1087,13 @@ mod tests {
         let (gh, m, h) = mock(None).await;
         m.json(json!([{"id":1,"user":null,"body":"<!-- crow-status:v1 --> forged"},{"id":2,"user":{"id":999},"body":"<!-- crow-status:v1 --> forged"},{"id":3,"user":{"id":42},"body":"<!-- crow-status:v1 --> current"}]));
         m.push(404, HeaderMap::new(), json!({}));
-        m.json(json!({"id":4}));
+        let url = "https://github.com/owner/project/pull/3#issuecomment-4";
+        m.json(json!({"id":4,"html_url":url}));
         assert_eq!(
             gh.status(&repo(), 3, "token", "updated", 42, None)
                 .await
                 .unwrap(),
-            json!({"id":4})
+            json!({"id":4,"html_url":url})
         );
         let calls = m.calls.lock().unwrap();
         assert_eq!(calls[1].method, "PATCH");

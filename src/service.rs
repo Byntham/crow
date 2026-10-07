@@ -163,6 +163,74 @@ fn can_resume(j: &Value) -> bool {
         _ => false,
     }
 }
+/// The PR's one Crow comment. A completed review shows its report; any other
+/// state shows above the last published report, folded. `saved` holds that
+/// report.
+fn comment_body(j: &Value, saved: &Value) -> String {
+    let state = s(j, "state");
+    let head = report::commit(s(j, "repo"), s(j, "head"));
+    let report = saved["report"].as_str();
+    // The same commit may have been reviewed against another base or target.
+    let current = saved["reportComparison"].as_str() == Some(&comparison_key(&j["comparison"]));
+    if let Some(report) = report.filter(|_| state == "completed" && current) {
+        return format!(
+            "<!-- crow-status:v1 -->\n### {} on {head}\n\n{report}",
+            s(saved, "outcome")
+        );
+    }
+    let (icon, doing) = match state {
+        "queued" | "held" => ("⏳", "Waiting to review"),
+        "reviewing" => ("🔄", "Reviewing"),
+        "retrying" => ("🔄", "Retrying the review of"),
+        "publishing" => ("🔄", "Publishing the review of"),
+        "paused" => ("⏸️", "Paused on"),
+        "completed" => ("✅", "Reviewed"),
+        "superseded" => ("⏭️", "Superseded"),
+        _ => ("⏹️", "Not reviewing"),
+    };
+    let mut about = j["trigger"]
+        .as_str()
+        .filter(|x| !x.is_empty())
+        .unwrap_or(if b(j, "manual") {
+            "Manual request"
+        } else {
+            "Pull request event"
+        })
+        .to_owned();
+    if let Some(at) = report::when(n(j, "startedAt")).filter(|_| state == "reviewing") {
+        about.push_str(&format!(" · started {at}"));
+    }
+    let mut body =
+        format!("<!-- crow-status:v1 -->\n### {icon} {doing} {head}\n\n<sub>{about}</sub>");
+    if !s(j, "reason").is_empty() {
+        body.push_str(&format!("\n\n{}", s(j, "reason")));
+    }
+    // A review published before reports moved into this comment.
+    if !s(j, "reviewUrl").is_empty() && j["reviewUrl"] != saved["url"] {
+        body.push_str(&format!("\n\n[Read review]({})", s(j, "reviewUrl")));
+    } else if state == "completed" {
+        // Such as after a force-push back to a reviewed commit.
+        body.push_str(
+            "\n\nCrow reviewed this commit earlier. Its report is in this comment's edit history.",
+        );
+    }
+    if state == "paused" {
+        let restart_only = s(j, "reason").starts_with("Restart required");
+        body.push_str(if can_resume(j) && !restart_only {
+            "\n\nComment `/crow resume` to continue saved work, or `/crow restart` to start again."
+        } else {
+            "\n\nComment `/crow restart` to start the review again."
+        });
+    }
+    if let Some(report) = report {
+        body.push_str(&format!(
+            "\n\n<details>\n<summary>Previous report: {} on <code>{}</code></summary>\n\n{report}\n</details>",
+            s(saved, "outcome"),
+            report::short(s(saved, "reportHead"))
+        ));
+    }
+    body
+}
 fn comparison_key(c: &Value) -> String {
     format!("{}:{}:{}", s(c, "head"), s(c, "target"), s(c, "base"))
 }
@@ -225,6 +293,7 @@ struct Service {
     store: Mutex<Store>,
     github: Arc<dyn GitHubApi>,
     scans: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    comments: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     shutdown: CancellationToken,
 }
 impl Service {
@@ -654,6 +723,92 @@ impl Service {
         }
         Ok(())
     }
+    /// One PR's comment writes, which must not interleave.
+    fn comment_lock(&self, key: &str) -> Result<Arc<AsyncMutex<()>>> {
+        Ok(self
+            .comments
+            .lock()
+            .map_err(|_| anyhow!("Comment lock poisoned"))?
+            .entry(key.to_owned())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone())
+    }
+    /// Write the PR's comment and save what it shows. Hold its lock.
+    async fn write_comment(
+        &self,
+        repo: &Value,
+        token: &str,
+        j: &Value,
+        saved: Value,
+        bot_id: i64,
+    ) -> Result<Value> {
+        let body = comment_body(j, &saved);
+        // An unchanged comment needs no edit, which would only add a revision,
+        // but what it shows next time may still have changed.
+        if saved["id"].is_i64() && s(&saved, "body") == body {
+            self.db(|db| db.put("status", s(j, "key"), &saved))?;
+            return Ok(saved);
+        }
+        let result = self
+            .github
+            .status(
+                repo,
+                n(j, "number"),
+                token,
+                &body,
+                bot_id,
+                saved["id"].as_i64(),
+            )
+            .await?;
+        let record = patch(
+            saved,
+            &json!({
+                "id": result["id"],
+                "url": result["html_url"],
+                "body": body,
+                "state": j["state"],
+                "trigger": j["trigger"],
+                "head": j["head"],
+                "updatedAt": now(),
+                "layout": 2,
+            }),
+        );
+        self.db(|db| db.put("status", s(j, "key"), &record))?;
+        Ok(record)
+    }
+    /// Write `j`'s report into the PR's comment. `records` are the PR's
+    /// findings after it, and `review` holds its new findings inline. `done`
+    /// says that nothing is left to post. Hold the comment's lock.
+    async fn write_report(
+        &self,
+        repo: &Value,
+        token: &str,
+        j: &Value,
+        records: &[Value],
+        review: Option<&str>,
+        done: bool,
+    ) -> Result<Value> {
+        let key = s(j, "key");
+        let saved = self.get("status", key)?.unwrap_or_else(|| json!({}));
+        let mut shown = self.latest(key)?.unwrap_or_else(|| j.clone());
+        // This publication completes the job.
+        if done && shown["id"] == j["id"] && s(&shown, "state") == "publishing" {
+            shown["state"] = json!("completed");
+        }
+        let published = report::add_published(&saved["published"], j, review);
+        let saved = patch(
+            saved,
+            &json!({
+                "report": report::report_body(j, records, &published)?,
+                "outcome": report::outcome(&j["report"]),
+                "reportHead": j["head"],
+                "reportComparison": comparison_key(&j["comparison"]),
+                "published": published,
+            }),
+        );
+        let bot = self.config["app"]["botId"].as_i64().unwrap_or(0);
+        self.write_comment(repo, token, &shown, saved, bot).await
+    }
     async fn status(&self, j: &Value) -> Result<()> {
         let Some(bot_id) = self.config["app"]["botId"].as_i64().filter(|x| *x > 0) else {
             return Ok(());
@@ -661,85 +816,31 @@ impl Service {
         let Some(repo) = self.get("repos", s(j, "repo"))? else {
             return Ok(());
         };
-        if self.latest(s(j, "key"))?.is_none_or(|x| x["id"] != j["id"]) {
-            return Ok(());
-        }
-        let state = s(j, "state");
-        let icon = match state {
-            "completed" => "✅",
-            "paused" => "⏸️",
-            "cancelled" => "❌",
-            _ => "🔄",
-        };
-        let title = format!(
-            "{}{}",
-            state.get(..1).unwrap_or("").to_uppercase(),
-            state.get(1..).unwrap_or("")
-        );
-        let head = s(j, "head");
-        let trigger =
-            j["trigger"]
-                .as_str()
-                .filter(|x| !x.is_empty())
-                .unwrap_or(if b(j, "manual") {
-                    "Manual request"
-                } else {
-                    "Pull request event"
-                });
-        let date = chrono::DateTime::from_timestamp_millis(n(j, "updatedAt"))
-            .unwrap_or_default()
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        let mut body = format!(
-            "<!-- crow-status:v1 -->\n| Status | Commit | Review trigger |\n| --- | --- | --- |\n| {icon} {title} | [{}](https://github.com/{}/commit/{head}) | {trigger} |\n\nUpdated {date}.",
-            head.get(..8).unwrap_or(head),
-            s(j, "repo")
-        );
-        if !s(j, "reason").is_empty() {
-            body.push_str(&format!("\n\n{}", s(j, "reason")));
-        }
-        if !s(j, "reviewUrl").is_empty() {
-            body.push_str(&format!("\n\n[Read review]({})", s(j, "reviewUrl")));
-        }
-        if state == "paused" {
-            let restart_only = s(j, "reason").starts_with("Restart required");
-            body.push_str(if can_resume(j) && !restart_only {
-                "\n\nComment `/crow resume` to continue saved work, or `/crow restart` to start again."
-            } else {
-                "\n\nComment `/crow restart` to start the review again."
-            });
-        }
         let key = s(j, "key");
-        let prev = self.get("status", key)?;
-        if prev.as_ref().is_some_and(|p| {
-            s(p, "body") == body
-                || (p["state"] == j["state"]
-                    && p["trigger"] == j["trigger"]
-                    && p["head"] == j["head"]
-                    && now() - n(p, "updatedAt") < 60000)
-        }) {
+        let lock = self.comment_lock(key)?;
+        // A publication is writing the comment; the next tick catches up.
+        let Ok(_guard) = lock.try_lock() else {
+            return Ok(());
+        };
+        let Some(j) = self.latest(key)?.filter(|x| x["id"] == j["id"]) else {
+            return Ok(());
+        };
+        let saved = self.get("status", key)?.unwrap_or_else(|| json!({}));
+        // Comments from earlier releases keep their final state, rather than
+        // every past PR's comment being rewritten at once after an upgrade.
+        let finished = matches!(s(&j, "state"), "completed" | "cancelled" | "superseded");
+        if (finished && saved.get("body").is_some() && saved.get("layout").is_none())
+            || s(&saved, "body") == comment_body(&j, &saved)
+            || (saved["state"] == j["state"]
+                && saved["trigger"] == j["trigger"]
+                && saved["head"] == j["head"]
+                && now() - n(&saved, "updatedAt") < 60000)
+        {
             return Ok(());
         }
         let token = self.github.token(&repo).await?;
-        let result = self
-            .github
-            .status(
-                &repo,
-                n(j, "number"),
-                &token,
-                &body,
-                bot_id,
-                prev.as_ref().and_then(|p| p["id"].as_i64()),
-            )
-            .await?;
-        let record = json!({
-            "id": result["id"],
-            "body": body,
-            "state": j["state"],
-            "trigger": j["trigger"],
-            "head": j["head"],
-            "updatedAt": now(),
-        });
-        self.db(|db| db.put("status", key, &record))
+        self.write_comment(&repo, &token, &j, saved, bot_id).await?;
+        Ok(())
     }
     async fn publish(&self, j: &Value) -> Result<()> {
         let (pr, token) = self
@@ -771,66 +872,68 @@ impl Service {
         }
         let reviews = self.github.reviews(&repo, n(j, "number"), &token).await?;
         let bot = self.config["app"]["botId"].as_i64();
-        let owned = |r: &&Value| bot.is_some_and(|bot| r["user"]["id"].as_i64() == Some(bot));
-        let mut published = reviews
+        // An earlier attempt may have posted this report's inline comments.
+        let mut review = reviews
             .iter()
-            .filter(owned)
+            .filter(|r| bot.is_some_and(|bot| r["user"]["id"].as_i64() == Some(bot)))
             .find(|r| report::metadata(s(r, "body")).is_some_and(|m| m["job"] == j["id"]))
-            .cloned();
+            .and_then(|r| r["html_url"].as_str())
+            .map(str::to_owned);
+        let key = s(j, "key");
         let history = self
-            .get("findings", s(j, "key"))?
+            .get("findings", key)?
             .map(|v| array(&v))
             .unwrap_or_default();
-        if published.is_none() {
-            if self
+        let anchored = report::anchored(&j["report"], s(j, "patch"), &history);
+        if review.is_none()
+            && self
                 .get("jobs", s(j, "id"))?
                 .is_none_or(|j| s(&j, "state") != "publishing")
-            {
-                return Ok(());
-            }
-            let prior = reviews
-                .iter()
-                .filter(owned)
-                .filter_map(|r| {
-                    let m = report::metadata(s(r, "body"))?;
-                    (m["job"] != j["id"]).then(|| json!({"url":r["html_url"],"head":m["head"]}))
-                })
-                .collect::<Vec<_>>();
-            let body = report::report_body(j, &history, &prior)?;
-            let comments = report::inline_comments(&j["report"], s(j, "patch"), &history);
-            published = Some(
-                self.github
-                    .publish(
-                        &repo,
-                        n(j, "number"),
-                        &token,
-                        &body,
-                        s(j, "head"),
-                        &comments,
-                    )
-                    .await?,
-            );
+        {
+            return Ok(());
         }
-        let url = published.unwrap()["html_url"].clone();
-        let mut records = history;
-        for f in array(&j["report"]["findings"]) {
-            let new = json!({"id":f["id"],"title":f["title"],"url":url});
-            if let Some(x) = records.iter_mut().find(|r| r["id"] == f["id"]) {
-                *x = new;
-            } else {
-                records.push(new);
-            }
+        let lock = self.comment_lock(key)?;
+        let _guard = lock.lock().await;
+        // The comment publishes the report, so it comes first. The inline
+        // comments follow and point to it, and then the comment links them.
+        let mut records =
+            report::record_findings(&j["report"], history.clone(), &anchored, review.as_deref());
+        let inline = review.is_none() && !anchored.is_empty();
+        let comment = self
+            .write_report(&repo, &token, j, &records, review.as_deref(), !inline)
+            .await?;
+        if inline {
+            let posted = self
+                .github
+                .publish(
+                    &repo,
+                    n(j, "number"),
+                    &token,
+                    &report::review_body(j, &anchored, s(&comment, "url")),
+                    s(j, "head"),
+                    &report::inline_comments(&anchored),
+                )
+                .await?;
+            review = posted["html_url"].as_str().map(str::to_owned);
+            records = report::record_findings(&j["report"], history, &anchored, review.as_deref());
         }
+        let url = comment["url"].clone();
+        // Record the inline comments before anything else can fail, so that
+        // later reports don't post them again.
         self.db(|db| {
             db.tx(|db| {
-                db.put("findings", s(j, "key"), &json!(records))?;
+                db.put("findings", key, &json!(records))?;
                 db.put(
                     "completed",
-                    &format!("{}:{}", s(j, "key"), comparison_key(&j["comparison"])),
+                    &format!("{key}:{}", comparison_key(&j["comparison"])),
                     &json!({"job":j["id"],"reviewUrl":url,"comparison":j["comparison"]}),
                 )
             })
         })?;
+        if inline {
+            self.write_report(&repo, &token, j, &records, review.as_deref(), true)
+                .await?;
+        }
         let current = self
             .get("jobs", s(j, "id"))?
             .ok_or_else(|| anyhow!("Publication record disappeared"))?;
@@ -1490,8 +1593,11 @@ impl Service {
                 if previous.is_none() && !b(&j, "manual") && bot.is_some() {
                     let repo = self.repo(s(&j, "repo"))?;
                     let token = self.github.token(&repo).await?;
-                    let reviews = self.github.reviews(&repo, n(&j, "number"), &token).await?;
-                    previous = reviews
+                    // Reports live in the PR's Crow comment; earlier ones in reviews.
+                    let mut published =
+                        self.github.comments(&repo, n(&j, "number"), &token).await?;
+                    published.extend(self.github.reviews(&repo, n(&j, "number"), &token).await?);
+                    previous = published
                         .iter()
                         .find(|r| {
                             r["user"]["id"].as_i64() == bot
@@ -1552,7 +1658,7 @@ impl Service {
                 let patch = s(a, "patch").chars().take(1000000).collect::<String>();
                 self.update(
                     id,
-                    json!({"report":report,"patch":patch,"state":"publishing","reason":null}),
+                    json!({"report":report,"patch":patch,"state":"publishing","reason":null,"reportedAt":now()}),
                     Some(lease),
                 )?;
                 Ok(json!({"ok":true}))
@@ -2121,6 +2227,7 @@ async fn start_on_runtime(
         store: Mutex::new(store),
         github,
         scans: Mutex::new(HashMap::new()),
+        comments: Mutex::new(HashMap::new()),
         shutdown: cancel.clone(),
     });
     let shutdown = cancel.clone();
@@ -2301,11 +2408,20 @@ mod tests {
         fail_pushes: Mutex<HashMap<i64, u16>>,
         pushes_gate: Mutex<Option<Arc<Gate>>>,
         reviews: Mutex<Vec<Value>>,
+        /// Reviews Crow posted.
         published: Mutex<Vec<Value>>,
+        /// PR conversation comments, as GitHub lists them.
+        comments: Mutex<Vec<Value>>,
+        /// Every body Crow wrote to its PR comment.
+        written: Mutex<Vec<String>>,
         pr_gate: Mutex<Option<Arc<Gate>>>,
         prs_gate: Mutex<Option<Arc<Gate>>>,
         publish_gate: Mutex<Option<Arc<Gate>>>,
         fail_publish: AtomicBool,
+        /// Fails the nth publication call from now, counting from one.
+        fail_nth: AtomicUsize,
+        /// Fails every inline review.
+        fail_reviews: AtomicBool,
         fail_pr: AtomicBool,
         pr_calls: AtomicUsize,
         threads: Mutex<HashSet<std::thread::ThreadId>>,
@@ -2390,16 +2506,24 @@ mod tests {
         async fn installation(&self, _: &str) -> Result<Value> {
             Ok(json!({"id":11}))
         }
+        async fn comments(&self, _: &Value, _: i64, _: &str) -> Result<Vec<Value>> {
+            Ok(self.comments.lock().unwrap().clone())
+        }
         async fn status(
             &self,
             _: &Value,
             _: i64,
             _: &str,
-            _: &str,
+            body: &str,
             _: i64,
             _: Option<i64>,
         ) -> Result<Value> {
-            Ok(json!({"id":1}))
+            // Status updates write no report until one is published.
+            if report::metadata(body).is_some() {
+                self.publication().await?;
+            }
+            self.written.lock().unwrap().push(body.to_owned());
+            Ok(json!({"id":1,"html_url":COMMENT}))
         }
         async fn publish(
             &self,
@@ -2410,6 +2534,25 @@ mod tests {
             head: &str,
             comments: &[Value],
         ) -> Result<Value> {
+            self.publication().await?;
+            if self.fail_reviews.load(Ordering::Relaxed) {
+                bail!("Unprocessable review comment");
+            }
+            let mut published = self.published.lock().unwrap();
+            published.push(json!({"number":number,"body":body,"head":head,"comments":comments}));
+            let url = format!(
+                "https://github.com/owner/project/pull/1#pullrequestreview-{}",
+                published.len()
+            );
+            Ok(json!({"id":published.len(),"html_url":url}))
+        }
+        async fn audit(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+    const COMMENT: &str = "https://github.com/owner/project/pull/1#issuecomment-1";
+    impl FakeGitHub {
+        async fn publication(&self) -> Result<()> {
             let gate = self.publish_gate.lock().unwrap().take();
             if let Some(gate) = gate {
                 gate.block().await;
@@ -2417,16 +2560,31 @@ mod tests {
             if self.fail_publish.swap(false, Ordering::Relaxed) {
                 bail!("GitHub unavailable");
             }
-            self.published
+            let nth = self.fail_nth.load(Ordering::Relaxed);
+            if nth > 0 {
+                self.fail_nth.store(nth - 1, Ordering::Relaxed);
+                if nth == 1 {
+                    bail!("GitHub unavailable");
+                }
+            }
+            Ok(())
+        }
+        /// The PR comment as Crow last wrote it.
+        fn comment(&self) -> String {
+            self.written
                 .lock()
                 .unwrap()
-                .push(json!({"number":number,"body":body,"head":head,"comments":comments}));
-            Ok(
-                json!({"id":1,"html_url":"https://github.com/owner/project/pull/1#pullrequestreview-1"}),
-            )
+                .last()
+                .cloned()
+                .unwrap_or_default()
         }
-        async fn audit(&self) -> Result<()> {
-            Ok(())
+        /// Whether the PR comment has shown `job`'s report.
+        fn reported(&self, job: &Value) -> bool {
+            self.written
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|b| report::metadata(b).is_some_and(|m| m["job"] == job["id"]))
         }
     }
     fn pr(number: i64) -> Value {
@@ -2523,6 +2681,12 @@ mod tests {
         }
         async fn report(&self, j: &Value) {
             self.worker("report",json!({"id":j["id"],"lease":j["lease"],"report":{"summary":"No issues found.","findings":[]},"patch":"private patch"})).await.unwrap();
+        }
+        /// Report one finding on a line the PR adds.
+        async fn report_finding(&self, j: &Value) {
+            let finding = json!({"title":"Missing authorization","body":"Check the caller.","path":"src/api.js","line":2,"severity":"high"});
+            let patch = "+++ b/src/api.js\n@@ -1,1 +1,2 @@\n context\n+added\n";
+            self.worker("report",json!({"id":j["id"],"lease":j["lease"],"report":{"summary":"One issue.","findings":[finding]},"patch":patch})).await.unwrap();
         }
         async fn call(&self, path: &str, token: &str, body: Option<Value>) -> (u16, Value) {
             let client = reqwest::Client::new();
@@ -2749,15 +2913,18 @@ mod tests {
         )
         .unwrap();
         let resumed = &dispatch["job"];
-        f.report(resumed).await;
+        f.report_finding(resumed).await;
         f.publish_tick().await;
         let published = f.github.published.lock().unwrap()[0].clone();
         let metadata = report::metadata(s(&published, "body")).unwrap();
         assert_eq!(metadata["job"], job["id"]);
         assert!(metadata.get("guidance").is_none());
+        let metadata = report::metadata(&f.github.comment()).unwrap();
+        assert_eq!(metadata["job"], job["id"]);
+        assert!(metadata.get("guidance").is_none());
 
         // A lost acknowledgment must reconcile the authenticated review marker
-        // instead of publishing the same completed report a second time.
+        // instead of posting the same inline comments a second time.
         f.github.reviews.lock().unwrap().push(json!({
             "user":{"id":42},"body":published["body"],
             "html_url":"https://github.com/owner/project/pull/1#pullrequestreview-1"
@@ -2819,12 +2986,13 @@ mod tests {
         .unwrap();
         f.worker("report", args).await.unwrap();
         assert_eq!(f.job(s(&j, "id"))["state"], "publishing");
-        assert!(f.github.published.lock().unwrap().is_empty());
+        assert!(!f.github.reported(&j));
         f.github.fail_publish.store(true, Ordering::Relaxed);
         f.publish_tick().await;
         let saved = f.job(s(&j, "id"));
         assert_eq!(saved["state"], "publishing");
         assert!(!saved["report"].is_null());
+        assert!(!f.github.reported(&j));
         assert!(f.claim().await.is_null());
         f.handle
             .service
@@ -2832,7 +3000,10 @@ mod tests {
             .unwrap();
         f.publish_tick().await;
         assert_eq!(f.job(s(&j, "id"))["state"], "completed");
-        assert_eq!(f.github.published.lock().unwrap().len(), 1);
+        assert_eq!(f.job(s(&j, "id"))["reviewUrl"], COMMENT);
+        assert!(f.github.reported(&j));
+        // A clean report has no inline comments to post.
+        assert!(f.github.published.lock().unwrap().is_empty());
         f.close().await;
     }
     #[tokio::test]
@@ -3892,7 +4063,7 @@ mod tests {
         f.github.prs.lock().unwrap()[0]["base"]["sha"] = json!("d".repeat(40));
         f.publish_tick().await;
         assert_eq!(f.job(s(&j, "id"))["state"], "queued");
-        assert!(f.github.published.lock().unwrap().is_empty());
+        assert!(!f.github.reported(&j));
         let current = f.claim().await;
         let mut c = comparison();
         c["targetSha"] = json!("d".repeat(40));
@@ -3906,12 +4077,263 @@ mod tests {
         f.report(&current).await;
         f.publish_tick().await;
         assert_eq!(f.job(s(&j, "id"))["state"], "completed");
-        assert_eq!(f.github.published.lock().unwrap().len(), 1);
+        assert!(f.github.reported(&j));
         f.close().await;
     }
     #[tokio::test]
+    async fn every_review_updates_one_comment_and_posts_only_new_findings_inline() {
+        let f = Fixture::new().await;
+        let finding = |title: &str, line: u64| json!({"title":title,"body":"Details.","path":"src/api.js","line":line,"severity":"medium"});
+        let patch = "+++ b/src/api.js\n@@ -1,1 +1,3 @@\n context\n+added\n+added\n";
+        let cycle = |head: char, findings: Vec<Value>| {
+            let f = &f;
+            async move {
+                f.github.prs.lock().unwrap()[0]["head"]["sha"] = json!(head.to_string().repeat(40));
+                f.queue().await;
+                let j = f.claim().await;
+                let mut c = comparison();
+                c["head"] = j["head"].clone();
+                f.worker(
+                    "comparison",
+                    json!({"id":j["id"],"lease":j["lease"],"comparison":c}),
+                )
+                .await
+                .unwrap();
+                f.worker("report", json!({"id":j["id"],"lease":j["lease"],"report":{"summary":"Done.","findings":findings},"patch":patch}))
+                    .await
+                    .unwrap();
+                f.publish_tick().await;
+                assert_eq!(f.job(s(&j, "id"))["state"], "completed");
+                assert_eq!(f.job(s(&j, "id"))["reviewUrl"], COMMENT);
+                assert!(f.github.reported(&j));
+            }
+        };
+        cycle('a', vec![finding("First", 2)]).await;
+        cycle('d', vec![finding("First", 2), finding("Second", 3)]).await;
+        let review =
+            |n: usize| format!("https://github.com/owner/project/pull/1#pullrequestreview-{n}");
+        let comment = f.github.comment();
+        assert!(comment.starts_with("<!-- crow-status:v1 -->\n### 🟡 2 findings on [`ddddddd`]"));
+        // Each finding links to the inline comment that first raised it.
+        assert!(comment.contains(&format!("#L2) · [Thread]({})", review(1))));
+        assert!(comment.contains(&format!("#L3) · [Thread]({})", review(2))));
+        assert!(comment.contains("**2 reviews** "));
+        assert!(!comment.contains("not rechecked"));
+        cycle('e', vec![]).await;
+        let comment = f.github.comment();
+        assert!(comment.starts_with("<!-- crow-status:v1 -->\n### ✅ No findings on [`eeeeeee`]"));
+        assert!(!comment.contains("First"));
+        assert!(comment.contains(&format!(
+            "**3 reviews** [🟡]({} \"Review 1 · aaaaaaa · 1 medium\")[🟡]({} \"Review 2 · ddddddd · 2 medium\")[🟢](https://github.com/owner/project/pull/1/commits/{} \"Review 3 · eeeeeee · no findings\") · 2 earlier findings not rechecked",
+            review(1),
+            review(2),
+            "e".repeat(40)
+        )));
+        // Reviews carry only the inline comments for findings not raised before.
+        let published = f.github.published.lock().unwrap().clone();
+        assert_eq!(published.len(), 2);
+        for (review, title) in published.iter().zip(["First", "Second"]) {
+            assert_eq!(array(&review["comments"]).len(), 1);
+            assert!(s(&review["comments"][0], "body").contains(title));
+            assert!(s(review, "body").contains("🟡 1 new finding on "));
+        }
+        for review in &published {
+            assert!(s(review, "body").contains(&format!("[Crow's comment]({COMMENT})")));
+        }
+        f.close().await;
+    }
+    #[tokio::test]
+    async fn inline_comments_stay_recorded_when_linking_them_fails() {
+        let f = Fixture::new().await;
+        let j = f.prepared().await;
+        f.report_finding(&j).await;
+        // The comment and the inline review are written; linking them fails.
+        f.github.fail_nth.store(3, Ordering::Relaxed);
+        f.publish_tick().await;
+        assert_eq!(f.job(s(&j, "id"))["state"], "publishing");
+        assert!(f.github.reported(&j));
+        assert_eq!(f.github.published.lock().unwrap().len(), 1);
+        let review = "https://github.com/owner/project/pull/1#pullrequestreview-1";
+        let records = f.handle.service.get("findings", s(&j, "key")).unwrap();
+        assert_eq!(records.unwrap()[0]["url"], review);
+        // A newer push supersedes the job before its retry, and the next
+        // report of the same finding doesn't post it inline again.
+        f.github.prs.lock().unwrap()[0]["head"]["sha"] = json!("d".repeat(40));
+        f.queue().await;
+        assert_eq!(f.job(s(&j, "id"))["state"], "superseded");
+        let next = f.claim().await;
+        let mut c = comparison();
+        c["head"] = next["head"].clone();
+        f.worker(
+            "comparison",
+            json!({"id":next["id"],"lease":next["lease"],"comparison":c}),
+        )
+        .await
+        .unwrap();
+        f.report_finding(&next).await;
+        f.publish_tick().await;
+        assert_eq!(f.job(s(&next, "id"))["state"], "completed");
+        assert_eq!(f.github.published.lock().unwrap().len(), 1);
+        assert!(
+            f.github
+                .comment()
+                .contains(&format!("#L2) · [Thread]({review})"))
+        );
+        f.close().await;
+    }
+    #[tokio::test]
+    async fn a_failing_inline_review_leaves_the_comment_settled() {
+        let f = Fixture::new().await;
+        let j = f.prepared().await;
+        f.report_finding(&j).await;
+        f.github.fail_reviews.store(true, Ordering::Relaxed);
+        let mut writes = Vec::new();
+        for _ in 0..4 {
+            f.handle
+                .service
+                .update(s(&j, "id"), json!({"publishAt":0}), None)
+                .unwrap();
+            f.publish_tick().await;
+            let job = f.job(s(&j, "id"));
+            let service = f.handle.service.clone();
+            f.handle
+                .execute(async move { service.status(&job).await })
+                .await
+                .unwrap();
+            writes.push(f.github.written.lock().unwrap().len());
+        }
+        // The report, then once the failure's reason; later retries change nothing.
+        assert_eq!(writes, [1, 2, 2, 2]);
+        let comment = f.github.comment();
+        assert!(comment.contains("### 🔄 Publishing the review of"));
+        assert!(comment.contains("GitHub publication failed"));
+        assert!(comment.contains("<summary>Previous report: 🟠 1 finding on"));
+        f.github.fail_reviews.store(false, Ordering::Relaxed);
+        f.handle
+            .service
+            .update(s(&j, "id"), json!({"publishAt":0}), None)
+            .unwrap();
+        f.publish_tick().await;
+        assert_eq!(f.job(s(&j, "id"))["state"], "completed");
+        let comment = f.github.comment();
+        assert!(comment.contains("### 🟠 1 finding on"));
+        assert!(
+            comment
+                .contains("[Thread](https://github.com/owner/project/pull/1#pullrequestreview-1)")
+        );
+        f.close().await;
+    }
+    #[tokio::test]
+    async fn an_unchanged_comment_still_saves_its_record() {
+        let f = Fixture::new().await;
+        f.queue().await;
+        let j = f.claim().await;
+        let mut saved = json!({"id":1,"url":COMMENT,"layout":2});
+        saved["body"] = json!(comment_body(&j, &saved));
+        // Recorded for the history row, which this comment doesn't show.
+        let next = patch(saved, &json!({"published":{"count":1}}));
+        let repo = f.handle.service.repo("owner/project").unwrap();
+        let service = f.handle.service.clone();
+        let job = j.clone();
+        let written = f
+            .handle
+            .execute(async move { service.write_comment(&repo, "token", &job, next, 42).await })
+            .await
+            .unwrap();
+        assert_eq!(written["published"]["count"], 1);
+        let record = f.handle.service.get("status", s(&j, "key")).unwrap();
+        assert_eq!(record.unwrap()["published"]["count"], 1);
+        f.close().await;
+    }
+    #[tokio::test]
+    async fn upgrade_leaves_earlier_comments_on_finished_prs() {
+        let f = Fixture::new().await;
+        f.queue().await;
+        let j = f.claim().await;
+        let id = s(&j, "id");
+        let status = |state: &str| {
+            let job = f
+                .handle
+                .service
+                .update(id, json!({"state":state}), None)
+                .unwrap();
+            let service = f.handle.service.clone();
+            f.handle.execute(async move { service.status(&job).await })
+        };
+        f.handle
+            .service
+            .update(id, json!({"state":"completed"}), None)
+            .unwrap();
+        // Written by an earlier release, before the background tick can see
+        // an active job.
+        let legacy = json!({"id":1,"url":COMMENT,"body":"| ✅ Completed |","state":"completed","head":j["head"],"updatedAt":0});
+        f.handle
+            .service
+            .db(|db| db.put("status", s(&j, "key"), &legacy))
+            .unwrap();
+        let before = f.github.written.lock().unwrap().len();
+        status("completed").await.unwrap();
+        status("cancelled").await.unwrap();
+        assert_eq!(f.github.written.lock().unwrap().len(), before);
+        status("reviewing").await.unwrap();
+        // An active review switches the comment to the current layout.
+        assert!(
+            f.github
+                .comment()
+                .starts_with("<!-- crow-status:v1 -->\n### 🔄 Reviewing")
+        );
+        let saved = f.handle.service.get("status", s(&j, "key")).unwrap();
+        assert_eq!(saved.unwrap()["layout"], 2);
+        f.close().await;
+    }
+    #[test]
+    fn comment_shows_any_other_state_above_the_folded_report() {
+        let a = "a".repeat(40);
+        let saved = json!({"report":"REPORT","outcome":"🟡 3 findings","reportHead":a,"reportComparison":comparison_key(&comparison()),"url":COMMENT});
+        let mut j = json!({"repo":"owner/project","head":a,"comparison":comparison(),"state":"completed","trigger":"Pull request updated","reviewUrl":COMMENT});
+        assert_eq!(
+            comment_body(&j, &saved),
+            format!(
+                "<!-- crow-status:v1 -->\n### 🟡 3 findings on [`aaaaaaa`](https://github.com/owner/project/commit/{a})\n\nREPORT"
+            )
+        );
+        // An earlier review of the same commit against another target.
+        j["comparison"]["target"] = json!("develop");
+        let body = comment_body(&j, &saved);
+        assert!(body.starts_with("<!-- crow-status:v1 -->\n### ✅ Reviewed [`aaaaaaa`]"));
+        assert!(body.contains("</sub>\n\nCrow reviewed this commit earlier. Its report is in this comment's edit history.\n\n<details>"));
+        j["head"] = json!("d".repeat(40));
+        let body = comment_body(&j, &saved);
+        assert!(body.starts_with("<!-- crow-status:v1 -->\n### ✅ Reviewed [`ddddddd`]"));
+        j["state"] = json!("reviewing");
+        j["startedAt"] = json!(1_791_355_500_000i64);
+        j["updatedAt"] = json!(1);
+        let body = comment_body(&j, &saved);
+        assert!(body.starts_with("<!-- crow-status:v1 -->\n### 🔄 Reviewing [`ddddddd`]"));
+        assert!(body.contains("\n\n<sub>Pull request updated · started Oct 7, 06:45 UTC</sub>"));
+        assert!(body.ends_with("\n\n<details>\n<summary>Previous report: 🟡 3 findings on <code>aaaaaaa</code></summary>\n\nREPORT\n</details>"));
+        // Heartbeats leave the comment as it is.
+        j["updatedAt"] = json!(2);
+        assert_eq!(comment_body(&j, &saved), body);
+        j["state"] = json!("paused");
+        j["reason"] = json!("Paused by the operator");
+        let body = comment_body(&j, &saved);
+        assert!(body.starts_with("<!-- crow-status:v1 -->\n### ⏸️ Paused on [`ddddddd`]"));
+        assert!(body.contains("</sub>\n\nPaused by the operator\n\nComment `/crow restart`"));
+        assert!(body.contains("<summary>Previous report: "));
+        assert!(!comment_body(&j, &json!({})).contains("<details>"));
+    }
+    #[tokio::test]
     async fn completed_comparison_is_reconstructed_only_from_own_bot_marker() {
-        for bot in [42, 99] {
+        let cases = [
+            (42, "comment", true),
+            (99, "comment", false),
+            (42, "review", true),
+            (99, "review", false),
+            // Inline comments posted before the comment holds the report.
+            (42, "inline", false),
+        ];
+        for (bot, place, reviewed) in cases {
             let f = Fixture::new().await;
             f.queue().await;
             let j = f.claim().await;
@@ -3919,8 +4341,21 @@ mod tests {
                 j.clone(),
                 &json!({"comparison":comparison(),"settings":review_settings(&f.config["worker"]),"report":{"summary":"Earlier review","findings":[]}}),
             );
-            let body = report::report_body(&saved, &[], &[]).unwrap();
-            f.github.reviews.lock().unwrap().push(json!({"id":1,"body":body,"user":{"id":bot},"html_url":"https://github.com/owner/project/pull/1#pullrequestreview-1"}));
+            let body = match place {
+                "inline" => report::review_body(&saved, &[], COMMENT),
+                _ => report::report_body(&saved, &[], &json!({})).unwrap(),
+            };
+            // Reports live in the PR comment; earlier releases posted reviews.
+            if place == "comment" {
+                let body = comment_body(&j, &json!({"report":body}));
+                f.github
+                    .comments
+                    .lock()
+                    .unwrap()
+                    .push(json!({"id":1,"body":body,"user":{"id":bot},"html_url":COMMENT}));
+            } else {
+                f.github.reviews.lock().unwrap().push(json!({"id":1,"body":body,"user":{"id":bot},"html_url":"https://github.com/owner/project/pull/1#pullrequestreview-1"}));
+            }
             let result = f
                 .worker(
                     "comparison",
@@ -3930,11 +4365,11 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 result.get("skip").and_then(Value::as_bool).unwrap_or(false),
-                bot == 42
+                reviewed
             );
             assert_eq!(
                 f.job(s(&j, "id"))["state"],
-                if bot == 42 { "completed" } else { "reviewing" }
+                if reviewed { "completed" } else { "reviewing" }
             );
             f.close().await;
         }
