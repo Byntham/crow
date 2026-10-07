@@ -1,0 +1,7 @@
+# Crow's managed runtime image. The worker builds it with Podman's normal network;
+# repository files never enter this build. Package patch versions follow Alpine 3.23.
+FROM docker.io/library/alpine:3.23@sha256:85fe1e81d6758c208f3e1eed4338a1997e19d4be002d4dd32d3100c9a8c010a0
+RUN apk add --no-cache bash build-base ca-certificates cargo curl git go libffi-dev \
+        linux-headers nodejs npm openssl-dev pkgconf py3-pip python3 rust sqlite tar \
+    && adduser -D -H -u 1000 -h /workspace/.home crow
+COPY proxy.py /opt/crow/proxy.py

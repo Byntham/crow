@@ -97,7 +97,8 @@ fn pull_request(v: Value) -> Result<Value> {
         "state": string(&v["state"])?,
         "draft": draft,
         "user": {"login": string(&v["user"]["login"])?},
-        "head": {"sha": string(&v["head"]["sha"])?},
+        // A deleted fork leaves no head repository; treat it as a fork.
+        "head": {"sha": string(&v["head"]["sha"])?, "repo": v["head"]["repo"]["full_name"].as_str()},
         "base": {"sha": string(&v["base"]["sha"])?, "ref": string(&v["base"]["ref"])?},
     });
     for key in ["title", "created_at", "updated_at"] {
@@ -758,9 +759,16 @@ mod tests {
                 .to_string()
                 .contains("Unexpected GitHub")
         );
-        m.json(valid_pr());
+        // The head repository is kept by name; a deleted fork has none.
+        let mut response = valid_pr();
+        response["head"]["repo"] = json!({"full_name":"someone/fork","private":false});
+        m.json(response);
         let mut expected = valid_pr();
         expected["draft"] = json!(false);
+        expected["head"]["repo"] = json!("someone/fork");
+        assert_eq!(gh.pr(&repo(), 3, "token").await.unwrap(), expected);
+        m.json(valid_pr());
+        expected["head"]["repo"] = Value::Null;
         assert_eq!(gh.pr(&repo(), 3, "token").await.unwrap(), expected);
         let mut bad = valid_pr();
         bad["draft"] = json!("false");

@@ -2,6 +2,7 @@ pub mod backup;
 pub mod cli;
 pub mod config;
 pub mod delegation;
+pub mod execution;
 pub mod github;
 pub mod inspection;
 pub mod install;

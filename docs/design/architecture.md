@@ -8,6 +8,7 @@ Crow is a Linux daemon and CLI in a single Rust executable. The same binary runs
 - **Worker** (`worker.rs`): claims jobs over HTTPS, fetches pinned source into a bare Git repository, runs the review through a provider, saves the validated report, then hands it to the service.
 - **Providers** (`provider/`): drive the official Codex or Claude Code CLI with the operator's subscription login. `provider/mod.rs` holds the shared review driver (sessions, prompts, events, report validation); `codex.rs` and `claude.rs` hold each CLI's isolation, policy checks, and event parsing. See ADR 0008 and ADR 0009.
 - **Inspection and delegation** (`inspection.rs`, `delegation.rs`): the MCP server a reviewer uses to list, read, search, and diff pinned Git objects, and to run bounded child reviews.
+- **Runtime experiments** (`execution/`): opt-in tools that prepare dependencies and run commands in rootless Podman for trusted authors (ADR 0010). `sandbox.rs` owns the container flags, `gateway.rs` the package-registry gateway for setup, and `image.rs` the runtime image the worker builds.
 
 Tokio owns asynchronous processes and network tasks; Axum handles inbound HTTP; reqwest with rustls handles HTTPS; rusqlite stores durable state in bundled SQLite.
 
@@ -19,7 +20,7 @@ Persisted records and wire envelopes are `serde_json::Value`s validated at each 
 - A job has one active lease. Recheck ownership and policy after network waits.
 - Preserve incomplete provider sessions. Never silently restart a lost session.
 - Save a valid complete report before publishing. Reconcile authenticated bot metadata before retrying publication.
-- Repository code is data. Inspect pinned Git objects without checkout, hooks, external diff helpers, or repository commands.
+- Repository code is data on the host. Inspect pinned Git objects without checkout, hooks, external diff helpers, or repository commands; run code only inside the opt-in Podman sandbox (ADR 0010).
 - Enforce provider tools and delegation limits before every new or resumed session.
 - Keep author policy, command requester policy, and worker/admin authentication separate.
 - Keep initial backlog exclusion, held catch-up batches, and no scheduled PR polling.

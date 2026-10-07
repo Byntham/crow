@@ -730,6 +730,13 @@ impl Review {
             },
         });
         config.extend(review.as_object().unwrap().clone());
+        // An experiment can outlast Codex's default MCP tool timeout.
+        if let Some(policy) = &layout.execution {
+            config.insert(
+                "mcp_servers.crow_inspection.tool_timeout_sec".into(),
+                json!(crate::execution::tool_timeout_seconds(policy)),
+            );
+        }
         let mut skills = Vec::new();
         skill_disables(
             &Path::new(&environment.env["CODEX_HOME"]).join("skills"),
@@ -839,8 +846,16 @@ impl Review {
             "default_tools_approval_mode",
             "enabled_tools",
             "env_vars",
+            "tool_timeout_sec",
         ] {
-            if inspection[key] != self.config[&format!("mcp_servers.crow_inspection.{key}")] {
+            let expected = self
+                .config
+                .get(&format!("mcp_servers.crow_inspection.{key}"))
+                .unwrap_or(&Value::Null);
+            if key == "tool_timeout_sec" && expected.is_null() {
+                continue;
+            }
+            if &inspection[key] != expected {
                 return Err(failure(
                     "config",
                     "Codex did not apply the controlled Crow inspection helper.",
@@ -1139,6 +1154,30 @@ mod tests {
         f.job["settings"]["effort"] = json!("unsupported");
         assert_eq!(classify_error(&f.run().await.unwrap_err()).kind, "config");
         assert!(!f.root.path().join("invocation.json").exists());
+    }
+    #[tokio::test]
+    async fn experiments_raise_the_verified_tool_timeout() {
+        let mut f = Fixture::new(json!({}));
+        f.job["settings"]["execution"] = json!({
+            "podman": "podman",
+            "limits": crate::execution::Limits::default(),
+        });
+        f.run().await.unwrap();
+        let invocation = util::read_json(&f.root.path().join("invocation.json"))
+            .unwrap()
+            .unwrap();
+        let args = invocation["args"].as_array().unwrap();
+        let timeout = crate::execution::Limits::default().timeout_seconds + 300;
+        assert!(args.contains(&json!(format!(
+            "mcp_servers.crow_inspection.tool_timeout_sec={timeout}"
+        ))));
+        let tools = args
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|a| a.starts_with("mcp_servers.crow_inspection.enabled_tools="))
+            .unwrap();
+        assert!(tools.contains("\"run_experiment\""), "{tools}");
+        assert!(text(&invocation, "prompt").contains("Runtime tools are available"));
     }
     #[tokio::test]
     async fn provider_failure_keeps_classification_and_retry_delay() {

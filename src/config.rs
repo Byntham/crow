@@ -217,6 +217,9 @@ pub fn validate_config(value: &Value) -> Result<()> {
             string(v, &format!("worker.{key}"))?;
         }
     }
+    if let Some(execution) = worker.get("execution") {
+        crate::execution::validate(execution)?;
+    }
     for key in ["operator", "publicUrl"] {
         let v = c.get(key).with_context(|| format!("Invalid {key}"))?;
         if !v.is_null() {

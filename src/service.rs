@@ -942,11 +942,18 @@ impl Service {
             json!({"settings":settings,"author":pr["user"]["login"]}),
             Some(lease),
         )?;
+        // Experiments only for authors the operator listed explicitly, and never
+        // for forks. The worker's own list must also include the repository.
+        let fork = !pr["head"]["repo"]
+            .as_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case(s(&repo, "name")));
+        let execution_allowed = s(&repo, "policy") != "everyone" && !fork;
         Ok(json!({
             "job": patch(job.clone(), &json!({"settings": settings})),
             "pr": pr,
             "token": token,
             "repo": repo,
+            "executionAllowed": execution_allowed,
         }))
     }
     async fn worker_action(&self, action: &str, a: &Value, mut worker: Value) -> Result<Value> {
@@ -2706,6 +2713,29 @@ mod tests {
                 .is_err()
         );
         f.close().await;
+    }
+    #[tokio::test]
+    async fn experiments_are_withheld_for_forks_and_open_author_policies() {
+        // (head repository, repository policy, expected)
+        for (head, policy, expected) in [
+            (json!("Owner/Project"), "selected", true),
+            (json!("someone/project"), "selected", false),
+            (Value::Null, "selected", false),
+            (json!("owner/project"), "everyone", false),
+        ] {
+            let f = Fixture::new().await;
+            f.github.prs.lock().unwrap()[0]["head"]["repo"] = head.clone();
+            let mut repo = f.handle.service.repo("owner/project").unwrap();
+            repo["policy"] = json!(policy);
+            f.handle
+                .service
+                .db(|db| db.enroll(&repo).map(|_| ()))
+                .unwrap();
+            f.queue().await;
+            let next = f.worker("next", json!({"active":[]})).await.unwrap();
+            assert_eq!(next["executionAllowed"], expected, "{head} {policy}");
+            f.close().await;
+        }
     }
     #[test]
     fn eligibility_ignores_author_case_and_skips_drafts() {

@@ -200,7 +200,7 @@ Continue later with crow resume owner/repo 42.")]
 Editable settings:
   worker.provider (codex or claude), worker.model, worker.effort
   worker.concurrency, worker.timeoutMs
-  worker.subagents, worker.retry (JSON objects)
+  worker.subagents, worker.retry, worker.execution (JSON objects)
   catchUp.enabled, catchUp.threshold, auditIntervalMs, retentionDays
 
 Choose the model and reasoning level from crow models. Changing the
@@ -556,6 +556,7 @@ async fn configured_command(format: OutputFormat, command: Command, root: &Path)
         } => {
             let writable = [
                 "worker.provider",
+                "worker.execution",
                 "worker.concurrency",
                 "worker.model",
                 "worker.effort",
