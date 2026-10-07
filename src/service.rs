@@ -930,7 +930,12 @@ impl Service {
             let config = patch(self.config.clone(), &json!({"worker": defaults}));
             review_settings(&config::settings(&config, Some(&repo))?)
         } else {
-            review_settings(&job["settings"])
+            let mut settings = review_settings(&job["settings"]);
+            // Reviews started before provider selection ran on Codex.
+            if settings.get("provider").is_none() {
+                settings["provider"] = json!("codex");
+            }
+            settings
         };
         self.update(
             id,
@@ -2631,6 +2636,12 @@ mod tests {
         f.queue().await;
         let j = f.claim().await;
         assert!(j["settings"].get("provider").is_none(), "{}", j["settings"]);
+        // Once started, a review without a recorded provider stays on Codex.
+        f.handle
+            .service
+            .update(s(&j, "id"), json!({"state":"queued"}), None)
+            .unwrap();
+        assert_eq!(f.claim().await["settings"]["provider"], "codex");
         f.close().await;
         let f = Fixture::new().await;
         f.queue().await;

@@ -583,6 +583,8 @@ fn content_text(message: &Value) -> String {
 }
 /// Map Claude Code's API error codes. Subscription usage limits and billing
 /// problems pause for the operator; the reset time becomes the retry delay.
+/// Claude Code reports every HTTP 429 as `rate_limit`, so only a rate limit it
+/// also reported as rejected is a usage limit; short throttling stays transient.
 fn api_error(code: &str, message: &str, resets_at: Option<u64>) -> ProviderError {
     let message = if message.is_empty() {
         format!("Claude Code API error: {code}")
@@ -592,7 +594,8 @@ fn api_error(code: &str, message: &str, resets_at: Option<u64>) -> ProviderError
     let mut error = classify_error(&anyhow!(message));
     match code {
         "authentication_failed" => error.kind = "auth".into(),
-        "billing_error" | "rate_limit" => error.kind = "quota".into(),
+        "billing_error" => error.kind = "quota".into(),
+        "rate_limit" if resets_at.is_some() => error.kind = "quota".into(),
         _ => {}
     }
     if error.kind == "quota"
@@ -894,6 +897,9 @@ mod tests {
         let error = classify_error(&f.run().await.unwrap_err());
         assert_eq!(error.kind, "quota");
         assert!(error.retry_after > 3_000_000, "{}", error.retry_after);
+        // Brief throttling without a rejected usage limit is retried automatically.
+        let f = Fixture::new(json!({"throttled":true}));
+        assert_eq!(kind(f.run().await.unwrap_err()), "transient");
         let f = Fixture::new(json!({"fail":"Overloaded; Retry-After: 45"}));
         let error = classify_error(&f.run().await.unwrap_err());
         assert_eq!(error.kind, "transient");

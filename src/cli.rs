@@ -597,8 +597,10 @@ async fn configured_command(format: OutputFormat, command: Command, root: &Path)
                             .into_iter()
                             .flatten()
                             .filter(|repo| {
+                                let settings = &repo["settings"];
                                 ["model", "effort"].iter().any(|key| {
-                                    repo["settings"].get(*key).is_some_and(|v| !v.is_null())
+                                    settings.get(*key).is_some_and(|v| !v.is_null())
+                                        || settings["subagents"].get(*key).is_some()
                                 })
                             })
                             .filter_map(|repo| repo["name"].as_str())

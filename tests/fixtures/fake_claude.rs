@@ -170,6 +170,11 @@ fn main() {
         send(json!({"type":"result","subtype":"success","is_error":true,"result":"You've hit your limit"}));
         std::process::exit(1);
     }
+    if behavior["throttled"] == true {
+        send(json!({"type":"assistant","error":"rate_limit","message":{"content":[{"type":"text","text":"Request rate limited"}]}}));
+        send(json!({"type":"result","subtype":"success","is_error":true,"result":"Request rate limited"}));
+        std::process::exit(1);
+    }
     if let Some(message) = behavior["fail"].as_str() {
         send(json!({"type":"result","subtype":"success","is_error":true,"result":message}));
         std::process::exit(1);

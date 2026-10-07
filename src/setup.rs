@@ -870,7 +870,10 @@ pub async fn github_identity(interactive: bool) -> Result<Value> {
         )
         .await?;
     }
-    let user: Value = serde_json::from_str(&operations::run("gh", &["api", "user"], false).await?)?;
+    // GH_HOST may name another host; the operator identity comes from github.com.
+    let user: Value = serde_json::from_str(
+        &operations::run("gh", &["api", "--hostname", "github.com", "user"], false).await?,
+    )?;
     let login = user["login"]
         .as_str()
         .filter(|v| !v.is_empty())
@@ -943,7 +946,7 @@ pub fn validate_setup_role(config: &Value, selected_role: &str, root: &Path) -> 
 // systemctl accepted a request but its process was cancelled before replying.
 #[async_trait::async_trait]
 trait RestartBackend: Send + Sync {
-    async fn current_draining(&self) -> Result<Option<bool>>;
+    async fn running(&self) -> Result<Running>;
     async fn drain(&self) -> Result<()>;
     async fn wait_drained(&self) -> Result<()>;
     async fn stop(&self) -> Result<()>;
@@ -954,18 +957,36 @@ trait RestartBackend: Send + Sync {
     async fn interrupted(&self) -> Result<()>;
 }
 
+/// The state of the Crow process that setup is about to replace.
+enum Running {
+    No,
+    /// Reachable; `draining` is true when an operator drain already exists.
+    Answering {
+        draining: bool,
+    },
+    /// Running but not answering administration requests, such as a
+    /// worker-only process becoming a service. It is stopped without a drain.
+    Unreachable,
+}
 async fn restart_with_backend(backend: &impl RestartBackend) -> Result<()> {
     let mut owns_drain = false;
     let mut stop_requested = false;
     let apply = async {
-        if let Some(already_draining) = backend.current_draining().await? {
-            if !already_draining {
-                owns_drain = true;
-                backend.drain().await?;
+        match backend.running().await? {
+            Running::Answering { draining } => {
+                if !draining {
+                    owns_drain = true;
+                    backend.drain().await?;
+                }
+                backend.wait_drained().await?;
+                stop_requested = true;
+                backend.stop().await?;
             }
-            backend.wait_drained().await?;
-            stop_requested = true;
-            backend.stop().await?;
+            Running::Unreachable => {
+                stop_requested = true;
+                backend.stop().await?;
+            }
+            Running::No => {}
         }
         backend.install().await?;
         backend.ready().await?;
@@ -1004,22 +1025,24 @@ struct ServiceRestart<'a> {
 
 #[async_trait::async_trait]
 impl RestartBackend for ServiceRestart<'_> {
-    async fn current_draining(&self) -> Result<Option<bool>> {
-        let error = match operations::admin(self.config, "status", &Value::Null).await {
-            Ok(status) => return Ok(Some(status["draining"] == true)),
-            Err(error) => error,
-        };
-        // Skipping the stop would leave a running service on its old settings.
+    async fn running(&self) -> Result<Running> {
+        if let Ok(status) = operations::admin(self.config, "status", &Value::Null).await {
+            return Ok(Running::Answering {
+                draining: status["draining"] == true,
+            });
+        }
+        // Leaving a running process in place would keep its old settings.
         let unit = operations::unit_name(self.root);
         let active = operations::run("systemctl", &["--user", "is-active", &unit], false)
             .await
             .is_ok_and(|state| state.trim() == "active");
         if active {
-            return Err(error.context(
-                "Crow is running but did not answer its status check. Check crow logs, then rerun crow setup.",
-            ));
+            println!(
+                "Crow is running but cannot be drained through its service. Restarting it to apply setup changes; interrupted reviews keep their saved sessions."
+            );
+            return Ok(Running::Unreachable);
         }
-        Ok(None)
+        Ok(Running::No)
     }
     async fn drain(&self) -> Result<()> {
         println!("Waiting for active reviews before applying setup changes.");
@@ -1123,8 +1146,13 @@ struct WorkerRestart<'a> {
 
 #[async_trait::async_trait]
 impl RestartBackend for WorkerRestart<'_> {
-    async fn current_draining(&self) -> Result<Option<bool>> {
-        Ok(self.previous.as_ref().map(|state| state.already_draining))
+    async fn running(&self) -> Result<Running> {
+        Ok(match &self.previous {
+            Some(state) => Running::Answering {
+                draining: state.already_draining,
+            },
+            None => Running::No,
+        })
     }
     async fn drain(&self) -> Result<()> {
         operations::drain_worker(self.root).await
@@ -1506,7 +1534,8 @@ async fn setup_provider(config: &mut Value, root: &Path) -> Result<()> {
         .as_array()
         .context("The provider returned no model catalog")?;
     let saved = string(&worker, "model");
-    let current = crate::provider::find_model(models, saved)
+    let found = crate::provider::find_model(models, saved);
+    let current = found
         .or_else(|| models.iter().find(|model| model["isDefault"] == true))
         .context("The provider did not report a default model. Retry model discovery before completing initial setup.")?;
     let mut model_choices: Vec<_> = models
@@ -1515,7 +1544,7 @@ async fn setup_provider(config: &mut Value, root: &Path) -> Result<()> {
         .collect();
     // Keep a pinned model (one an alias resolves to) as the default choice.
     let pinned = format!("{} (pinned)", string(current, "displayName"));
-    let default = if !saved.is_empty() && current["model"] != saved {
+    let default = if found.is_some_and(|model| model["model"] != saved) {
         model_choices.push((saved, &pinned));
         saved
     } else {
@@ -1891,6 +1920,7 @@ mod tests {
     struct RestartProbe {
         calls: std::sync::Mutex<Vec<&'static str>>,
         already_draining: bool,
+        unreachable: bool,
         fail_at: Option<&'static str>,
         interrupt_at: Option<&'static str>,
         interruption: tokio::sync::Notify,
@@ -1905,6 +1935,7 @@ mod tests {
             Self {
                 calls: std::sync::Mutex::new(Vec::new()),
                 already_draining,
+                unreachable: false,
                 fail_at,
                 interrupt_at,
                 interruption: tokio::sync::Notify::new(),
@@ -1928,9 +1959,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RestartBackend for RestartProbe {
-        async fn current_draining(&self) -> Result<Option<bool>> {
+        async fn running(&self) -> Result<Running> {
             self.step("status").await?;
-            Ok(Some(self.already_draining))
+            Ok(if self.unreachable {
+                Running::Unreachable
+            } else {
+                Running::Answering {
+                    draining: self.already_draining,
+                }
+            })
         }
         async fn drain(&self) -> Result<()> {
             self.step("drain").await
@@ -1999,6 +2036,20 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn unreachable_process_is_stopped_without_a_drain_and_recovered_on_failure() {
+        let mut backend = RestartProbe::new(false, None, None);
+        backend.unreachable = true;
+        restart_with_backend(&backend).await.unwrap();
+        assert_eq!(backend.calls(), vec!["status", "stop", "install", "ready"]);
+        let mut backend = RestartProbe::new(false, Some("install"), None);
+        backend.unreachable = true;
+        assert!(restart_with_backend(&backend).await.is_err());
+        assert_eq!(
+            backend.calls(),
+            vec!["status", "stop", "install", "recover"]
+        );
+    }
     #[tokio::test]
     async fn lost_drain_response_is_cleaned_up_without_stopping() {
         let backend = RestartProbe::new(false, Some("drain"), None);

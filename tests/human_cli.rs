@@ -219,6 +219,7 @@ async fn switching_provider_clears_provider_specific_models() -> Result<()> {
         "repos": [
             {"name": "owner/api", "settings": {"model": "gpt-review"}},
             {"name": "owner/web", "settings": {}},
+            {"name": "owner/docs", "settings": {"subagents": {"mode": "configured", "model": "gpt-mini", "effort": "low"}}},
         ],
         "workers": [],
         "jobs": [],
@@ -244,6 +245,7 @@ async fn switching_provider_clears_provider_specific_models() -> Result<()> {
     );
     assert!(human.contains("crow login"), "{human}");
     assert!(human.contains("owner/api"), "{human}");
+    assert!(human.contains("owner/docs"), "{human}");
     assert!(!human.contains("owner/web"), "{human}");
     let saved = config::load(fixture.root.path())?;
     assert_eq!(saved["worker"]["provider"], "claude");
