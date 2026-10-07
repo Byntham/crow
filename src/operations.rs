@@ -781,6 +781,13 @@ pub async fn doctor(config: &Value, root: &Path, runtime: bool) -> Result<Value>
                 ),
                 Err(error) => check_result(&mut checks, "review runtime", Err(error)),
             }
+            match crate::execution::diagnostics(&config["worker"]).await {
+                Ok(Some(result)) => checks.push(
+                    json!({"name":"runtime experiments","ok":result["ok"] == true,"detail":result}),
+                ),
+                Ok(None) => {}
+                Err(error) => check_result(&mut checks, "runtime experiments", Err(error)),
+            }
         }
     }
     let persistent = async {

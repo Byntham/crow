@@ -18,6 +18,7 @@ crow policy owner/repo --requesters alice,bob
 crow config
 crow models
 crow config worker.provider claude
+crow config worker.execution '{"repositories":{"owner/repo":{}}}'
 crow config worker.concurrency 3
 crow config worker.model provider-model-id
 crow config worker.effort high

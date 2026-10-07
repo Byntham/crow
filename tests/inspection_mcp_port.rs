@@ -44,11 +44,13 @@ fn mcp_advertises_pagination_and_serializes_errors_without_executing_tools() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let messages: Vec<Value> = String::from_utf8(output.stdout)
+    // Tool calls run concurrently, so responses may arrive out of order.
+    let mut messages: Vec<Value> = String::from_utf8(output.stdout)
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
+    messages.sort_by_key(|m| m["id"].as_u64());
     assert_eq!(messages.len(), 6);
     assert_eq!(messages[0]["result"]["protocolVersion"], "2024-11-05");
     let definitions = messages[1]["result"]["tools"].as_array().unwrap();

@@ -1,6 +1,7 @@
 //! Read-only inspection of pinned Git objects. Reviewed files are never checked out.
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::Engine;
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -222,6 +223,55 @@ pub async fn git(dir: &Path, args: &[String]) -> Result<String> {
 }
 fn strings(args: &[&str]) -> Vec<String> {
     args.iter().map(|s| (*s).to_owned()).collect()
+}
+
+/// Write a tar archive of one pinned revision for an experiment container,
+/// bounded by `max_bytes`. Nothing is unpacked on the host.
+pub async fn execution_archive(
+    source: &Value,
+    revision_key: &str,
+    output: &Path,
+    max_bytes: u64,
+    cancel: CancellationToken,
+) -> Result<()> {
+    use std::io::Write;
+    // An empty work tree keeps repository .gitattributes from selecting filters.
+    let attributes = tempfile::tempdir()?;
+    let mut file = std::fs::File::create(output)?;
+    let mut total = 0u64;
+    let work_tree = attributes.path().to_string_lossy().into_owned();
+    let index = attributes
+        .path()
+        .join("empty-index")
+        .to_string_lossy()
+        .into_owned();
+    git_stream(
+        source_dir(source)?,
+        &strings(&[
+            "-c",
+            "core.bare=false",
+            "archive",
+            "--worktree-attributes",
+            "--format=tar",
+            source_rev(source, revision_key)?,
+        ]),
+        &BTreeMap::from([
+            ("GIT_WORK_TREE".into(), work_tree),
+            ("GIT_INDEX_FILE".into(), index),
+        ]),
+        cancel,
+        |chunk| {
+            total += chunk.len() as u64;
+            ensure!(
+                total <= max_bytes,
+                "The source archive exceeds {} MiB",
+                max_bytes / 1024 / 1024
+            );
+            file.write_all(chunk)?;
+            Ok(())
+        },
+    )
+    .await
 }
 
 pub async fn checkout(
@@ -884,6 +934,7 @@ async fn read_message(input: &mut (impl AsyncBufReadExt + Unpin)) -> Result<Vec<
 async fn call_tool(
     source: &Value,
     delegation: Option<&crate::delegation::Delegation>,
+    execution: Option<&crate::execution::Execution>,
     params: &Value,
 ) -> Result<Value> {
     let name = params["name"]
@@ -898,6 +949,11 @@ async fn call_tool(
         && crate::delegation::tools().iter().any(|t| t["name"] == name)
     {
         return delegation.call(name, args).await;
+    }
+    if let Some(execution) = execution
+        && crate::execution::TOOL_NAMES.contains(&name)
+    {
+        return execution.call(name, args).await;
     }
     inspection_tool(source, name, args).await
 }
@@ -921,6 +977,10 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
         Some(path) => Some(serde_json::from_slice(&tokio::fs::read(path).await?)?),
         None => None,
     };
+    let execution = match &context {
+        Some(context) => crate::execution::Execution::from_context(context)?,
+        None => None,
+    };
     let delegation = match context.filter(|v| {
         v["job"]["settings"]["subagents"]["max"]
             .as_u64()
@@ -934,7 +994,10 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
     if delegation.is_some() {
         definitions.extend(crate::delegation::tools());
     }
-    let mut stdin = BufReader::new(crate::process::NonblockingIo::stdin()?);
+    if execution.is_some() {
+        definitions.extend(crate::execution::tools());
+    }
+    let stdin = BufReader::new(crate::process::NonblockingIo::stdin()?);
     let mut stdout = crate::process::NonblockingIo::stdout()?;
     #[cfg(unix)]
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -949,41 +1012,66 @@ pub async fn inspection_main(source_path: &Path, context_path: Option<&Path>) ->
         }
     };
     tokio::pin!(stop);
+    let reply = |request: &Value, mut response: Value| {
+        response["jsonrpc"] = "2.0".into();
+        response["id"] = request["id"].clone();
+        response
+    };
+    let (source, delegation_ref, execution_ref) =
+        (&source, delegation.as_ref(), execution.as_ref());
     let result = async {
+        // Tool calls run concurrently and are answered by ID, so a long experiment
+        // does not hold up inspection or a client's timeout for other calls. One
+        // read stays pending across turns: a partly read message cannot resume.
+        let next = |mut stdin| async move {
+            let line = read_message(&mut stdin).await;
+            (stdin, line)
+        };
+        let mut reading = Box::pin(next(stdin));
+        let mut open = true;
+        let mut calls = FuturesUnordered::new();
         loop {
-            let line = tokio::select! {
-                _ = &mut stop => break,
-                line = read_message(&mut stdin) => line?,
-            };
-            if line.is_empty() {
+            // After EOF, answer every request already read, then exit.
+            if !open && calls.is_empty() {
                 break;
             }
-            // Notifications and malformed messages need no reply.
-            let Ok(request) = serde_json::from_slice::<Value>(&line) else {
-                continue;
-            };
-            if !request.is_object() || request.get("id").is_none() {
-                continue;
-            }
-            let mut response = match request["method"].as_str() {
-                Some("initialize") => json!({"result": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "crow-inspection", "version": "1.0.0"},
-                }}),
-                Some("tools/list") => json!({"result": {"tools": definitions}}),
-                Some("ping") => json!({"result": {}}),
-                Some("tools/call") => {
-                    let output = tokio::select! {
-                        _ = &mut stop => break,
-                        output = call_tool(&source, delegation.as_ref(), &request["params"]) => output,
+            let response = tokio::select! {
+                _ = &mut stop => break,
+                Some(response) = calls.next() => response,
+                (stdin, line) = &mut reading, if open => {
+                    let line = line?;
+                    if line.is_empty() {
+                        open = false;
+                        continue;
+                    }
+                    reading = Box::pin(next(stdin));
+                    // Notifications and malformed messages need no reply.
+                    let Ok(request) = serde_json::from_slice::<Value>(&line) else {
+                        continue;
                     };
-                    json!({"result": tool_result(output)})
+                    if !request.is_object() || request.get("id").is_none() {
+                        continue;
+                    }
+                    let response = match request["method"].as_str() {
+                        Some("initialize") => json!({"result": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "crow-inspection", "version": "1.0.0"},
+                        }}),
+                        Some("tools/list") => json!({"result": {"tools": definitions}}),
+                        Some("ping") => json!({"result": {}}),
+                        Some("tools/call") => {
+                            calls.push(async move {
+                                let output = call_tool(source, delegation_ref, execution_ref, &request["params"]).await;
+                                reply(&request, json!({"result": tool_result(output)}))
+                            });
+                            continue;
+                        }
+                        _ => json!({"error": {"code": -32601, "message": "Unsupported method"}}),
+                    };
+                    reply(&request, response)
                 }
-                _ => json!({"error": {"code": -32601, "message": "Unsupported method"}}),
             };
-            response["jsonrpc"] = "2.0".into();
-            response["id"] = request["id"].clone();
             let write = async {
                 stdout.write_all(response.to_string().as_bytes()).await?;
                 stdout.write_all(b"\n").await?;

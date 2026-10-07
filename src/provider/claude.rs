@@ -93,6 +93,11 @@ pub(super) fn environment(settings: &Value, root: &Path) -> Result<Environment> 
     for (key, value) in ENVIRONMENT {
         env.insert((*key).into(), (*value).into());
     }
+    // An experiment can outlast the default MCP tool timeout.
+    if let Some(policy) = settings.get("execution").filter(|p| p.is_object()) {
+        let seconds = crate::execution::tool_timeout_seconds(policy);
+        env.insert("MCP_TOOL_TIMEOUT".into(), (seconds * 1000).to_string());
+    }
     // Network settings Claude Code needs to reach Anthropic from this host.
     for key in [
         "NODE_EXTRA_CA_CERTS",
@@ -905,6 +910,59 @@ mod tests {
         f.job["settings"]["effort"] = json!("unsupported");
         assert_eq!(kind(f.run().await.unwrap_err()), "config");
         assert!(!f.root.path().join("invocation.json").exists());
+    }
+    #[tokio::test]
+    async fn experiments_add_runtime_tools_timeout_and_report_summary() {
+        let mut f = Fixture::new(json!({}));
+        f.job["settings"]["execution"] = json!({
+            "podman": "podman",
+            "limits": crate::execution::Limits::default(),
+        });
+        // A receipt from earlier in this review appears in the published summary.
+        let receipt = json!({"id":"1","kind":"test","revision":"head","status":"passed","purpose":"Run the unit tests"});
+        let receipt_path = "reviews/job-one/experiments/0001.json";
+        crate::util::atomic(&f.root.path().join(receipt_path), &receipt).unwrap();
+        let report = f.run().await.unwrap();
+        assert!(
+            text(&report, "summary").contains("- passed, PR version: Run the unit tests"),
+            "{report}"
+        );
+        let invocation = f.invocation();
+        let args = invocation["args"].as_array().unwrap();
+        let allowed = flag(args, "--allowedTools").unwrap();
+        for name in crate::execution::TOOL_NAMES {
+            assert!(allowed.contains(&format!("mcp__crow_inspection__{name}")));
+        }
+        let timeout = crate::execution::Limits::default().timeout_seconds + 300;
+        assert_eq!(
+            invocation["env"]["MCP_TOOL_TIMEOUT"],
+            json!((timeout * 1000).to_string())
+        );
+        assert!(text(&invocation, "prompt").contains("Runtime tools are available"));
+        let context = crate::util::read_json(
+            &f.root
+                .path()
+                .join("reviews/job-one/delegation-context.json"),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(context["job"]["settings"]["execution"].is_object());
+        // Without a policy, no runtime tools, prompt or summary.
+        let plain = Fixture::new(json!({}));
+        plain.run().await.unwrap();
+        let invocation = plain.invocation();
+        let allowed = flag(invocation["args"].as_array().unwrap(), "--allowedTools").unwrap();
+        assert!(!allowed.contains("run_experiment"));
+        assert!(!text(&invocation, "prompt").contains("Runtime tools are available"));
+        assert!(!text(&plain.run().await.unwrap(), "summary").contains("Runtime checks"));
+        // A resumed review that lost its policy still reports what already ran.
+        let resumed = Fixture::new(json!({}));
+        crate::util::atomic(&resumed.root.path().join(receipt_path), &receipt).unwrap();
+        let report = resumed.run().await.unwrap();
+        assert!(
+            text(&report, "summary").contains("- passed, PR version: Run the unit tests"),
+            "{report}"
+        );
     }
     #[tokio::test]
     async fn pinned_models_and_fixed_effort_models_are_accepted() {

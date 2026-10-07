@@ -9,6 +9,18 @@ cargo clippy --locked --all-targets -- -D warnings
 
 It covers durable receipts and jobs, separate worker/admin authentication, inspection permissions, merge-base comparisons, recovery, report validation, provider policy for both providers, setup callbacks, encrypted backups, installation, and retention. Linux subprocess tests exercise cancellation and cleanup, including prompts and MCP servers that receive SIGINT or SIGTERM while stdin stays open.
 
+## Runtime experiments
+
+`tests/runtime_experiments.rs` drives the runtime tools against a fake Podman. It covers preparation and reuse, fresh runs, base comparisons, the isolation flags on every container, the setup-only gateway mount, the attempt budget, recovery after a crash, and the report summary. Real isolation needs rootless Podman and network access to build the runtime image:
+
+```sh
+cargo test --locked --test runtime_podman -- --ignored --test-threads=1
+```
+
+`real_podman_isolates_experiments` checks the non-root user, empty capabilities, `no_new_privs`, that `unshare`, `clone` and `clone3` cannot create a user namespace while threads still work, the read-only root, the lack of network in tests, the gateway's allowlist, offline use of a prepared dependency, and container removal. `real_podman_runs_through_the_helper_a_provider_starts` runs experiments through the MCP helper with the isolated environment providers give it, which only works because the worker passes Podman's environment with the policy.
+
+On October 7, 2026, a live review of [testbed PR #8](https://github.com/Byntham/testbed/pull/8) ran with experiments turned on for that repository: Claude Code with Opus 5.5, rootless Podman 5.7 and crun. The reviewer ran the unit tests and a reproduction in the sandbox, found shares that broke the PR's one-cent rule, and the published review ended with the runtime summary. Setup through the gateway was not part of that review; `real_podman_isolates_experiments` covers it.
+
 ## Installed Codex probes
 
 Opt-in tests run the installed Codex executable against temporary synthetic authentication and a loopback Responses API. They never use an operator's account or perform model inference:

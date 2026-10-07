@@ -1,0 +1,37 @@
+name: Runtime sandbox
+
+# Real rootless Podman checks for runtime experiments. Separate from the release
+# build: it downloads the runtime image and one npm package.
+on:
+  pull_request:
+    paths:
+      - "src/execution/**"
+      - "src/inspection.rs"
+      - "tests/runtime_podman.rs"
+      - ".github/workflows/runtime.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  podman:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain
+      - name: Install rootless Podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes podman uidmap
+          sudo loginctl enable-linger "$USER"
+      - name: Test real rootless runtime experiments
+        run: |
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+          # enable-linger starts the user manager asynchronously.
+          for _ in $(seq 1 30); do [ -S "$XDG_RUNTIME_DIR/bus" ] && break; sleep 1; done
+          systemd-run --user --scope -p Delegate=yes -- \
+            cargo test --locked --test runtime_podman -- --ignored --nocapture --test-threads=1

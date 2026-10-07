@@ -166,6 +166,16 @@ pub fn validate_response(config: &Value, action: &str, mut value: Value) -> Resu
             ensure!(pr["draft"].is_boolean(), INVALID);
             string(&pr["user"]["login"])?;
             string(&pr["head"]["sha"])?;
+            ensure!(
+                pr["head"]
+                    .get("repo")
+                    .is_none_or(|r| r.is_null() || r.is_string()),
+                INVALID
+            );
+            ensure!(
+                value.get("executionAllowed").is_none_or(Value::is_boolean),
+                INVALID
+            );
             string(&pr["base"]["sha"])?;
             string(&pr["base"]["ref"])?;
             for k in ["title", "updated_at"] {
@@ -631,6 +641,17 @@ async fn execute(shared: Arc<Shared>, work: Value, cancel: CancellationToken) {
     if let Some(extra) = job["settings"].as_object() {
         settings.extend(extra.clone());
     }
+    // Only this worker's own list grants experiments; the service can only withhold them.
+    settings.remove("execution");
+    let allowed = work["executionAllowed"] == true;
+    let repo = job["repo"].as_str().unwrap_or("");
+    match crate::execution::resolve(&shared.config["worker"], repo, allowed) {
+        Ok(Some(policy)) => {
+            settings.insert("execution".into(), policy);
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!("Runtime experiments are disabled for this review: {e:#}"),
+    }
     job["settings"] = Value::Object(settings);
     let text = |value: &Value, limit: usize| -> String {
         value.as_str().unwrap_or("").chars().take(limit).collect()
@@ -723,6 +744,10 @@ async fn execute(shared: Arc<Shared>, work: Value, cancel: CancellationToken) {
             "report": report,
         });
         util::atomic(&local, &saved)?;
+        // With the report saved, its prepared runtime workspaces are no longer needed.
+        let _ = crate::execution::release_environments(
+            &shared.root.join("reviews").join(string(&job["id"])?),
+        );
         cancelled(&cancel)?;
         let patch = shared
             .backend
@@ -869,32 +894,69 @@ async fn run_loop(shared: Arc<Shared>) {
 }
 async fn maintain(shared: &Arc<Shared>) {
     let result: Result<()> = async {
-        let response = shared.rpc("maintenance", &json!({}), shared.stop.clone()).await?;
-        if let Some(jobs) = response["jobs"].as_array() {
-            let mut state = shared.state.lock().await;
-            for job in jobs {
-                if matches!(job["state"].as_str(), Some("completed" | "superseded" | "cancelled"))
-                    && let Some(id) = job["id"].as_str() { state.sessions.remove(id); }
+        let response = shared
+            .rpc("maintenance", &json!({}), shared.stop.clone())
+            .await?;
+        let jobs = response["jobs"].as_array().cloned().unwrap_or_default();
+        let terminal = |job: &Value| {
+            matches!(
+                job["state"].as_str(),
+                Some("completed" | "superseded" | "cancelled")
+            )
+        };
+        let mut state = shared.state.lock().await;
+        for id in jobs
+            .iter()
+            .filter(|j| terminal(j))
+            .filter_map(|j| j["id"].as_str())
+        {
+            state.sessions.remove(id);
+            // Finished reviews no longer need prepared workspaces.
+            if let Err(e) =
+                crate::execution::release_environments(&shared.root.join("reviews").join(id))
+            {
+                eprintln!("Could not remove prepared runtime workspaces for {id}: {e}");
             }
-            // Keep active records as nonterminal so their delegated sessions protect shared rollouts.
-            let retained: Vec<Value> = jobs.iter().map(|job| {
+        }
+        // Keep active records as nonterminal so their delegated sessions protect shared rollouts.
+        let retained: Vec<Value> = jobs
+            .iter()
+            .map(|job| {
                 let mut job = job.clone();
-                if job["id"].as_str().is_some_and(|id| state.active.contains_key(id)) {
+                if job["id"]
+                    .as_str()
+                    .is_some_and(|id| state.active.contains_key(id))
+                {
                     job["state"] = json!("reviewing");
                 }
                 job
-            }).collect();
-            drop(state);
-            let root = shared.root.clone();
-            let config = json!({"retentionDays": response["retentionDays"]});
-            // Large Codex session trees must not delay lease heartbeats.
-            let outcome = tokio::task::spawn_blocking(move || crate::retention::cleanup(&root, &config, &retained)).await??;
-            if outcome["warnings"].as_array().is_some_and(|v| !v.is_empty()) {
-                eprintln!("Some retained review files could not be cleaned; inspect local file permissions.");
-            }
+            })
+            .collect();
+        drop(state);
+        let root = shared.root.clone();
+        let config = json!({"retentionDays": response["retentionDays"]});
+        // Large session trees must not delay lease heartbeats.
+        let outcome = tokio::task::spawn_blocking(move || {
+            crate::retention::cleanup(&root, &config, &retained)
+        })
+        .await??;
+        if outcome["warnings"]
+            .as_array()
+            .is_some_and(|v| !v.is_empty())
+        {
+            eprintln!(
+                "Some retained review files could not be cleaned; inspect local file permissions."
+            );
+        }
+        // Shutdown stops a runtime image build rather than waiting for it.
+        if let Err(e) = crate::execution::maintain(&shared.config["worker"], &shared.stop).await
+            && !shared.stop.is_cancelled()
+        {
+            eprintln!("Runtime maintenance deferred: {e:#}");
         }
         Ok(())
-    }.await;
+    }
+    .await;
     if result.is_err() && !shared.stop.is_cancelled() {
         eprintln!("Review retention cleanup deferred until the next maintenance check.");
     }
@@ -1058,6 +1120,7 @@ mod tests {
         review_started: Semaphore,
         cleaning: Semaphore,
         guidance_targets: Mutex<Vec<Value>>,
+        settings: std::sync::Mutex<Vec<Value>>,
     }
     impl Fake {
         fn new() -> Self {
@@ -1077,6 +1140,7 @@ mod tests {
                 review_started: Semaphore::new(0),
                 cleaning: Semaphore::new(0),
                 guidance_targets: Mutex::new(vec![]),
+                settings: std::sync::Mutex::new(vec![]),
             }
         }
         async fn count(&self, action: &str) -> usize {
@@ -1166,6 +1230,7 @@ mod tests {
         ) -> Result<Value> {
             self.reviews.fetch_add(1, Ordering::SeqCst);
             assert!(job["settings"].get("codexHome").is_some());
+            self.settings.lock().unwrap().push(job["settings"].clone());
             assert!(job["settings"].get("token").is_none());
             if let Some(callback) = callbacks.on_session {
                 callback(json!(SESSION)).await?;
@@ -1464,6 +1529,50 @@ mod tests {
             assert!(!log.contains(secret), "leaked {secret}");
         }
         assert!(log.contains("Authorization: Bearer [redacted]"));
+    }
+    #[tokio::test]
+    async fn experiments_need_the_worker_list_and_the_services_approval() {
+        let listed = json!({"repositories":{"Owner/Project":{"maxRuns":4}}});
+        let settings = json!({
+            "model": null,
+            "effort": null,
+            "subagents": {"mode": "inherit", "max": 8},
+            "retry": {"mode": "fixed", "count": 10, "delayMs": 5000},
+            "timeoutMs": 0,
+            "execution": listed.clone(),
+        });
+        // (worker lists the repository, service allows, service sends settings, expected)
+        for (on_list, allowed, from_service, expected) in [
+            (true, true, false, true),
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, true, true, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let f = Arc::new(Fake::new());
+            let mut claim = work();
+            claim["executionAllowed"] = json!(allowed);
+            if from_service {
+                claim["job"]["settings"] = settings.clone();
+            }
+            *f.queue.lock().await = VecDeque::from([claim]);
+            let mut config = crate::config::defaults(dir.path());
+            config["worker"]["concurrency"] = json!(1);
+            if on_list {
+                config["worker"]["execution"] = listed.clone();
+            }
+            let worker = start_worker_with(config, dir.path().to_owned(), f.clone(), options())
+                .await
+                .unwrap();
+            f.until("report", 1).await;
+            worker.close().await.unwrap();
+            let seen = f.settings.lock().unwrap()[0].clone();
+            let case = (on_list, allowed, from_service);
+            assert_eq!(seen["execution"].is_object(), expected, "{case:?}: {seen}");
+            if expected {
+                assert_eq!(seen["execution"]["limits"]["maxRuns"], 4);
+            }
+        }
     }
     #[tokio::test]
     async fn service_saved_report_avoids_inference() {
