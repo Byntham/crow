@@ -3,6 +3,7 @@
 use super::podman;
 use anyhow::{Context, Result, ensure};
 use std::{collections::BTreeMap, time::Duration};
+use tokio_util::sync::CancellationToken;
 
 const CONTAINERFILE: &str = include_str!("Containerfile");
 const PROXY: &str = include_str!("proxy.py");
@@ -23,8 +24,13 @@ pub async fn exists(executable: &str, env: &BTreeMap<String, String>) -> Result<
     Ok(output.success)
 }
 
-/// Build the current image, then remove older Crow-managed images.
-pub async fn build(executable: &str, env: &BTreeMap<String, String>) -> Result<()> {
+/// Build the current image, then remove older Crow-managed images. Cancelling
+/// stops the build, for example when the worker shuts down.
+pub async fn build(
+    executable: &str,
+    env: &BTreeMap<String, String>,
+    cancel: &CancellationToken,
+) -> Result<()> {
     let context = tempfile::tempdir()?;
     std::fs::write(context.path().join("Containerfile"), CONTAINERFILE)?;
     std::fs::write(context.path().join("proxy.py"), PROXY)?;
@@ -42,6 +48,7 @@ pub async fn build(executable: &str, env: &BTreeMap<String, String>) -> Result<(
         crate::process::RunOptions {
             env: Some(env.clone()),
             timeout: Some(Duration::from_secs(1800)),
+            cancel: cancel.clone(),
             ..Default::default()
         },
     )

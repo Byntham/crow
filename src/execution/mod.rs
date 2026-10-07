@@ -558,14 +558,14 @@ pub fn release_environments(review_dir: &Path) -> Result<()> {
 /// Worker maintenance: build the runtime image if it is missing. Containers need
 /// no sweep: each is removed after its command, Podman stops and removes it when
 /// its lifetime ends even if Crow has exited, and a resumed review removes its own.
-pub async fn maintain(worker: &Value) -> Result<()> {
+pub async fn maintain(worker: &Value, cancel: &CancellationToken) -> Result<()> {
     if !configured(worker) {
         return Ok(());
     }
     let config = parse(&worker["execution"])?;
     let env = podman_env();
     if !image::exists(&config.podman, &env).await? {
-        image::build(&config.podman, &env).await?;
+        image::build(&config.podman, &env, cancel).await?;
     }
     Ok(())
 }
@@ -666,6 +666,34 @@ mod tests {
             names,
             TOOL_NAMES.iter().map(|n| json!(n)).collect::<Vec<_>>()
         );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_stops_a_runtime_image_build() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let podman = dir.path().join("podman");
+        // The image is missing, and building it never finishes.
+        std::fs::write(
+            &podman,
+            "#!/bin/sh\n[ \"$1\" = build ] && exec sleep 600\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&podman, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let worker = json!({"execution": {"podman": podman, "repositories": {"o/r": {}}}});
+        let cancel = CancellationToken::new();
+        let stop = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            stop.cancel();
+        });
+        let stopped = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            maintain(&worker, &cancel),
+        )
+        .await
+        .expect("cancelling must stop the build");
+        assert!(stopped.is_err());
     }
     #[test]
     fn delegated_reviews_never_receive_execution() {

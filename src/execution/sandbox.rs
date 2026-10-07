@@ -3,7 +3,7 @@
 //! filesystem, verified cgroup limits, and no network unless it is a setup
 //! container using the gateway.
 use super::{Limits, gateway::Gateway, seccomp};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -97,7 +97,7 @@ impl Sandbox<'_> {
             return Outcome::sandbox_error(format!("Seccomp profile: {e:#}"));
         }
         let gateway = if run.snapshot.is_some() {
-            match Gateway::start_in(run.scratch) {
+            match Gateway::start_in(run.scratch, self.limits) {
                 Ok(gateway) => Some(gateway),
                 Err(e) => return Outcome::sandbox_error(format!("Package gateway: {e:#}")),
             }
@@ -258,8 +258,17 @@ impl Sandbox<'_> {
     }
     /// Stream a container file into `target`, bounded by the workspace size.
     async fn export(&self, args: &[String], target: &Path) -> Result<()> {
-        let limit = self.limits.workspace_mib * 1024 * 1024;
         let partial = target.with_extension("partial");
+        let result = self.stream(args, &partial).await.and_then(|()| {
+            std::fs::rename(&partial, target).context("Could not store the snapshot")
+        });
+        if result.is_err() {
+            let _ = std::fs::remove_file(&partial);
+        }
+        result
+    }
+    async fn stream(&self, args: &[String], partial: &Path) -> Result<()> {
+        let limit = self.limits.workspace_mib * 1024 * 1024;
         let mut child = Command::new(self.podman)
             .args(args)
             .env_clear()
@@ -271,28 +280,27 @@ impl Sandbox<'_> {
             .spawn()?;
         let mut stdout = child.stdout.take().unwrap().take(limit + 1);
         let stderr = child.stderr.take().unwrap();
-        let errors = Arc::new(Mutex::new(Captured::default()));
-        let mut file = tokio::fs::File::create(&partial).await?;
-        let (copied, _, status) = tokio::try_join!(
-            tokio::io::copy(&mut stdout, &mut file),
-            capture(stderr, &errors),
-            child.wait()
-        )?;
-        drop(file);
-        let result = if copied > limit {
-            Err(anyhow::anyhow!(
-                "the workspace exceeds {} MiB",
-                self.limits.workspace_mib
-            ))
-        } else if !status.success() {
-            Err(anyhow::anyhow!("{}", errors.lock().unwrap().text()))
-        } else {
-            std::fs::rename(&partial, target).context("Could not store the snapshot")
+        let errors = Mutex::new(Captured::default());
+        let mut file = tokio::fs::File::create(partial).await?;
+        let copy = async {
+            let copied = tokio::io::copy(&mut stdout, &mut file).await;
+            // Past the limit nothing reads the archive, so tar would block until
+            // the container's timeout. Stop the export instead.
+            if !matches!(copied, Ok(n) if n <= limit) {
+                let _ = child.start_kill();
+            }
+            (copied, child.wait().await)
         };
-        if result.is_err() {
-            let _ = std::fs::remove_file(&partial);
-        }
-        result
+        let ((copied, status), captured) = tokio::join!(copy, capture(stderr, &errors));
+        let (copied, status) = (copied?, status?);
+        captured?;
+        ensure!(
+            copied <= limit,
+            "the workspace exceeds {} MiB",
+            self.limits.workspace_mib
+        );
+        ensure!(status.success(), "{}", errors.lock().unwrap().text());
+        Ok(())
     }
 }
 
@@ -603,6 +611,29 @@ mod tests {
         assert!(check.contains("id -u"));
         assert!(check.contains(&format!("= {} ]", Limits::default().pids)));
         assert!(check.contains("exit 125"));
+    }
+    #[tokio::test]
+    async fn oversized_export_stops_without_waiting_for_the_container() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = std::env::vars().filter(|(k, _)| k == "PATH").collect();
+        let limits = Limits {
+            workspace_mib: 1,
+            ..Limits::default()
+        };
+        let sandbox = Sandbox {
+            podman: "/bin/sh",
+            env: &env,
+            limits: &limits,
+        };
+        // `yes` never ends on its own, like tar blocked on a full pipe.
+        let target = dir.path().join("snapshot.tar");
+        let args = ["-c", "exec yes"].map(str::to_owned);
+        let exported =
+            tokio::time::timeout(Duration::from_secs(10), sandbox.export(&args, &target))
+                .await
+                .expect("the export must stop at the limit");
+        assert!(exported.unwrap_err().to_string().contains("exceeds 1 MiB"));
+        assert!(!target.exists() && !target.with_extension("partial").exists());
     }
     #[test]
     fn captured_output_keeps_beginning_and_end() {

@@ -96,7 +96,10 @@ async fn real_podman_isolates_experiments() {
         .await
         .unwrap()
     {
-        crow::execution::image::build("podman", &env).await.unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        crow::execution::image::build("podman", &env, &cancel)
+            .await
+            .unwrap();
     }
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

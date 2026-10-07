@@ -948,7 +948,10 @@ async fn maintain(shared: &Arc<Shared>) {
                 "Some retained review files could not be cleaned; inspect local file permissions."
             );
         }
-        if let Err(e) = crate::execution::maintain(&shared.config["worker"]).await {
+        // Shutdown stops a runtime image build rather than waiting for it.
+        if let Err(e) = crate::execution::maintain(&shared.config["worker"], &shared.stop).await
+            && !shared.stop.is_cancelled()
+        {
             eprintln!("Runtime maintenance deferred: {e:#}");
         }
         Ok(())

@@ -1,6 +1,7 @@
 //! Package download gateway for setup containers. Containers have no network
 //! interface; a setup container reaches this gateway through a Unix socket and
 //! can open HTTPS tunnels only to a fixed list of public package registries.
+use super::Limits;
 use anyhow::{Context, Result, ensure};
 use std::{
     net::IpAddr,
@@ -88,7 +89,7 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 // Keep a completed HTTP keep-alive from consuming every tunnel indefinitely
 // when another package request is waiting. This deadline applies only while
 // another accepted connection is waiting for admission. A quiet connection with
-// no demand keeps the existing 120-second whole-connection limit. Because TLS
+// no demand lasts as long as the setup command. Because TLS
 // remains encrypted, a slow first response under pressure is indistinguishable
 // from keep-alive and may require the package manager to retry.
 const PRESSURE_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -255,6 +256,7 @@ async fn tunnel(
     client: &mut UnixStream,
     established: &mut bool,
     pressure: watch::Receiver<bool>,
+    download_limit: u64,
 ) -> Result<()> {
     let mut header = Vec::new();
     while !header.ends_with(b"\r\n\r\n") {
@@ -284,14 +286,15 @@ async fn tunnel(
     // Connect to the validated address, never resolve the hostname again.
     let mut remote = TcpStream::connect(addresses.as_slice()).await?;
     remote.write_all(&hello).await?;
-    // Bound bytes in each direction as well as lifetime and concurrency.
+    // Bound bytes in each direction as well as lifetime and concurrency. A
+    // download larger than the workspace could not be kept anyway.
     relay(
         client,
         &mut remote,
         pressure,
         PRESSURE_IDLE_TIMEOUT,
         16 * 1024 * 1024 - hello.len() as u64,
-        256 * 1024 * 1024,
+        download_limit,
     )
     .await
 }
@@ -316,9 +319,12 @@ pub struct Gateway {
 impl Gateway {
     #[cfg(test)]
     pub fn start() -> Result<Self> {
-        Self::start_in(&std::env::temp_dir())
+        Self::start_in(&std::env::temp_dir(), &Limits::default())
     }
-    pub fn start_in(root: &Path) -> Result<Self> {
+    /// Each tunnel lasts at most the setup timeout and downloads at most the workspace size.
+    pub fn start_in(root: &Path, limits: &Limits) -> Result<Self> {
+        let lifetime = Duration::from_secs(limits.timeout_seconds);
+        let download_limit = limits.workspace_mib * 1024 * 1024;
         let directory = tempfile::Builder::new()
             .prefix(".crow-runtime-downloads-")
             .tempdir_in(root)?;
@@ -379,10 +385,10 @@ impl Gateway {
                         tasks.spawn(async move {
                             let _permit = permit;
                             let mut established = false;
-                            let error = match tokio::time::timeout(Duration::from_secs(120), tunnel(&mut stream, &mut established, pressured)).await {
+                            let error = match tokio::time::timeout(lifetime, tunnel(&mut stream, &mut established, pressured, download_limit)).await {
                                 Ok(Ok(())) => return,
                                 Ok(Err(error)) => format!("{error:#}"),
-                                Err(_) => "Package gateway connection timed out after 120 seconds".to_owned(),
+                                Err(_) => format!("Package gateway connection timed out after {} seconds", lifetime.as_secs()),
                             };
                             remember_error(&errors, &error);
                             // After CONNECT, the peer expects TLS. Keep the actual
@@ -811,7 +817,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let long = root.path().join("long-review-directory-".repeat(8));
         std::fs::create_dir(&long).unwrap();
-        let gateway = Gateway::start_in(&long).unwrap();
+        let gateway = Gateway::start_in(&long, &Limits::default()).unwrap();
         let dir = gateway.directory().to_owned();
         assert!(dir.starts_with(&long));
         let handle = std::fs::File::open(&dir).unwrap();
