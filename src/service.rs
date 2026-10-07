@@ -275,10 +275,37 @@ impl Service {
             .get("jobs", id)?
             .is_some_and(|j| s(&j, "state") == state && s(&j, "lease") == lease))
     }
+    /// The PR as GitHub has it now. `readAt` records when it was read, so a
+    /// later decision can tell whether newer work was queued meanwhile.
     async fn refresh(&self, repo: &Value, number: i64) -> Result<(Value, String)> {
+        let read_at = now();
         let token = self.github.token(repo).await?;
-        let pr = self.github.pr(repo, number, &token).await?;
+        let mut pr = self.github.pr(repo, number, &token).await?;
+        pr["readAt"] = json!(read_at);
         Ok((pr, token))
+    }
+    /// A job queued for another version of the PR since `pr` was read reflects
+    /// a newer view of it. Queueing `pr` would supersede that job, which may be
+    /// a requested review, so it stays instead.
+    fn newer(&self, repo: &Value, pr: &Value) -> Result<Option<Value>> {
+        let key = format!("{}#{}", s(repo, "name"), n(pr, "number"));
+        Ok(self.latest(&key)?.filter(|j| {
+            n(pr, "readAt") > 0
+                && n(j, "createdAt") >= n(pr, "readAt")
+                && ACTIVE.contains(&s(j, "state"))
+                && (j["head"] != pr["head"]["sha"] || j["target"] != pr["base"]["ref"])
+        }))
+    }
+    /// Queue `pr` after a lookup, unless newer work arrived meanwhile.
+    fn place(&self, repo: &Value, pr: &Value, options: &Value, verify: bool) -> Result<Value> {
+        if let Some(newer) = self.newer(repo, pr)? {
+            return Ok(newer);
+        }
+        if verify {
+            self.queue_unverified(repo, pr, options)
+        } else {
+            self.db(|db| db.queue(repo, pr, options))
+        }
     }
     /// The PR with its branch's pushes, when the repository checks who pushed.
     /// Pushes are null when GitHub refuses the lookup or the head repository
@@ -318,15 +345,12 @@ impl Service {
         if !eligible(repo, pr) {
             return Ok(None);
         }
-        if b(options, "manual") || b(options, "admitted") {
-            return Ok(Some(self.db(|db| db.queue(repo, pr, options))?));
-        }
-        if b(options, "verify") {
-            return Ok(Some(self.queue_unverified(repo, pr, options)?));
+        if b(options, "manual") || b(options, "admitted") || b(options, "verify") {
+            return Ok(Some(self.place(repo, pr, options, b(options, "verify"))?));
         }
         Ok(match self.admission(repo, pr, token).await {
-            Admission::Admit => Some(self.db(|db| db.queue(repo, pr, options))?),
-            Admission::Verify => Some(self.queue_unverified(repo, pr, options)?),
+            Admission::Admit => Some(self.place(repo, pr, options, false)?),
+            Admission::Verify => Some(self.place(repo, pr, options, true)?),
             Admission::Skip(_) => None,
         })
     }
@@ -429,10 +453,13 @@ impl Service {
             return Ok(active);
         }
         let pr = match self.admission(&repo, &pr, &token).await {
-            Admission::Admit => return self.db(|db| db.queue(&repo, &pr, opts)),
-            Admission::Verify => return self.queue_unverified(&repo, &pr, opts),
+            Admission::Admit => return self.place(&repo, &pr, opts, false),
+            Admission::Verify => return self.place(&repo, &pr, opts, true),
             Admission::Skip(pr) => pr,
         };
+        if let Some(newer) = self.newer(&repo, &pr)? {
+            return Ok(newer);
+        }
         // A version queued, requested or reviewed before or during the lookup
         // keeps that state. Nothing runs between this check and the skip below.
         if let Some(existing) = self.latest(&key)?.filter(|j| {
@@ -459,7 +486,11 @@ impl Service {
         let _guard = lock.lock().await;
         let initial = self.repo(name)?;
         let token = self.github.token(&initial).await?;
-        let prs = self.github.prs(&initial, &token).await?;
+        let read_at = now();
+        let prs: Vec<Value> = (self.github.prs(&initial, &token).await?)
+            .into_iter()
+            .map(|pr| patch(pr, &json!({"readAt": read_at})))
+            .collect();
         let mut repo = self.repo(name)?;
         if include_backlog {
             repo["excluded"] = json!([]);
@@ -507,12 +538,7 @@ impl Service {
         let fresh = admitted;
         let held = fresh.len() as i64 > n(&self.config["catchUp"], "threshold");
         for (pr, verify) in &fresh {
-            let options = json!({"held":held});
-            if *verify {
-                self.queue_unverified(&repo, pr, &options)?;
-            } else {
-                self.db(|db| db.queue(&repo, pr, &options))?;
-            }
+            self.place(&repo, pr, &json!({"held":held}), *verify)?;
         }
         Ok(json!({"queued":if held {0}else{fresh.len()},"held":if held {fresh.len()}else{0}}))
     }
@@ -591,7 +617,11 @@ impl Service {
             }
             "push" if s(e, "ref").starts_with("refs/heads/") => {
                 let token = self.github.token(&repo).await?;
-                let prs = self.github.prs(&repo, &token).await?;
+                let read_at = now();
+                let prs: Vec<Value> = (self.github.prs(&repo, &token).await?)
+                    .into_iter()
+                    .map(|pr| patch(pr, &json!({"readAt": read_at})))
+                    .collect();
                 let current = self.repo(&name)?;
                 for pr in prs.iter().filter(|pr| {
                     s(&pr["base"], "ref") == &s(e, "ref")[11..]
@@ -1158,24 +1188,38 @@ impl Service {
         if !self.owns(id, lease, "reviewing")? {
             return Ok(Value::Null);
         }
-        // Enrollment can change while GitHub calls are pending.
+        // Enrollment can change while GitHub calls are pending, and a review
+        // requested meanwhile marks the stored job manual. Nothing runs between
+        // these reads and the decisions below.
         let repo = self.repo(s(job, "repo"))?;
+        let stored = self.get("jobs", id)?.unwrap_or_else(|| job.clone());
+        let requested = b(&stored, "manual");
         if !eligible(&repo, &pr)
             || pr["head"]["sha"] != job["head"]
             || pr["base"]["ref"] != job["target"]
             || repo["worker"] != job["worker"]
         {
             self.update(id, json!({"state":"superseded"}), Some(lease))?;
-            self.succeed(&repo, &pr, &api_token, job).await;
+            self.succeed(&repo, &pr, &api_token, &stored).await;
+            return Ok(Value::Null);
+        }
+        // An automatic review admitted under an earlier author list or push
+        // setting stops once GitHub confirms someone now unlisted pushed it.
+        let unverified = b(job, "verifyPusher") && !requested && checks_pushers(&repo);
+        if !unverified
+            && !requested
+            && checks_pushers(&repo)
+            && head_pusher(&pr).is_some()
+            && !pushed_by_author(&repo, &pr)
+        {
+            let skipped =
+                json!({"state":"cancelled","autoRecover":false,"reason":pusher_reason(&pr)});
+            self.update(id, skipped, Some(lease))?;
             return Ok(Value::Null);
         }
         // A version queued before GitHub confirmed its pusher goes ahead only once
         // a listed author is confirmed. Until the windows pass it waits;
         // otherwise it is skipped like any other version.
-        // Read the stored job: a review requested during the GitHub calls above
-        // marked it manual, and nothing runs between here and the decision.
-        let requested = self.get("jobs", id)?.is_some_and(|j| b(&j, "manual"));
-        let unverified = b(job, "verifyPusher") && !requested && checks_pushers(&repo);
         if unverified && !pushed_by_author(&repo, &pr) {
             // The windows start at the first check, not when the version was
             // queued, since a held or busy queue can delay that check.
@@ -1228,6 +1272,11 @@ impl Service {
         let execution_allowed = s(&repo, "policy") != "everyone"
             && !fork
             && (!checks_pushers(&repo) || every_push_by_authors(&repo, &pr));
+        // The worker needs the PR, not Crow's bookkeeping about it.
+        if let Some(fields) = pr.as_object_mut() {
+            fields.remove("pushes");
+            fields.remove("readAt");
+        }
         Ok(json!({
             "job": patch(job.clone(), &json!({"settings": settings})),
             "pr": pr,
@@ -3513,6 +3562,102 @@ mod tests {
         gate.open();
         assert_eq!(claim.await.unwrap().unwrap()["job"]["id"], queued["id"]);
         assert_eq!(f.job(s(&queued, "id"))["state"], "reviewing");
+        f.close().await;
+
+        // An event still looking up an older version does not supersede a newer
+        // one requested meanwhile.
+        let f = Fixture::new().await;
+        *f.github.pushes.lock().unwrap() = Some(vec![bob(&"a".repeat(40))]);
+        let gate = Gate::new();
+        *f.github.pushes_gate.lock().unwrap() = Some(gate.clone());
+        let service = f.handle.service.clone();
+        let event = tokio::spawn(f.handle.execute(async move {
+            let options = json!({"event":true,"trigger":"Pull request updated"});
+            service
+                .enqueue(&service.repo("owner/project")?, 1, &options)
+                .await
+        }));
+        gate.wait().await;
+        f.github.prs.lock().unwrap()[0]["head"]["sha"] = json!("b".repeat(40));
+        let requested = f
+            .handle
+            .admin("review", &json!({"repo":"owner/project","number":1}))
+            .await
+            .unwrap();
+        gate.open();
+        assert_eq!(event.await.unwrap().unwrap()["id"], requested["id"]);
+        let kept = f.job(s(&requested, "id"));
+        assert_eq!(
+            (&kept["state"], &kept["manual"]),
+            (&json!("queued"), &json!(true))
+        );
+        f.close().await;
+
+        // A version admitted while pushes from anyone were accepted stops at
+        // dispatch once the repository checks pushers again.
+        let f = Fixture::new().await;
+        *f.github.pushes.lock().unwrap() = Some(vec![bob(&"a".repeat(40))]);
+        let mut repo = f.handle.service.repo("owner/project").unwrap();
+        repo["pushers"] = json!("anyone");
+        f.handle
+            .service
+            .db(|db| db.enroll(&repo).map(|_| ()))
+            .unwrap();
+        let admitted = f.queue().await;
+        repo["pushers"] = json!("authors");
+        f.handle
+            .service
+            .db(|db| db.enroll(&repo).map(|_| ()))
+            .unwrap();
+        assert!(f.claim().await.is_null());
+        let stopped = f.job(s(&admitted, "id"));
+        assert_eq!(stopped["state"], "cancelled");
+        assert!(s(&stopped, "reason").contains("bob pushed"), "{stopped}");
+        f.close().await;
+
+        // A review requested during dispatch survives a supersede: the
+        // replacement stays requested rather than unverified.
+        let f = Fixture::new().await;
+        *f.github.pushes.lock().unwrap() = Some(vec![]);
+        let service = f.handle.service.clone();
+        f.handle
+            .execute(async move {
+                let options = json!({"event":true,"trigger":"Pull request updated"});
+                service
+                    .enqueue(&service.repo("owner/project")?, 1, &options)
+                    .await
+            })
+            .await
+            .unwrap();
+        let gate = Gate::new();
+        *f.github.pushes_gate.lock().unwrap() = Some(gate.clone());
+        let service = f.handle.service.clone();
+        let worker = service
+            .get("workers", s(&f.config["worker"], "id"))
+            .unwrap()
+            .unwrap();
+        let claim = tokio::spawn(f.handle.execute(async move {
+            service
+                .worker_action("next", &json!({"active":[]}), worker)
+                .await
+        }));
+        gate.wait().await;
+        f.handle
+            .admin("review", &json!({"repo":"owner/project","number":1}))
+            .await
+            .unwrap();
+        // The repository moves to another worker, which supersedes the job.
+        let mut repo = f.handle.service.repo("owner/project").unwrap();
+        repo["worker"] = json!("other-worker");
+        f.handle
+            .service
+            .db(|db| db.enroll(&repo).map(|_| ()))
+            .unwrap();
+        gate.open();
+        assert!(claim.await.unwrap().unwrap().is_null());
+        let replacement = latest(&f);
+        assert_eq!(replacement["worker"], "other-worker");
+        assert_eq!(replacement["manual"], true);
         f.close().await;
 
         // The windows start at the first check: a version that waited long in
