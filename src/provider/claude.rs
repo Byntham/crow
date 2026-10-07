@@ -169,6 +169,16 @@ pub(super) async fn catalog(
     root: &Path,
     cancel: &CancellationToken,
 ) -> Result<Value> {
+    // The handshake also answers for API-key logins; list models only for a subscription.
+    let status = auth(settings, root, cancel).await?;
+    if status["authenticated"] != true {
+        return Err(failure(
+            "auth",
+            status["warning"]
+                .as_str()
+                .unwrap_or("A Claude subscription login is required for model discovery."),
+        ));
+    }
     let environment = environment(settings, root)?;
     let mut args = locked_down();
     args.extend(["--input-format".into(), "stream-json".into()]);
@@ -712,6 +722,11 @@ mod tests {
         )
         .await
         .unwrap_err();
+        assert_eq!(kind(error), "auth");
+        let api_key = Fixture::new(json!({"apiKey":true}));
+        let error = discover(&api_key.job["settings"], api_key.root.path())
+            .await
+            .unwrap_err();
         assert_eq!(kind(error), "auth");
     }
     #[tokio::test]
