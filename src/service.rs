@@ -81,6 +81,43 @@ fn eligible(repo: &Value, pr: &Value) -> bool {
         && (s(repo, "policy") == "everyone"
             || matches_login(&repo["authors"], s(&pr["user"], "login")))
 }
+/// Whether Crow checks who pushed each version of a repository's PRs. It does
+/// unless the repository reviews everyone, or accepts pushes from anyone.
+fn checks_pushers(repo: &Value) -> bool {
+    s(repo, "policy") != "everyone" && s(repo, "pushers") != "anyone"
+}
+/// Who pushed the PR's current head, from its branch's push activity.
+fn head_pusher(pr: &Value) -> Option<&str> {
+    let head = s(&pr["head"], "sha");
+    pr["pushes"]
+        .as_array()?
+        .iter()
+        .find(|p| s(p, "after") == head)?["actor"]
+        .as_str()
+}
+/// Whether a listed author pushed this version, when the repository requires it.
+/// Only automatic reviews depend on this; a requester can still ask for one.
+fn pushed_by_author(repo: &Value, pr: &Value) -> bool {
+    !checks_pushers(repo)
+        || head_pusher(pr).is_some_and(|login| matches_login(&repo["authors"], login))
+}
+fn pusher_reason(pr: &Value) -> String {
+    let why = match head_pusher(pr) {
+        Some(login) => format!("{login} pushed this version and is not a listed author"),
+        None => "Crow could not confirm who pushed this version".to_owned(),
+    };
+    format!("Not reviewed automatically: {why}. Comment `/crow review` to review it.")
+}
+/// Whether every push since the PR's branch was created came from a listed author.
+fn every_push_by_authors(repo: &Value, pr: &Value) -> bool {
+    let pushes = array(&pr["pushes"]);
+    pushes.iter().any(|p| p["type"] == "branch_creation")
+        && pushes.iter().all(|p| {
+            p["actor"]
+                .as_str()
+                .is_some_and(|login| matches_login(&repo["authors"], login))
+        })
+}
 fn ineligible_reason(repo: &Value, pr: Option<&Value>) -> &'static str {
     match pr {
         None => "PR is closed",
@@ -209,14 +246,38 @@ impl Service {
             .get("jobs", id)?
             .is_some_and(|j| s(&j, "state") == state && s(&j, "lease") == lease))
     }
-    async fn refresh(&self, repo: &Value, number: i64) -> Result<(Value, String)> {
+    /// The PR as GitHub has it now, with its branch's pushes when the
+    /// repository checks who pushed. `wait` allows for GitHub listing a push a
+    /// moment after its webhook.
+    async fn refresh(&self, repo: &Value, number: i64, wait: bool) -> Result<(Value, String)> {
         let token = self.github.token(repo).await?;
         let pr = self.github.pr(repo, number, &token).await?;
-        Ok((pr, token))
+        Ok((self.with_pushes(repo, pr, &token, wait).await, token))
+    }
+    async fn with_pushes(&self, repo: &Value, mut pr: Value, token: &str, wait: bool) -> Value {
+        if !checks_pushers(repo) {
+            return pr;
+        }
+        for attempt in 0..3 {
+            // Without the pushes the pusher is unconfirmed, which withholds
+            // automatic reviews and experiments rather than allowing them.
+            pr["pushes"] = match self.github.pushes(repo, &pr, token).await {
+                Ok(pushes) => json!(pushes),
+                Err(e) => {
+                    eprintln!("Could not read who pushed PR #{}: {e}", n(&pr, "number"));
+                    json!([])
+                }
+            };
+            if !wait || head_pusher(&pr).is_some() || attempt == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        pr
     }
     async fn enqueue(&self, repo: &Value, number: i64, opts: &Value) -> Result<Value> {
         ensure!(number > 0, "Invalid pull request number");
-        let (pr, _) = self.refresh(repo, number).await?;
+        let (pr, _) = self.refresh(repo, number, b(opts, "event")).await?;
         let mut repo = self.repo(s(repo, "name"))?;
         let requester = s(opts, "requester");
         if !requester.is_empty() && !matches_login(requesters(&repo), requester) {
@@ -241,6 +302,16 @@ impl Service {
             self.db(|db| db.enroll(&repo).map(|_| ()))?;
         } else if array(&repo["excluded"]).contains(&json!(number)) {
             return Ok(json!({"skipped":"Initial backlog excluded"}));
+        }
+        if !b(opts, "manual") && !pushed_by_author(&repo, &pr) {
+            // Show the skipped version on the PR's status. An explicit request stands.
+            let job = self.db(|db| db.queue(&repo, &pr, opts))?;
+            if !b(&job, "manual") {
+                let skipped =
+                    json!({"state":"cancelled","autoRecover":false,"reason":pusher_reason(&pr)});
+                self.update(s(&job, "id"), skipped, None)?;
+            }
+            return Ok(json!({"skipped":"Not pushed by a listed author"}));
         }
         self.db(|db| db.queue(&repo, &pr, opts))
     }
@@ -293,6 +364,14 @@ impl Service {
                     })
             })
             .collect();
+        let mut admitted = Vec::new();
+        for pr in fresh {
+            let pr = self.with_pushes(&repo, pr.clone(), &token, false).await;
+            if pushed_by_author(&repo, &pr) {
+                admitted.push(pr);
+            }
+        }
+        let fresh = admitted;
         let held = fresh.len() as i64 > n(&self.config["catchUp"], "threshold");
         for pr in &fresh {
             self.db(|db| db.queue(&repo, pr, &json!({"held":held})))?;
@@ -381,7 +460,10 @@ impl Service {
                         && eligible(&current, pr)
                         && !array(&current["excluded"]).contains(&pr["number"])
                 }) {
-                    self.db(|db| db.queue(&current, pr, &json!({})))?;
+                    let pr = self.with_pushes(&current, pr.clone(), &token, false).await;
+                    if pushed_by_author(&current, &pr) {
+                        self.db(|db| db.queue(&current, &pr, &json!({})))?;
+                    }
                 }
             }
             _ => {}
@@ -477,7 +559,7 @@ impl Service {
     }
     async fn publish(&self, j: &Value) -> Result<()> {
         let (pr, token) = self
-            .refresh(&self.repo(s(j, "repo"))?, n(j, "number"))
+            .refresh(&self.repo(s(j, "repo"))?, n(j, "number"), false)
             .await?;
         let repo = self.repo(s(j, "repo"))?;
         if self
@@ -491,7 +573,7 @@ impl Service {
             || pr["base"]["ref"] != j["target"]
         {
             self.update(s(j, "id"), json!({"state":"superseded"}), None)?;
-            if eligible(&repo, &pr) {
+            if eligible(&repo, &pr) && pushed_by_author(&repo, &pr) {
                 self.db(|db| db.queue(&repo, &pr, &json!({})))?;
             }
             return Ok(());
@@ -737,6 +819,7 @@ impl Service {
                     "policy": a["policy"].as_str().unwrap_or("selected"),
                     "authors": a.get("authors").cloned().unwrap_or_else(|| json!([operator])),
                     "requesters": [operator],
+                    "pushers": a["pushers"].as_str().unwrap_or("authors"),
                     "settings": a.get("settings").cloned().unwrap_or_else(|| json!({})),
                     "enrolledAt": now(),
                     "excluded": [],
@@ -762,13 +845,21 @@ impl Service {
             }
             "config-repo" => {
                 let mut repo = self.repo(string(&a["repo"], "repository")?)?;
-                for k in ["policy", "authors", "requesters", "worker", "settings"] {
+                for k in [
+                    "policy",
+                    "authors",
+                    "requesters",
+                    "pushers",
+                    "worker",
+                    "settings",
+                ] {
                     if let Some(v) = a.get(k) {
                         repo[k] = v.clone();
                     }
                 }
                 ensure!(
                     ["selected", "everyone"].contains(&s(&repo, "policy"))
+                        && ["", "authors", "anyone"].contains(&s(&repo, "pushers"))
                         && valid_logins(&repo["authors"])
                         && valid_logins(&repo["requesters"])
                         && self.get("workers", s(&repo, "worker"))?.is_some(),
@@ -906,7 +997,7 @@ impl Service {
         let id = s(job, "id");
         let lease = s(job, "lease");
         let assigned = self.repo(s(job, "repo"))?;
-        let (pr, _) = self.refresh(&assigned, n(job, "number")).await?;
+        let (pr, _) = self.refresh(&assigned, n(job, "number"), false).await?;
         let token = self.github.checkout_token(&assigned).await?;
         if !self.owns(id, lease, "reviewing")? {
             return Ok(Value::Null);
@@ -919,9 +1010,16 @@ impl Service {
             || repo["worker"] != job["worker"]
         {
             self.update(id, json!({"state":"superseded"}), Some(lease))?;
-            if eligible(&repo, &pr) {
+            if eligible(&repo, &pr) && pushed_by_author(&repo, &pr) {
                 self.db(|db| db.queue(&repo, &pr, &json!({})))?;
             }
+            return Ok(Value::Null);
+        }
+        // The author list or push setting can change after a job is queued.
+        if !b(job, "manual") && !pushed_by_author(&repo, &pr) {
+            let skipped =
+                json!({"state":"cancelled","autoRecover":false,"reason":pusher_reason(&pr)});
+            self.update(id, skipped, Some(lease))?;
             return Ok(Value::Null);
         }
         // Settings are fixed when a review first starts and kept for recovery.
@@ -942,12 +1040,17 @@ impl Service {
             json!({"settings":settings,"author":pr["user"]["login"]}),
             Some(lease),
         )?;
-        // Experiments only for authors the operator listed explicitly, and never
-        // for forks. The worker's own list must also include the repository.
+        // Experiments only for authors the operator listed explicitly, never for
+        // forks, and unless the repository accepts pushes from anyone, only when
+        // listed authors made every push to the branch. A requested review of
+        // someone else's push does not run code. The worker's own list must also
+        // include the repository.
         let fork = !pr["head"]["repo"]
             .as_str()
             .is_some_and(|name| name.eq_ignore_ascii_case(s(&repo, "name")));
-        let execution_allowed = s(&repo, "policy") != "everyone" && !fork;
+        let execution_allowed = s(&repo, "policy") != "everyone"
+            && !fork
+            && (!checks_pushers(&repo) || every_push_by_authors(&repo, &pr));
         Ok(json!({
             "job": patch(job.clone(), &json!({"settings": settings})),
             "pr": pr,
@@ -1229,16 +1332,20 @@ impl Service {
                 let kind = a["kind"].as_str().unwrap_or("transient");
                 if kind == "superseded" {
                     let (pr, _) = self
-                        .refresh(&self.repo(s(&j, "repo"))?, n(&j, "number"))
+                        .refresh(&self.repo(s(&j, "repo"))?, n(&j, "number"), false)
                         .await?;
                     let repo = self.repo(s(&j, "repo"))?;
                     if !self.owns(id, lease, "reviewing")? {
                         return Ok(json!({"cancel":true}));
                     }
                     self.update(id, json!({"state":"superseded"}), Some(lease))?;
-                    if eligible(&repo, &pr) {
-                        let replacement = self.db(|db| db.queue(&repo, &pr, &json!({})))?;
-                        if pr["head"]["sha"] == j["head"] && pr["base"]["ref"] == j["target"] {
+                    let same = pr["head"]["sha"] == j["head"] && pr["base"]["ref"] == j["target"];
+                    // A requested review of this same version stays requested.
+                    let manual = same && b(&j, "manual");
+                    if eligible(&repo, &pr) && (manual || pushed_by_author(&repo, &pr)) {
+                        let options = json!({"manual": manual});
+                        let replacement = self.db(|db| db.queue(&repo, &pr, &options))?;
+                        if same {
                             self.update(s(&replacement, "id"), json!({"nextAt":now()+5000}), None)?;
                         }
                     }
@@ -1351,6 +1458,12 @@ fn validate_admin(a: &Value) -> Result<()> {
         if let Some(v) = a.get(field) {
             ensure!(valid_logins(v), "Invalid {field}");
         }
+    }
+    if let Some(pushers) = a.get("pushers") {
+        ensure!(
+            ["authors", "anyone"].contains(&string(pushers, "pushers")?),
+            "Invalid pushers setting"
+        );
     }
     for field in ["includeBacklog", "reenroll"] {
         if let Some(v) = a.get(field) {
@@ -1949,6 +2062,8 @@ mod tests {
     #[derive(Default)]
     struct FakeGitHub {
         prs: Mutex<Vec<Value>>,
+        /// Pushes to every PR branch; by default alice created it and pushed the head.
+        pushes: Mutex<Option<Vec<Value>>>,
         reviews: Mutex<Vec<Value>>,
         published: Mutex<Vec<Value>>,
         pr_gate: Mutex<Option<Arc<Gate>>>,
@@ -2010,6 +2125,15 @@ mod tests {
                 gate.block().await;
             }
             Ok(prs)
+        }
+        async fn pushes(&self, _: &Value, pr: &Value, _: &str) -> Result<Vec<Value>> {
+            if let Some(pushes) = self.pushes.lock().unwrap().clone() {
+                return Ok(pushes);
+            }
+            Ok(vec![
+                json!({"type":"push","actor":"alice","after":pr["head"]["sha"]}),
+                json!({"type":"branch_creation","actor":"alice","after":"b".repeat(40)}),
+            ])
         }
         async fn reviews(&self, _: &Value, _: i64, _: &str) -> Result<Vec<Value>> {
             Ok(self.reviews.lock().unwrap().clone())
@@ -2736,6 +2860,97 @@ mod tests {
             assert_eq!(next["executionAllowed"], expected, "{head} {policy}");
             f.close().await;
         }
+    }
+    #[test]
+    fn listed_authors_must_push_each_version_and_every_push_for_experiments() {
+        let repo = json!({"policy":"selected","authors":["Alice"]});
+        let head = "a".repeat(40);
+        let push = |actor: &str, after: &str| json!({"type":"push","actor":actor,"after":after});
+        let creation = json!({"type":"branch_creation","actor":"alice","after":"b".repeat(40)});
+        let pr = |pushes: Value| json!({"head":{"sha":head},"pushes":pushes});
+        let on_top = pr(json!([
+            push("alice", &head),
+            push("bob", &"c".repeat(40)),
+            creation
+        ]));
+        assert!(pushed_by_author(&repo, &on_top));
+        assert!(!every_push_by_authors(&repo, &on_top));
+        let alice = pr(json!([push("ALICE", &head), creation]));
+        assert!(pushed_by_author(&repo, &alice) && every_push_by_authors(&repo, &alice));
+        // Without the branch's creation, earlier pushes are unknown.
+        assert!(!every_push_by_authors(
+            &repo,
+            &pr(json!([push("alice", &head)]))
+        ));
+        let bob = pr(json!([push("bob", &head), creation]));
+        assert!(!pushed_by_author(&repo, &bob));
+        assert!(pusher_reason(&bob).contains("bob pushed this version"));
+        let unknown = pr(json!([]));
+        assert!(!pushed_by_author(&repo, &unknown));
+        assert!(pusher_reason(&unknown).contains("could not confirm"));
+        let anyone = json!({"policy":"selected","authors":["alice"],"pushers":"anyone"});
+        assert!(pushed_by_author(&anyone, &bob));
+        assert!(pushed_by_author(&json!({"policy":"everyone"}), &unknown));
+    }
+    #[tokio::test]
+    async fn only_versions_pushed_by_listed_authors_are_reviewed_automatically() {
+        let head = "a".repeat(40);
+        let push = |actor: &str, after: &str| json!({"type":"push","actor":actor,"after":after});
+        let creation = json!({"type":"branch_creation","actor":"alice","after":"b".repeat(40)});
+        let enqueue = |f: &Fixture, options: Value| {
+            let service = f.handle.service.clone();
+            f.handle.execute(async move {
+                service
+                    .enqueue(&service.repo("owner/project")?, 1, &options)
+                    .await
+            })
+        };
+
+        // bob pushed this version: skipped, and the status says why.
+        let f = Fixture::new().await;
+        *f.github.pushes.lock().unwrap() = Some(vec![push("bob", &head), creation.clone()]);
+        let event = json!({"event":true,"trigger":"Pull request updated"});
+        let skipped = enqueue(&f, event).await.unwrap();
+        assert_eq!(skipped["skipped"], "Not pushed by a listed author");
+        let status = f.handle.service.latest("owner/project#1").unwrap().unwrap();
+        assert_eq!(status["state"], "cancelled");
+        assert!(
+            s(&status, "reason").contains("bob pushed this version"),
+            "{status}"
+        );
+        // A requested review still runs, but never with experiments.
+        let manual = enqueue(&f, json!({"manual":true,"requester":"alice"}))
+            .await
+            .unwrap();
+        assert_eq!(manual["state"], "queued");
+        let next = f.worker("next", json!({"active":[]})).await.unwrap();
+        assert_eq!(next["job"]["id"], manual["id"]);
+        assert_eq!(next["executionAllowed"], false);
+        f.close().await;
+
+        // alice pushed on top of bob's push: reviewed, but no experiments.
+        let f = Fixture::new().await;
+        *f.github.pushes.lock().unwrap() = Some(vec![
+            push("alice", &head),
+            push("bob", &"c".repeat(40)),
+            creation,
+        ]);
+        assert_eq!(f.queue().await["state"], "queued");
+        let next = f.worker("next", json!({"active":[]})).await.unwrap();
+        assert_eq!(next["executionAllowed"], false);
+        f.close().await;
+
+        // The operator can deliberately accept pushes from anyone.
+        let f = Fixture::new().await;
+        *f.github.pushes.lock().unwrap() = Some(vec![push("bob", &head)]);
+        let mut repo = f.handle.service.repo("owner/project").unwrap();
+        repo["pushers"] = json!("anyone");
+        f.handle
+            .service
+            .db(|db| db.enroll(&repo).map(|_| ()))
+            .unwrap();
+        assert_eq!(f.queue().await["state"], "queued");
+        f.close().await;
     }
     #[test]
     fn eligibility_ignores_author_case_and_skips_drafts() {

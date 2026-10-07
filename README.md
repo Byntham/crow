@@ -33,7 +33,7 @@ See the [Linux quickstart](docs/user/quickstart.md), [HTTPS choices](docs/user/n
 ## Review behavior
 
 - New PR events trigger work. Crow does not poll GitHub for PRs on a schedule.
-- Repository policies initially allow only your PRs. You can add authors or allow everyone. Authorized fork PRs targeting an enrolled repository are included.
+- Repository policies initially allow only your PRs, and only versions you pushed. You can add authors, accept pushes from anyone with write access, or allow everyone. Authorized fork PRs targeting an enrolled repository are included.
 - Drafts and the initial open backlog are skipped. Startup/recovery catch-up repairs missed work, with large batches held for release.
 - Each worker allows three simultaneous reviews. Each review can use up to eight subagents. Both limits are configurable.
 - Reviews inspect files and diffs through dedicated read-only tools. Running tests is off by default; you can [enable it](docs/user/runtime-experiments.md) for repositories and authors you trust, in a rootless Podman sandbox.

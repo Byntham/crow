@@ -11,7 +11,7 @@ Inspection alone cannot show whether a change breaks a program. Crow lets the ma
 
 Execution needs three things: the repository is listed in the worker's local `worker.execution.repositories`, the repository's author policy lists its authors explicitly (not `everyone`), and the PR comes from a branch of the repository itself, not a fork. The connection service reports the last two for each job and can only withhold execution; it cannot grant it. PR content and review guidance cannot change any of this. Delegated reviewers stay inspection-only.
 
-The author check applies to whoever opened the PR, not to each commit. Anyone with write access can push to a branch of the repository, and Git author fields can name anyone, so neither proves who wrote the code. Enabling execution for a repository therefore trusts everyone who can push to it, including automation with write access. Proving who pushed each commit would mean reconstructing push history from GitHub's activity records, which this decision leaves out.
+Opening the PR is not enough, because anyone with write access can push to its branch. Every push since the branch was created must also come from a listed author (ADR 0011). A repository set to accept pushes from anyone trusts everyone who can push to it, including automation with write access.
 
 Upgrades never enable execution. An installation without the setting behaves exactly as before.
 

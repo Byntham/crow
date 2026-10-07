@@ -22,7 +22,7 @@ Persisted records and wire envelopes are `serde_json::Value`s validated at each 
 - Save a valid complete report before publishing. Reconcile authenticated bot metadata before retrying publication.
 - Repository code is data on the host. Inspect pinned Git objects without checkout, hooks, external diff helpers, or repository commands; run code only inside the opt-in Podman sandbox (ADR 0010).
 - Enforce provider tools and delegation limits before every new or resumed session.
-- Keep author policy, command requester policy, and worker/admin authentication separate.
+- Keep author policy, command requester policy, and worker/admin authentication separate. With an author list, review automatically only versions a listed author pushed, using GitHub's record of the pusher (ADR 0011).
 - Keep initial backlog exclusion, held catch-up batches, and no scheduled PR polling.
 - Clean up process groups and join background work before releasing runtime ownership.
 - Never claim live subscription or network behavior from synthetic test results.

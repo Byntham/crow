@@ -696,6 +696,17 @@ fn repository(command: &str, v: &Value) -> String {
             scalar(&v["authors"])
         },
     );
+    if v["policy"] != "everyone" {
+        field(
+            &mut out,
+            "Versions pushed by",
+            if v["pushers"] == "anyone" {
+                "Anyone with write access"
+            } else {
+                "Listed authors only"
+            },
+        );
+    }
     field(&mut out, "Can request reviews", scalar(&v["requesters"]));
     field(&mut out, "Worker", scalar(&v["worker"]));
     if v["settings"].as_object().is_some_and(|s| !s.is_empty()) {
