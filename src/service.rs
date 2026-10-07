@@ -1172,7 +1172,10 @@ impl Service {
         // A version queued before GitHub confirmed its pusher goes ahead only once
         // a listed author is confirmed. Until the windows pass it waits;
         // otherwise it is skipped like any other version.
-        let unverified = b(job, "verifyPusher") && !b(job, "manual") && checks_pushers(&repo);
+        // Read the stored job: a review requested during the GitHub calls above
+        // marked it manual, and nothing runs between here and the decision.
+        let requested = self.get("jobs", id)?.is_some_and(|j| b(&j, "manual"));
+        let unverified = b(job, "verifyPusher") && !requested && checks_pushers(&repo);
         if unverified && !pushed_by_author(&repo, &pr) {
             // The windows start at the first check, not when the version was
             // queued, since a held or busy queue can delay that check.
@@ -1209,6 +1212,7 @@ impl Service {
         let mut started = json!({"settings":settings,"author":pr["user"]["login"]});
         if unverified {
             started["verifyPusher"] = json!(false);
+            started["reason"] = Value::Null;
         }
         self.update(id, started, Some(lease))?;
         // Experiments only for authors the operator listed explicitly, never for
@@ -3347,6 +3351,8 @@ mod tests {
             .update(&id, json!({"nextAt":0}), None)
             .unwrap();
         assert_eq!(f.claim().await["id"], queued["id"]);
+        // The wait is over, so the status no longer mentions it.
+        assert!(f.job(&id)["reason"].is_null());
         f.close().await;
         // Still unlisted once the window has passed: skipped.
         let f = Fixture::new().await;
@@ -3469,6 +3475,44 @@ mod tests {
         let replacement = latest(&f);
         assert_eq!(replacement["target"], "develop");
         assert_eq!(replacement["verifyPusher"], true);
+        f.close().await;
+
+        // A review requested while an unverified job is being dispatched stands,
+        // even if the lookup then shows someone else pushed.
+        let f = Fixture::new().await;
+        *f.github.pushes.lock().unwrap() = Some(vec![]);
+        let service = f.handle.service.clone();
+        let queued = f
+            .handle
+            .execute(async move {
+                let options = json!({"event":true,"trigger":"Pull request updated"});
+                service
+                    .enqueue(&service.repo("owner/project")?, 1, &options)
+                    .await
+            })
+            .await
+            .unwrap();
+        *f.github.pushes.lock().unwrap() = Some(vec![bob(&"a".repeat(40))]);
+        let gate = Gate::new();
+        *f.github.pushes_gate.lock().unwrap() = Some(gate.clone());
+        let service = f.handle.service.clone();
+        let worker = service
+            .get("workers", s(&f.config["worker"], "id"))
+            .unwrap()
+            .unwrap();
+        let claim = tokio::spawn(f.handle.execute(async move {
+            service
+                .worker_action("next", &json!({"active":[]}), worker)
+                .await
+        }));
+        gate.wait().await;
+        f.handle
+            .admin("review", &json!({"repo":"owner/project","number":1}))
+            .await
+            .unwrap();
+        gate.open();
+        assert_eq!(claim.await.unwrap().unwrap()["job"]["id"], queued["id"]);
+        assert_eq!(f.job(s(&queued, "id"))["state"], "reviewing");
         f.close().await;
 
         // The windows start at the first check: a version that waited long in
