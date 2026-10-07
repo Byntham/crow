@@ -388,8 +388,8 @@ pub(super) struct Review {
     mcp_config: PathBuf,
     /// Fully qualified MCP tool names the reviewer may call.
     tools: Vec<String>,
-    /// The model Claude Code should report once the session starts.
-    expected_model: String,
+    /// The model Claude Code should report once the session starts, when known.
+    expected_model: Option<String>,
     state: Mutex<ParseState>,
 }
 impl Review {
@@ -397,13 +397,16 @@ impl Review {
         layout: &Layout,
         environment: Environment,
         models: &[Value],
+        cached: bool,
     ) -> Result<Self> {
         let settings = environment.settings;
         let model = text(&settings, "model");
-        let expected_model = find_model(models, model)
+        let resolved = find_model(models, model)
             .and_then(|m| m["resolvedModel"].as_str())
-            .unwrap_or(model)
-            .to_owned();
+            .unwrap_or(model);
+        // A cached catalog may predate an alias moving to a newer model, so
+        // only a pinned model can be checked against it.
+        let expected_model = (!cached || resolved == model).then(|| resolved.to_owned());
         let helper = std::env::current_exe()?;
         // The helper runs with the same isolated, credential-free environment.
         let mcp = json!({"mcpServers": {"crow_inspection": {
@@ -577,13 +580,14 @@ impl Review {
             ));
         }
         let base = |model: &str| model.split('[').next().unwrap_or(model).to_owned();
-        if base(text(init, "model")) != base(&self.expected_model) {
+        if let Some(expected) = &self.expected_model
+            && base(text(init, "model")) != base(expected)
+        {
             return Err(failure(
                 "config",
                 format!(
-                    "Claude Code started {} instead of the requested {}. Check host-managed Claude Code settings.",
+                    "Claude Code started {} instead of the requested {expected}. Check host-managed Claude Code settings.",
                     text(init, "model"),
-                    self.expected_model
                 ),
             ));
         }
@@ -913,6 +917,22 @@ mod tests {
         let args = f.invocation()["args"].as_array().unwrap().clone();
         assert_eq!(flag(&args, "--model"), Some("haiku"));
         assert!(!args.contains(&json!("--effort")));
+    }
+    #[tokio::test]
+    async fn stale_cached_catalog_does_not_reject_a_moved_alias() {
+        let mut f = Fixture::new(json!({}));
+        discover(&f.job["settings"], f.root.path()).await.unwrap();
+        // The cached catalog predates `opus` moving to the model Claude Code now runs.
+        let cache = f.root.path().join("model-catalog-claude.json");
+        let mut catalog = crate::util::read_json(&cache).unwrap().unwrap();
+        catalog["models"][0]["resolvedModel"] = json!("claude-opus-4-0");
+        crate::util::atomic(&cache, &catalog).unwrap();
+        f.set(json!({"offline":true}));
+        f.run().await.unwrap();
+        // A pinned model is still checked against what the session reports.
+        f.job["settings"]["model"] = json!("claude-opus-4-0");
+        f.set(json!({"offline":true,"wrongModel":true}));
+        assert_eq!(kind(f.run().await.unwrap_err()), "config");
     }
     #[tokio::test]
     async fn usage_limits_pause_until_the_reported_reset() {

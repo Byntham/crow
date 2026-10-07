@@ -732,7 +732,12 @@ async fn run_review_inner(
         Provider::Codex => {
             Backend::Codex(codex::Review::prepare(&layout, environment, root, &cancel).await?)
         }
-        Provider::Claude => Backend::Claude(claude::Review::prepare(&layout, environment, models)?),
+        Provider::Claude => Backend::Claude(claude::Review::prepare(
+            &layout,
+            environment,
+            models,
+            catalog["cached"] == true,
+        )?),
     };
     let saved = util::read_json(&layout.dir.join("session.json"))?.unwrap_or(Value::Null);
     let same_comparison = saved["comparison"].is_object()
